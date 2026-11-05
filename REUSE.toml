@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# Copyright and license information for files that cannot carry an SPDX
+# header of their own (https://reuse.software/spec-3.3/). Every other file
+# starts with SPDX lines, and CI runs `reuse lint`.
+
+version = 1
+
+# The Developer Certificate of Origin 1.1, https://developercertificate.org/,
+# verbatim. Its own notice allows verbatim copies only.
+[[annotations]]
+path = "DCO"
+SPDX-FileCopyrightText = "2004, 2006 The Linux Foundation and its contributors"
+SPDX-License-Identifier = "LicenseRef-DCO"
+
+[[annotations]]
+path = ["LICENSE-APACHE", "LICENSE-MIT"]
+SPDX-FileCopyrightText = "2026 The Dukovo contributors"
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
