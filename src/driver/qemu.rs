@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use super::{Driver, Setup};
+use crate::bench::Kit;
 use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
 use crate::ssh;
@@ -257,6 +258,84 @@ impl Qemu {
         Ok(&mut self.running.as_mut().expect("is_on said so").qmp)
     }
 
+    /// Boots the Linux twin: Linux from `kit` on the machine's processor,
+    /// CPUs and memory, with no disk, network card or firmware of its own,
+    /// the kernel booted directly. Its console goes to `log`.
+    fn boot_twin(&self, kit: &Kit, log: &Path, deadline: Instant) -> Result<String, String> {
+        File::create(log).map_err(|err| format!("making {}: {err}", log.display()))?;
+        let (accel, cpu) = if self.kvm { ("kvm", "host") } else { ("tcg", "max") };
+        let arguments: Vec<String> = vec![
+            "-M".into(),
+            "q35".into(),
+            "-accel".into(),
+            accel.into(),
+            "-cpu".into(),
+            cpu.into(),
+            "-smp".into(),
+            self.settings.cpus.to_string(),
+            "-m".into(),
+            self.settings.memory.clone(),
+            // Only what Linux needs: no network card, screen or monitor.
+            "-nodefaults".into(),
+            "-display".into(),
+            "none".into(),
+            "-no-reboot".into(),
+            "-chardev".into(),
+            format!("file,id=twin,path={}", option_value(log)),
+            "-serial".into(),
+            "chardev:twin".into(),
+            "-kernel".into(),
+            kit.kernel.display().to_string(),
+            "-initrd".into(),
+            kit.initrd.display().to_string(),
+            "-append".into(),
+            kit.cmdline.clone(),
+        ];
+        let mut messages = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.qemu_log())
+            .map_err(|err| format!("opening {}: {err}", self.qemu_log().display()))?;
+        let _ = writeln!(messages, "Starting the Linux twin: {QEMU} {}", arguments.join(" "));
+        let mut child = Command::new(QEMU)
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(messages)
+            .spawn()
+            .map_err(|err| format!("starting {QEMU} for the Linux twin: {err}"))?;
+        // Linux powers itself off once its benchmarks are done; the done
+        // line is the sign they all ran.
+        let outcome = loop {
+            let text = fs::read_to_string(log).unwrap_or_default();
+            if text.contains(&kit.done) {
+                break Ok(text);
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                break Err(format!(
+                    "Linux ended ({status}) before it printed \"{}\"; its console is in {}",
+                    kit.done,
+                    log.display()
+                ));
+            }
+            if Instant::now() >= deadline {
+                break Err(format!(
+                    "Linux had not printed \"{}\" at the test's time limit; its console is in {}",
+                    kit.done,
+                    log.display()
+                ));
+            }
+            if self.setup.stop.requested() {
+                break Err("the run was stopped while Linux was measuring".into());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        // It may still be powering off; nothing it does now counts.
+        let _ = child.kill();
+        let _ = child.wait();
+        outcome
+    }
+
     /// Waits for QEMU to end until `deadline`, or until the run is
     /// stopped; kills it if `kill` and it has not ended.
     fn wait_for_exit(&mut self, deadline: Instant, kill: bool) -> bool {
@@ -435,6 +514,27 @@ impl Driver for Qemu {
 
     fn slowdown(&self) -> u32 {
         if self.kvm { 1 } else { self.settings.tcg_slowdown }
+    }
+
+    fn linux_twin(&mut self, kit: &Kit, log: &Path, deadline: Instant) -> Result<String, String> {
+        // The machine under test is paused rather than turned off, so the
+        // test goes on where it was once Linux is done.
+        let paused = self.is_on();
+        if paused {
+            self.qmp()?.execute("stop", &json!({}))?;
+        }
+        let measured = self.boot_twin(kit, log, deadline);
+        if paused && self.is_on() {
+            let resumed = self.qmp().and_then(|qmp| qmp.execute("cont", &json!({})));
+            if let Err(err) = resumed {
+                return Err(format!("the machine would not go on after Linux measured: {err}"));
+            }
+        }
+        measured
+    }
+
+    fn emulated(&self) -> bool {
+        !self.kvm
     }
 
     fn shut_off(&mut self) {

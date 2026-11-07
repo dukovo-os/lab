@@ -83,6 +83,8 @@ struct Page {
     /// The image under test and its build, which runs from the page use.
     image: Option<PathBuf>,
     build: Option<String>,
+    /// The Linux kit runs from the page hold Dukovo to, when given.
+    linux: Option<PathBuf>,
     /// When the image was made, as the page opened: a later one is a new
     /// build, which `build` no longer names.
     image_made: Option<SystemTime>,
@@ -119,6 +121,13 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         Some(image) => Some(absolute(image.clone())?),
         None => None,
     };
+    let linux = match &arguments.linux {
+        Some(dir) => {
+            crate::bench::Kit::read(dir).map_err(Error::Usage)?;
+            Some(absolute(dir.clone())?)
+        }
+        None => None,
+    };
     let port = arguments.port.unwrap_or(DEFAULT_PORT);
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|err| {
         Error::Usage(format!(
@@ -137,6 +146,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         results,
         image,
         build: arguments.build.clone(),
+        linux,
     });
     let address = format!("http://127.0.0.1:{port}/?key={}", page.key);
     if arguments.json {
@@ -340,6 +350,9 @@ impl Page {
         }
         args.extend(["--machine".into(), machines.join(",")]);
         args.extend(["--image".into(), image.display().to_string()]);
+        if let Some(linux) = &self.linux {
+            args.extend(["--linux".into(), linux.display().to_string()]);
+        }
         if let Some(build) = &self.build {
             args.extend(["--build".into(), build.clone()]);
         }
@@ -589,6 +602,7 @@ mod tests {
             results: store.join("lab-results"),
             image: None,
             build: None,
+            linux: None,
             image_made: None,
         }
     }

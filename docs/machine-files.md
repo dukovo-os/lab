@@ -40,7 +40,8 @@ cord = "person"    # treat pulling the cord as a person's job here
 
 A control is a way the lab acts on a machine: `power`, `cord` (pulling
 the power cord), `serial`, `link` (the network cable), `usb` (a USB
-stick), `keys`, `screen` and `ssh`. Each is done by one of:
+stick), `keys`, `screen`, `ssh` and `linux` (booting the machine's Linux
+twin, which performance tests measure against). Each is done by one of:
 
 | Value | Meaning |
 | --- | --- |
@@ -50,7 +51,8 @@ stick), `keys`, `screen` and `ssh`. Each is done by one of:
 
 A machine starts with every control its driver can do (QEMU can do all
 of them) set to `driver`. `[controls]` can hand one to a person or take
-it away, but cannot make a driver do what it cannot.
+it away, but cannot make a driver do what it cannot. `linux` is
+`driver` or `none`: a person cannot measure Linux.
 
 So one test file serves every machine: pulling the cord is automatic on
 QEMU, a Needs you step on a real machine until it has a smart plug.

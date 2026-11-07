@@ -23,13 +23,16 @@
 //! `dukovo-lab done` or presses Done on the runner page. A run can be
 //! stopped part way (see stop.rs); what it did not finish is skipped.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::Error;
+use crate::bench::{self, Kit, Row};
 use crate::bundle::{
     Bundle, MachineRecord, Outcome, ResultRecord, RunRecord, SCHEMA, StepRecord, Summary,
     new_run_id,
@@ -39,9 +42,10 @@ use crate::driver::{Driver, Setup};
 use crate::findings;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
+use crate::ssh;
 use crate::stop::Stop;
 use crate::store::Running;
-use crate::suite::{Command, Fit, PowerAction, Step, Test};
+use crate::suite::{Bench, Command, Fit, PowerAction, Step, Test};
 use crate::units::format_duration;
 
 /// What a stopped test's result says.
@@ -49,6 +53,12 @@ const STOPPED_DURING: &str = "the run was stopped during this test";
 const STOPPED_BEFORE: &str = "the run was stopped before this test";
 /// Why a `root` step cannot run.
 pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no password: run `dukovo-lab key`, then build the image again with `ob image --lab`";
+
+/// Why a `bench` step cannot run.
+pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given no Linux kit: `ob lab` builds one and passes it with --linux";
+
+/// Why a `bench` step's numbers are kept but not held to Linux's.
+pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers (no KVM), so they are kept but not held to Linux's";
 
 /// What to run.
 pub struct Request<'a> {
@@ -67,6 +77,8 @@ pub struct Request<'a> {
     pub password: Option<String>,
     /// Whether to run Needs you tests, asking a person to do their steps.
     pub with_person: bool,
+    /// The Linux that performance tests hold Dukovo to, when given.
+    pub linux: Option<Kit>,
     /// The preset the tests came from, for run.json.
     pub preset: Option<String>,
     /// The schedule that started the run, for run.json.
@@ -90,6 +102,10 @@ struct Shared<'a> {
     stop: &'a Stop,
     with_person: bool,
     password: Option<&'a str>,
+    linux: Option<&'a Kit>,
+    /// Held while a machine measures performance, so that machines run
+    /// side by side never time each other's load.
+    measuring: &'a Mutex<()>,
 }
 
 /// Starts a machine's driver; [`crate::driver::start`] outside tests.
@@ -147,6 +163,7 @@ pub fn run(
     let sockets = socket_folder(&id);
     let stop = Stop::default();
     let finished = AtomicBool::new(false);
+    let measuring = Mutex::new(());
     let shared = Shared {
         run_id: &id,
         bundle: &bundle,
@@ -155,6 +172,8 @@ pub fn run(
         stop: &stop,
         with_person: request.with_person,
         password: request.password.as_deref(),
+        linux: request.linux.as_ref(),
+        measuring: &measuring,
     };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
         // Ends the watcher below however this ends, a worker's panic too,
@@ -354,6 +373,9 @@ struct Worker<'a> {
     /// The test being run: its log lines and screenshots.
     log: Vec<String>,
     screenshots: Vec<String>,
+    /// Linux's numbers, from the machine's Linux twin, once measured: once
+    /// a run is enough, as nothing about Linux changes between tests.
+    linux: Option<BTreeMap<String, f64>>,
 }
 
 impl<'a> Worker<'a> {
@@ -373,6 +395,7 @@ impl<'a> Worker<'a> {
             serial: SerialWatch::new(PathBuf::new()),
             log: Vec::new(),
             screenshots: Vec::new(),
+            linux: None,
         }
     }
 
@@ -580,6 +603,7 @@ impl<'a> Worker<'a> {
         }
         match step {
             Step::Run(command) => self.run_command(command, deadline),
+            Step::Bench(bench) => self.bench(bench, deadline),
             Step::Serial(text) => self.wait_serial(text, deadline),
             Step::Power(action) => self.power(*action, deadline),
             Step::Link(up) => self.driver.set_link(*up).map(|()| None).map_err(StepFailure::Error),
@@ -656,37 +680,7 @@ impl<'a> Worker<'a> {
         command: &Command,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
-        // The machine went off when the test needed it on: Dukovo's
-        // failure, as when it turns off before a serial step's text.
-        if !self.driver.is_on() {
-            return Err(StepFailure::Fail(format!(
-                "the machine was off, so `{}` could not run",
-                command.command
-            )));
-        }
-        // As root: `elevate -S` reads the lab's password from the
-        // command's input, so it is never on a command line, and it is
-        // taken out of whatever comes back.
-        let (line, input, prompt) = if command.root {
-            let Some(password) = self.shared.password else {
-                return Err(StepFailure::Error(NO_PASSWORD.into()));
-            };
-            (format!("elevate -S {}", command.command), Some(format!("{password}\n")), "#")
-        } else {
-            (command.command.clone(), None, "$")
-        };
-        let mut output = self
-            .driver
-            .run_command(&line, input.as_deref(), deadline)
-            .map_err(StepFailure::Error)?;
-        if let Some(password) = self.shared.password {
-            output.text = output.text.replace(password, "********");
-        }
-        // Cut short by a stop: the command's end says nothing.
-        if output.status.is_none() && self.shared.stop.requested() {
-            return Err(StepFailure::Skip(STOPPED_DURING.into()));
-        }
-        let shown = format!("{prompt} {}\n{}", command.command, output.text.trim_end());
+        let (output, shown) = self.execute(&command.command, command.root, deadline)?;
         let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
         match output.status {
             None => return fail("it was still running at the test's time limit".into()),
@@ -711,6 +705,128 @@ impl<'a> Worker<'a> {
             return fail(format!("its output holds \"{found}\""));
         }
         Ok(Some(shown))
+    }
+
+    /// Runs `command` on the machine, as root through elevate when `root`,
+    /// and gives back its output and how a log shows it: a prompt, the
+    /// command and what it printed.
+    fn execute(
+        &mut self,
+        command: &str,
+        root: bool,
+        deadline: Instant,
+    ) -> Result<(ssh::Output, String), StepFailure> {
+        // The machine went off when the test needed it on: Dukovo's
+        // failure, as when it turns off before a serial step's text.
+        if !self.driver.is_on() {
+            return Err(StepFailure::Fail(format!(
+                "the machine was off, so `{command}` could not run"
+            )));
+        }
+        // As root: `elevate -S` reads the lab's password from the
+        // command's input, so it is never on a command line, and it is
+        // taken out of whatever comes back.
+        let (line, input, prompt) = if root {
+            let Some(password) = self.shared.password else {
+                return Err(StepFailure::Error(NO_PASSWORD.into()));
+            };
+            (format!("elevate -S {command}"), Some(format!("{password}\n")), "#")
+        } else {
+            (command.to_string(), None, "$")
+        };
+        let mut output = self
+            .driver
+            .run_command(&line, input.as_deref(), deadline)
+            .map_err(StepFailure::Error)?;
+        if let Some(password) = self.shared.password {
+            output.text = output.text.replace(password, "********");
+        }
+        // Cut short by a stop: the command's end says nothing.
+        if output.status.is_none() && self.shared.stop.requested() {
+            return Err(StepFailure::Skip(STOPPED_DURING.into()));
+        }
+        let shown = format!("{prompt} {command}\n{}", output.text.trim_end());
+        Ok((output, shown))
+    }
+
+    /// Runs a benchmark program and holds the rows the step names to
+    /// Linux's, which the machine's Linux twin measures once per run.
+    fn bench(&mut self, bench: &Bench, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        let Some(kit) = self.shared.linux else {
+            return Err(StepFailure::Skip(NO_KIT.into()));
+        };
+        // One machine measures at a time; the others wait here.
+        let _measuring = self.shared.measuring.lock().unwrap_or_else(PoisonError::into_inner);
+        let linux = match self.linux.take() {
+            Some(linux) => linux,
+            None => {
+                let log = self
+                    .shared
+                    .bundle
+                    .logs(&self.machine.name)
+                    .join(format!("linux-boot-{}.log", self.boot));
+                let text =
+                    self.driver.linux_twin(kit, &log, deadline).map_err(StepFailure::Error)?;
+                bench::parse(&text)
+            }
+        };
+        let outcome = self.hold_to_linux(bench, &linux, deadline);
+        self.linux = Some(linux);
+        outcome
+    }
+
+    fn hold_to_linux(
+        &mut self,
+        bench: &Bench,
+        linux: &BTreeMap<String, f64>,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        // A row Linux's kit does not measure is the test's mistake, or
+        // the kit's, not Dukovo's.
+        let unmeasured: Vec<&str> =
+            bench.rows.iter().filter(|row| !linux.contains_key(*row)).map(String::as_str).collect();
+        if !unmeasured.is_empty() {
+            return Err(StepFailure::Error(format!(
+                "the Linux kit measures no row {}",
+                unmeasured.join(", ")
+            )));
+        }
+        let (output, shown) = self.execute(&bench.command, bench.root, deadline)?;
+        let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
+        match output.status {
+            None => return fail("it was still running at the test's time limit".into()),
+            Some(0) => {}
+            Some(status) => {
+                // The program's own last word (its error, usually) makes the
+                // first line, so each way of breaking is a finding of its own.
+                let said = output
+                    .text
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with("BENCH"))
+                    .unwrap_or("nothing");
+                return fail(format!("the benchmark program exited with status {status}: {said}"));
+            }
+        }
+        let rows =
+            match bench::compare(&bench.rows, bench.limit, &bench::parse(&output.text), linux) {
+                Ok(rows) => rows,
+                Err(why) => return fail(why),
+            };
+        let table = bench::table(&rows);
+        if self.driver.emulated() {
+            return Err(StepFailure::Skip(format!("{EMULATED}\n{table}")));
+        }
+        if rows.iter().all(Row::passes) {
+            Ok(Some(table))
+        } else {
+            // The first line names no number, so a row that comes back over
+            // the limit joins the same finding, whatever it measured.
+            Err(StepFailure::Fail(format!(
+                "slower than Linux: the rows marked over take more than their share of Linux's time\n{table}"
+            )))
+        }
     }
 
     /// Waits until the machine turns itself off, as after `poweroff`.

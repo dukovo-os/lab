@@ -22,6 +22,9 @@ struct FakeMachine {
     /// Whether it boots again after reset; the machine named `stuck`
     /// does not.
     restarts: bool,
+    /// Whether its numbers are an emulator's; the machine named
+    /// `emulated`'s are.
+    emulated: bool,
 }
 
 impl FakeMachine {
@@ -101,6 +104,18 @@ impl Driver for FakeMachine {
                 self.on = false;
                 (Some(0), String::new())
             }
+            // A benchmark program: faster than the fake Linux below at
+            // fork, slower at pipes.
+            "bench" => (
+                Some(0),
+                "BENCH name=fork ns=90 iterations=10\nBENCH name=pipe ns=130 iterations=10\n"
+                    .into(),
+            ),
+            "bench-broken" => (
+                Some(1),
+                "BENCH name=fork ns=90 iterations=10\nbench: listen failed: Permission denied\n"
+                    .into(),
+            ),
             "true" => (Some(0), String::new()),
             "uname" => (Some(0), "Dukovo\n".into()),
             "false" => (Some(1), String::new()),
@@ -117,6 +132,24 @@ impl Driver for FakeMachine {
 
     fn slowdown(&self) -> u32 {
         1
+    }
+
+    fn linux_twin(
+        &mut self,
+        kit: &crate::bench::Kit,
+        log: &Path,
+        _deadline: Instant,
+    ) -> Result<String, String> {
+        let text = format!(
+            "Linux booting\nBENCH name=fork ns=100 iterations=10\nBENCH name=pipe ns=100 iterations=10\n{}\n",
+            kit.done
+        );
+        fs::write(log, &text).map_err(|err| err.to_string())?;
+        Ok(text)
+    }
+
+    fn emulated(&self) -> bool {
+        self.emulated
     }
 
     fn shut_off(&mut self) {
@@ -136,6 +169,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         on: false,
         stop: setup.stop,
         restarts: machine.name != "stuck",
+        emulated: machine.name == "emulated",
     }))
 }
 
@@ -209,6 +243,7 @@ fn run_with(
         key: Some(setting.dir.path().join("lab_ed25519")),
         password: None,
         with_person,
+        linux: None,
         preset: None,
         schedule: None,
         id: Some(
@@ -307,6 +342,107 @@ fn runs_tests_shares_boots_and_writes_the_bundle() {
 }
 
 #[test]
+fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
+    let setting = setting_with(&[
+        (
+            "performance/fork.toml",
+            "about = \"fork\"\ntime = \"1m\"\n[[step]]\nbench = \"bench\"\nrows = [\"fork\"]\n",
+        ),
+        (
+            "performance/pipe.toml",
+            "about = \"pipe\"\ntime = \"1m\"\n[[step]]\nbench = \"bench\"\nrows = [\"pipe\"]\n",
+        ),
+        (
+            "performance/pipe-loose.toml",
+            "about = \"pipe within 1.5\"\ntime = \"1m\"\n[[step]]\nbench = \"bench\"\n\
+             rows = [\"fork\", \"pipe\"]\nlimit = 1.5\n",
+        ),
+        (
+            "performance/unknown.toml",
+            "about = \"a row Linux lacks\"\ntime = \"1m\"\n[[step]]\nbench = \"bench\"\n\
+             rows = [\"exec\"]\n",
+        ),
+        (
+            "performance/broken.toml",
+            "about = \"the program breaks\"\ntime = \"1m\"\n[[step]]\nbench = \"bench-broken\"\n\
+             rows = [\"fork\"]\n",
+        ),
+    ]);
+    let kit_dir = setting.dir.path().join("kit");
+    setting.dir.write("kit/vmlinuz", "kernel");
+    setting.dir.write("kit/initramfs.img", "initrd");
+    setting.dir.write(
+        "kit/kit.toml",
+        "kernel = \"vmlinuz\"\ninitrd = \"initramfs.img\"\ncmdline = \"console=ttyS0\"\n\
+         done = \"linux-bench: done\"\n",
+    );
+    let mut emulated = setting.qemu.clone();
+    emulated.name = "emulated".into();
+    let request = |linux: Option<crate::bench::Kit>, machines| Request {
+        tests: setting.tests.iter().collect(),
+        machines,
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: None,
+        with_person: false,
+        linux,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let kit = crate::bench::Kit::read(&kit_dir).unwrap();
+    let with_kit = request(Some(kit.clone()), vec![&setting.qemu]);
+    let ended = run(&with_kit, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&with_kit.store, with_kit.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let by_test = |test: &str| results.results.iter().find(|r| r.test == test).unwrap().clone();
+    assert_eq!(by_test("performance/fork").result, Outcome::Pass);
+    let pipe = by_test("performance/pipe");
+    assert_eq!(pipe.result, Outcome::Fail);
+    let reason = pipe.reason.unwrap();
+    assert!(reason.starts_with("step 1: slower than Linux:"), "{reason}");
+    assert!(reason.contains("pipe        130 ns        100 ns    1.30   1.00  over"), "{reason}");
+    assert_eq!(by_test("performance/pipe-loose").result, Outcome::Pass);
+    assert_eq!(by_test("performance/unknown").result, Outcome::Error);
+    // A program that breaks says why in the first line, its finding's name.
+    let broken = by_test("performance/broken");
+    assert_eq!(broken.result, Outcome::Fail);
+    let why = broken.reason.unwrap();
+    assert!(
+        why.starts_with(
+            "step 1: the benchmark program exited with status 1: \
+             bench: listen failed: Permission denied\n"
+        ),
+        "{why}"
+    );
+    assert_eq!(ended.summary, Summary { passed: 2, failed: 2, skipped: 0, errors: 1 });
+    // Linux booted once for the whole run, and its console is kept.
+    let logs: Vec<_> = fs::read_dir(bundle.join("logs/qemu"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("linux-boot-"))
+        .collect();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    // The finding of a slow row names no number, so it comes back as one.
+    assert_eq!(
+        crate::findings::signature(&reason),
+        "step 1: slower than Linux: the rows marked over take more than their share of Linux's time"
+    );
+
+    // Without a kit the tests skip, saying how to get one; under an
+    // emulator they run and keep their numbers, but hold none to Linux.
+    let without = request(None, vec![&setting.qemu]);
+    let ended = run(&without, &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 0, failed: 0, skipped: 5, errors: 0 });
+    let under_emulator = request(Some(kit), vec![&emulated]);
+    let ended = run(&under_emulator, &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 0, failed: 1, skipped: 3, errors: 1 });
+}
+
+#[test]
 fn root_steps_give_elevate_the_password_and_never_show_it() {
     let setting = setting_with(&[
         (
@@ -327,6 +463,7 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         key: Some(setting.dir.path().join("lab_ed25519")),
         password: Some("sesame".into()),
         with_person: false,
+        linux: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
