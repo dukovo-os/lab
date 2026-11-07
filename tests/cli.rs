@@ -358,7 +358,10 @@ fn findings_are_marked_and_sent_as_an_agent_would() {
 }
 
 /// Waits for schedule `name`'s start to end, and answers how it went.
-fn last_of(setting: &Setting, name: &str) -> Value {
+/// How schedule `name` last went, once a start other than `before` has
+/// ended. A start runs in a process of its own, which may not have begun
+/// yet when the command that started it returns.
+fn last_of(setting: &Setting, name: &str, before: &Value) -> Value {
     for _ in 0..300 {
         let (_, listed) = setting.run(&["schedule"]);
         let schedule = listed["schedules"]
@@ -366,7 +369,8 @@ fn last_of(setting: &Setting, name: &str) -> Value {
             .and_then(|all| all.iter().find(|schedule| schedule["name"] == name))
             .cloned()
             .unwrap_or(Value::Null);
-        if schedule["going"].is_null() && !schedule["last"].is_null() {
+        if schedule["going"].is_null() && !schedule["last"].is_null() && schedule["last"] != *before
+        {
             return schedule["last"].clone();
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -459,7 +463,7 @@ fn a_schedule_tests_main_on_the_lab_s_own_checkout() {
     // breaks (no QEMU here), so the run broke.
     let (code, started) = setting.run(&["schedule", "start", "quick"]);
     assert_eq!(code, Some(0), "{started}");
-    let last = last_of(&setting, "quick");
+    let last = last_of(&setting, "quick", &Value::Null);
     assert_eq!(last["result"], "broke", "{last}");
     assert_eq!(last["commit"], first.as_str());
     let run = last["run"].as_str().unwrap().to_string();
@@ -484,7 +488,7 @@ fn a_schedule_tests_main_on_the_lab_s_own_checkout() {
     fs::write(&state_file, state.to_string()).unwrap();
     let (_, ticked) = setting.run(&["schedule", "tick"]);
     assert_eq!(ticked["started"], serde_json::json!(["quick"]), "{ticked}");
-    let last = last_of(&setting, "quick");
+    let last = last_of(&setting, "quick", &last);
     assert_eq!(last["commit"], second.as_str(), "{last}");
     assert_ne!(last["run"], run.as_str());
 

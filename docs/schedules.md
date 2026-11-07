@@ -17,7 +17,7 @@ commands:
 
 ```sh
 dukovo-lab schedule save nightly --preset full --machine qemu,optiplex --at 01:00 --title "Full run"
-dukovo-lab schedule save security security --machine optiplex --at 02:00 --days sun --hold
+dukovo-lab schedule save drivers drivers --machine optiplex --at 02:00 --days sun --hold
 dukovo-lab schedule save quick --preset quick --each-build
 dukovo-lab schedule                  # each one: when it runs next, how it went last
 dukovo-lab schedule start nightly    # run it now, as its time would
@@ -102,8 +102,8 @@ commands and the page write it; it can be edited by hand too.
       "send": true
     },
     {
-      "name": "security",
-      "tests": ["security"],
+      "name": "drivers",
+      "tests": ["drivers"],
       "machines": ["optiplex"],
       "at": "02:00",
       "days": ["sun"],
