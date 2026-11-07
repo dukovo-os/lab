@@ -333,6 +333,18 @@ fn local_text(zone: &Zone, at: Utc) -> String {
     format!("{weekday} {} {date}, {}", MONTHS[month as usize - 1], clock_text(minute))
 }
 
+/// A time to come, for people, from `now`: "Today, 1:00 AM",
+/// "Tomorrow, 1:00 AM", else as [`local_text`] says it.
+fn ahead_text(zone: &Zone, now: Utc, at: Utc) -> String {
+    let local = at.seconds() as i64 + zone.offset_at(at);
+    let clock = clock_text((local.rem_euclid(86_400) / 60) as u32);
+    match zone.day_of(at) - zone.day_of(now) {
+        0 => format!("Today, {clock}"),
+        1 => format!("Tomorrow, {clock}"),
+        _ => local_text(zone, at),
+    }
+}
+
 // ---------------------------------------------------------------------
 // Files.
 
@@ -1252,6 +1264,11 @@ fn list(config: &Path, store: &Path) -> Result<Value, Error> {
             item["title"] = json!(schedule.title);
             item["when"] = json!(if schedule.paused { "Paused".into() } else { schedule.when() });
             item["next"] = json!(next.map(Utc::rfc3339));
+            // In the lab's zone, whatever zone a browser or agent is in.
+            item["next_text"] = match (&zone, next) {
+                (Ok(zone), Some(next)) => json!(ahead_text(zone, now, next)),
+                _ => Value::Null,
+            };
             item["going"] = if going { json!(state.going) } else { Value::Null };
             item["last"] = json!(state.last);
             item
@@ -1473,6 +1490,8 @@ mod tests {
         assert_eq!(sundays.next_due(&zone, now), Some(at("2026-11-08T09:00:00Z")));
         assert_eq!(sundays.last_due(&zone, now), Some(at("2026-11-01T09:00:00Z")));
         assert_eq!(local_text(&zone, at("2026-11-08T09:00:00Z")), "Sun Nov 8, 2:00 AM");
+        assert_eq!(ahead_text(&zone, now, at("2026-11-08T08:00:00Z")), "Tomorrow, 1:00 AM");
+        assert_eq!(ahead_text(&zone, now, at("2026-11-07T23:00:00Z")), "Today, 4:00 PM");
     }
 
     #[test]

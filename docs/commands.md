@@ -280,7 +280,8 @@ build on Dukovo's main (`--each-build`), on the lab's own Dukovo checkout
 and with the runner page closed. See [Schedules](schedules.md).
 
 - With no action, it lists the schedules: each with what it runs, when
-  in words (`"when": "Every day, 1:00 AM"`), its next time (`next`, UTC),
+  in words (`"when": "Every day, 1:00 AM"`), its next time (`next`, UTC, and `next_text`, such as "Tomorrow, 1:00
+  AM", in the lab's zone),
   what its start is doing if one is going (`going`), and how the last
   one went (`last`: its run, the commit of main it tested, `result`
   passed, failed, broke, stopped, missed or error, its findings and

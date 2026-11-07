@@ -125,20 +125,6 @@ function when(rfc3339) {
   return time.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + clock;
 }
 
-/** A time to come as this PC shows it: "Today 01:00", "Tomorrow 01:00", "Sun, Nov 8 02:00". */
-function whenAhead(rfc3339) {
-  const time = new Date(rfc3339);
-  const clock = time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const day = new Date(time);
-  day.setHours(0, 0, 0, 0);
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const days = Math.round((day - today) / 86400000);
-  if (days === 0) return "Today " + clock;
-  if (days === 1) return "Tomorrow " + clock;
-  return time.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " " + clock;
-}
-
 const WORDS = { pass: "Passed", fail: "Failed", skip: "Skipped", error: "Error", running: "Running", queued: "Queued" };
 
 function pill(kind, text) {
@@ -678,13 +664,13 @@ function renderSchedules() {
     if (schedule.going) next = pill("running", schedule.going.run ? "Running" : "Starting");
     else if (schedule.paused) next = "Paused";
     else if (schedule.each_build) next = "On the next build on main";
-    else next = schedule.next ? whenAhead(schedule.next) : "";
+    else next = schedule.next_text || "";
     const title = el("td", {}, scheduleTitle(schedule.name));
     const line = schedule.going ? schedule.going.doing : lastText(schedule.last);
     if (line) title.append(el("span", { class: "why" }, line));
     const edit = el("button", { class: "mini", type: "button", onclick: () => openForm(schedule) }, "Edit");
     return el("tr", {}, title, el("td", {}, schedule.when), el("td", {}, schedule.machines.join(", ")),
-      el("td", {}, schedule.send ? "Send when done" : "Hold for me"), el("td", { class: "res" }, next), el("td", {}, edit));
+      el("td", {}, schedule.send ? "Send when done" : "Hold for me"), el("td", {}, next), el("td", {}, edit));
   }));
   let note = "Scheduled runs always skip tests that need you. A scheduled run waits if a run is already going on that machine, and tests main as it is then, on the lab's own Dukovo checkout.";
   if (listed.zone_problem) note += " Times cannot be worked out: " + listed.zone_problem;
