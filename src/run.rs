@@ -59,11 +59,8 @@ const STOPPED_BEFORE: &str = "the run was stopped before this test";
 /// `step-progress` event), so a long step — a soak, a slow boot — is not
 /// silent for minutes on end. Short under test, so the beat can be checked
 /// without a slow wait.
-const HEARTBEAT: Duration = if cfg!(test) {
-    Duration::from_millis(100)
-} else {
-    Duration::from_secs(30)
-};
+const HEARTBEAT: Duration =
+    if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(30) };
 /// Why a `root` step cannot run.
 pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no password: run `dukovo-lab key`, then build the image again with `ob image --lab`";
 
