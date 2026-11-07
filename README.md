@@ -24,12 +24,21 @@ requests.
 
 ## Getting started
 
-On a Linux PC with Rust (through rustup), QEMU and OpenSSH:
+In a Dukovo checkout, one command sets the lab up and opens the runner
+page: it installs or updates `dukovo-lab`, makes the lab key, clones
+lab-results for Send, builds the lab image and opens the page.
 
 ```sh
-sudo apt install qemu-system-x86 qemu-utils ovmf openssh-client   # Linux Mint, Ubuntu
+./ob lab
+```
+
+By hand, on a Linux PC with Rust (through rustup), QEMU and OpenSSH:
+
+```sh
+sudo apt install qemu-system-x86 qemu-utils ovmf openssh-client git   # Linux Mint, Ubuntu
 cargo install --locked --git https://github.com/dukovo-os/lab
 dukovo-lab key          # once: the lab's SSH key, which lab images trust
+git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results   # once: for Send
 ```
 
 Then, in a Dukovo checkout:
