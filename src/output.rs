@@ -6,11 +6,12 @@
 //!
 //! Every JSON line has an `event` field and an `at` time (RFC 3339, UTC):
 //! `run-started` comes first with the run's id and bundle, then
-//! `test-started`, `step-ended` and `test-ended` for each test on each
-//! machine as they happen (machines run side by side, so their lines
-//! interleave), `person-needed` when a step waits for a person, then
-//! `run-ended` with the counts. Readers skip events they do not know, so
-//! new ones can be added.
+//! `test-started`, `step-progress` (while a long step is still running),
+//! `step-ended` and `test-ended` for each test on each machine as they
+//! happen (machines run side by side, so their lines interleave),
+//! `person-needed` when a step waits for a person, then `run-ended` with
+//! the counts. Readers skip events they do not know, so new ones can be
+//! added.
 //!
 //! The same lines also go to `events.jsonl` in the bundle, with or without
 //! `--json`, so `status`, `results` and the runner page can follow a run
@@ -42,6 +43,15 @@ pub enum Event<'a> {
     TestStarted {
         machine: &'a str,
         test: &'a str,
+    },
+    /// A step is still running, so a long one (a soak, a slow boot) shows
+    /// it is alive rather than going silent. `milliseconds` is how long it
+    /// has run so far.
+    StepProgress {
+        machine: &'a str,
+        test: &'a str,
+        step: &'a str,
+        milliseconds: u64,
     },
     /// One step of a test is done. `note` is what went wrong or what the
     /// step saw, cut at 2000 bytes.
@@ -156,6 +166,9 @@ fn human(event: &Event<'_>) -> Option<String> {
             bundle.display()
         ),
         Event::TestStarted { machine, test } => format!("[{machine}] {test}: running"),
+        Event::StepProgress { machine, test, milliseconds, .. } => {
+            format!("[{machine}] {test}: still running ({})", seconds(*milliseconds))
+        }
         Event::StepEnded { .. } => return None,
         Event::PersonNeeded { machine, test, step, done } => {
             format!("[{machine}] {test}: NEEDS YOU: {step}; once done, run `{done}`")
