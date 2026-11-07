@@ -25,6 +25,9 @@ The lab's rules apply to agents as to people:
 - Send findings only with `dukovo-lab send`, which puts them in the
   private lab-results repository and nowhere else
   ([Sending findings](sending.md)).
+- Change or remove a schedule only when a person asks: schedules are the
+  maintainer's ([Schedules](schedules.md)). `dukovo-lab schedule --json`
+  shows them, and how each last went, at any time.
 
 ## Start, follow, report
 

@@ -496,6 +496,7 @@ mod tests {
             machines: Vec::new(),
             tests: Vec::new(),
             preset: None,
+            schedule: None,
             summary: None,
             stopped: false,
         }

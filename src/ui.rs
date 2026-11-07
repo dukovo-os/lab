@@ -5,7 +5,8 @@
 //!
 //! The page does nothing a command cannot: each of its buttons runs a
 //! `dukovo-lab` command with `--json` (`run --detach`, `status`, `stop`,
-//! `done`, `results`, `runs`, `list`, `machines`, `findings`, `send`)
+//! `done`, `results`, `runs`, `list`, `machines`, `findings`, `send`,
+//! `schedule`)
 //! and shows the answer,
 //! and every answer names the command it ran. So whatever a person does
 //! on the page, an agent can do with the same commands, and the page can
@@ -244,6 +245,7 @@ impl Page {
             ("GET", "/api/list") => self.command(&["list"]),
             ("GET", "/api/machines") => self.command(&["machines"]),
             ("GET", "/api/runs") => self.command(&["runs", "--limit", "20"]),
+            ("GET", "/api/schedules") => self.command(&["schedule"]),
             ("GET", "/api/findings") => match request.query("run") {
                 None => self.command(&["findings", "--all"]),
                 Some(id) if store::valid_run_id(id) => self.command(&["findings", "--run", id]),
@@ -278,6 +280,7 @@ impl Page {
                     },
                     "/api/send" => self.send(&body),
                     "/api/findings" => self.change_finding(&body),
+                    "/api/schedules" => self.change_schedule(&body),
                     _ => Response::text(404, "No such action."),
                 }
             }
@@ -392,6 +395,84 @@ impl Page {
         } else {
             self.command(&["findings", id, "--not-a-bug", "--note", &note])
         }
+    }
+
+    /// Makes, changes or starts a schedule: `{"save": {...}}`, or
+    /// `{"remove" | "pause" | "resume" | "start": name}`. A save holds
+    /// what `schedule save` takes: name, title, preset or tests or all,
+    /// machines, at and days or each_build, and send.
+    fn change_schedule(&self, body: &Value) -> Response {
+        for action in ["remove", "pause", "resume", "start"] {
+            if let Some(name) = body[action].as_str() {
+                if !is_plain_name(name) {
+                    return bad("not a schedule name");
+                }
+                return self.command(&["schedule", action, name]);
+            }
+        }
+        let save = &body["save"];
+        let Some(name) = save["name"].as_str().filter(|name| is_plain_name(name)) else {
+            return bad("give the schedule a name: lowercase letters, digits and dashes");
+        };
+        let strings = |field: &str| -> Vec<String> {
+            save[field]
+                .as_array()
+                .map(|items| {
+                    items.iter().filter_map(|item| item.as_str().map(String::from)).collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut args: Vec<String> = vec!["schedule".into(), "save".into(), name.into()];
+        if let Some(preset) = save["preset"].as_str() {
+            if !is_plain_name(preset) {
+                return bad("not a preset name");
+            }
+            args.extend(["--preset".into(), preset.into()]);
+        } else if save["all"].as_bool() == Some(true) {
+            args.push("--all".into());
+        } else {
+            let tests = strings("tests");
+            let plain =
+                |test: &String| test.split('/').all(is_plain_name) && test.split('/').count() <= 2;
+            if tests.is_empty() || !tests.iter().all(plain) {
+                return bad("pick what the schedule runs");
+            }
+            args.extend(tests);
+        }
+        let machines = strings("machines");
+        if machines.is_empty() || !machines.iter().all(|machine| is_plain_name(machine)) {
+            return bad("pick the machines the schedule runs on");
+        }
+        args.extend(["--machine".into(), machines.join(",")]);
+        if save["each_build"].as_bool() == Some(true) {
+            args.push("--each-build".into());
+        } else {
+            let Some(at) = save["at"].as_str() else { return bad("give the time it runs") };
+            // A time and day names only; `schedule save` checks them again.
+            let time = |text: &str| {
+                text.len() == 5 && text.chars().all(|c| c.is_ascii_digit() || c == ':')
+            };
+            let days = strings("days");
+            if !time(at) || !days.iter().all(|day| day.len() == 3 && is_plain_name(day)) {
+                return bad("not a time or days");
+            }
+            args.extend(["--at".into(), at.into()]);
+            if !days.is_empty() {
+                args.extend(["--days".into(), days.join(",")]);
+            }
+        }
+        args.push(if save["send"].as_bool() == Some(false) { "--hold" } else { "--send" }.into());
+        if let Some(title) = save["title"].as_str() {
+            let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            if title.chars().count() > 80 {
+                return bad("keep the title under 80 characters");
+            }
+            if !title.is_empty() {
+                args.extend(["--title".into(), title]);
+            }
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.command(&args)
     }
 
     /// Runs `dukovo-lab <args> --json` and answers with what it printed,
@@ -595,6 +676,43 @@ mod tests {
         assert_eq!(post(&page, "/api/findings", r#"{"finding":"-x","reopen":true}"#).status, 400);
         let long = format!(r#"{{"finding":"{id}","not_a_bug":true,"note":"{}"}}"#, "x".repeat(501));
         assert_eq!(post(&page, "/api/findings", &long).status, 400);
+    }
+
+    #[test]
+    fn makes_schedules_only_from_plain_names_and_times() {
+        let store = TempDir::new("ui-schedules");
+        let page = page(store.path());
+        let saved = post(
+            &page,
+            "/api/schedules",
+            r#"{"save":{"name":"nightly","title":"Full run","preset":"full","machines":["qemu","optiplex"],"at":"01:00","days":["sun"],"send":false}}"#,
+        );
+        assert_eq!(
+            command_of(&saved),
+            "dukovo-lab schedule save nightly --preset full --machine qemu,optiplex --at 01:00 --days sun --hold --title 'Full run' --json"
+        );
+        let each = post(
+            &page,
+            "/api/schedules",
+            r#"{"save":{"name":"quick","tests":["boot","drivers/link-pull"],"machines":["qemu"],"each_build":true}}"#,
+        );
+        assert_eq!(
+            command_of(&each),
+            "dukovo-lab schedule save quick boot drivers/link-pull --machine qemu --each-build --send --json"
+        );
+        let started = post(&page, "/api/schedules", r#"{"start":"nightly"}"#);
+        assert_eq!(command_of(&started), "dukovo-lab schedule start nightly --json");
+        for body in [
+            r#"{"start":"--all"}"#,
+            r#"{"save":{"name":"-x","all":true,"machines":["qemu"],"each_build":true}}"#,
+            r#"{"save":{"name":"x","tests":["--all"],"machines":["qemu"],"each_build":true}}"#,
+            r#"{"save":{"name":"x","all":true,"machines":[],"each_build":true}}"#,
+            r#"{"save":{"name":"x","all":true,"machines":["qemu"],"at":"--now"}}"#,
+            r#"{"save":{"name":"x","all":true,"machines":["qemu"],"at":"01:00","days":["--x"]}}"#,
+            r#"{"save":{"name":"x","all":true,"machines":["qemu"]}}"#,
+        ] {
+            assert_eq!(post(&page, "/api/schedules", body).status, 400, "{body}");
+        }
     }
 
     #[test]

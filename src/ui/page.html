@@ -64,6 +64,19 @@ in by running dukovo-lab commands through the server (see ui.rs).
         </div>
       </section>
 
+      <section class="panel" aria-label="Schedules">
+        <div class="ph"><h2>Schedules</h2><div class="tools"><button class="btn" type="button" id="new-schedule">New schedule</button></div></div>
+        <div class="histwrap" id="schedules-table" hidden>
+          <table class="hist sched">
+            <thead><tr><th>Runs</th><th id="when-head">When</th><th>Machines</th><th>Findings</th><th>Next</th><th></th></tr></thead>
+            <tbody id="schedules"></tbody>
+          </table>
+        </div>
+        <p class="note pad" id="no-schedules" hidden>No schedules yet. New schedule makes one: tests that run by themselves at a time or on each new build on main, with this page closed.</p>
+        <form class="sform" id="schedule-form" hidden></form>
+        <p class="note pad" id="schedule-note">Scheduled runs always skip tests that need you. A scheduled run waits if a run is already going on that machine, and tests main as it is then, on the lab's own Dukovo checkout.</p>
+      </section>
+
       <section class="panel" aria-label="Past runs">
         <div class="ph"><h2>Past runs</h2></div>
         <div class="histwrap">

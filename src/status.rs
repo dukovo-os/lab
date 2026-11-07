@@ -141,6 +141,8 @@ pub struct Status {
     pub bundle: PathBuf,
     pub build: Option<String>,
     pub preset: Option<String>,
+    /// The schedule that started it, if one did.
+    pub schedule: Option<String>,
     pub started: String,
     pub ended: Option<String>,
     pub counts: Counts,
@@ -288,6 +290,7 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
         bundle,
         build: record.build,
         preset: record.preset,
+        schedule: record.schedule,
         started: record.started,
         ended: record.ended,
         counts,
@@ -431,6 +434,8 @@ pub struct RunSummary {
     pub ended: Option<String>,
     pub build: Option<String>,
     pub preset: Option<String>,
+    /// The schedule that started it, if one did.
+    pub schedule: Option<String>,
     pub machines: Vec<String>,
     pub tests: usize,
     pub summary: Option<crate::bundle::Summary>,
@@ -459,6 +464,7 @@ pub fn runs(store: &Path, limit: usize) -> Vec<RunSummary> {
                 ended: record.ended,
                 build: record.build,
                 preset: record.preset,
+                schedule: record.schedule,
                 machines: record.machines.into_iter().map(|machine| machine.name).collect(),
                 tests: record.tests.len(),
                 summary: record.summary,
@@ -494,6 +500,7 @@ mod tests {
                 .into(),
             tests: vec!["boot/a".into(), "boot/b".into()],
             preset: None,
+            schedule: None,
             summary: None,
             stopped: false,
         }

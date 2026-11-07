@@ -118,3 +118,17 @@ table.hist th { font-weight: 500; color: var(--muted); font-size: 12px; }
 table.hist tbody tr { cursor: pointer; }
 table.hist tbody tr:hover, table.hist tbody tr.sel { background: var(--bg); }
 .mono { font-family: var(--mono); font-size: 12.5px; }
+table.sched tbody tr { cursor: default; }
+table.sched td { vertical-align: top; }
+.sform { border-top: 1px solid var(--line); padding: 12px 16px; display: grid; gap: 12px; background: var(--bg); }
+.sform h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.sform .row { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 6px 12px; align-items: center; }
+@media (max-width: 520px) { .sform .row { grid-template-columns: minmax(0, 1fr); } }
+.sform .row > span { font-size: 12.5px; color: var(--muted); }
+.sform .opts { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.sform .opts label { display: inline-flex; gap: 5px; align-items: center; font-size: 13px; }
+.sform input[type=text], .sform input[type=time], .sform select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); min-width: 0; }
+.sform input[type=text] { flex: 1 1 200px; }
+.sform .acts { display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; }
+.sform .acts div { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn.danger { color: var(--bad); border-color: var(--bad); }
