@@ -202,8 +202,8 @@ pub enum Fit {
 }
 
 impl Fit {
-    /// Why a run skips the test, if it does. Needs you tests are skipped
-    /// until the runner page can ask a person to act (PR 2).
+    /// Why a run skips the test, if it does. A run given `--with-person`
+    /// runs Needs you tests instead, asking a person to do their steps.
     pub fn skip_reason(&self) -> Option<String> {
         let names =
             |controls: &[Control]| controls.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ");
@@ -495,10 +495,106 @@ pub fn select<'a>(tests: &'a [Test], names: &[String]) -> Result<Vec<&'a Test>, 
     Ok(picked)
 }
 
+/// A named set of tests to run together, such as a quick check before a
+/// merge. The runner page offers them; `run --preset <name>` runs one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Preset {
+    /// What `--preset` takes, such as `quick`.
+    pub name: String,
+    /// What the runner page shows, such as "Quick check".
+    pub title: String,
+    pub about: String,
+    /// Test ids, in the order they run.
+    pub tests: Vec<String>,
+}
+
+/// presets.toml as written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetsFile {
+    #[serde(rename = "preset", default)]
+    presets: Vec<PresetFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresetFile {
+    name: String,
+    title: String,
+    #[serde(default)]
+    about: String,
+    /// Tests and categories, as `run` takes them.
+    tests: Vec<String>,
+}
+
+/// Reads `<dir>/presets.toml`, if there is one, naming its tests by id.
+/// Like a test file, a preset that is wrong stops every command.
+pub fn load_presets(dir: &Path, tests: &[Test]) -> Result<Vec<Preset>, Error> {
+    let path = dir.join("presets.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(Error::Usage(format!("reading {}: {err}", path.display()))),
+    };
+    let file: PresetsFile = toml::from_str(&text)
+        .map_err(|err| Error::Usage(format!("{}: {}", path.display(), err.message())))?;
+    let mut presets: Vec<Preset> = Vec::new();
+    for preset in file.presets {
+        let bad = |why: String| {
+            Error::Usage(format!("{}: preset \"{}\": {why}", path.display(), preset.name))
+        };
+        if !is_plain_name(&preset.name) {
+            return Err(bad("a name is letters, digits and dashes".into()));
+        }
+        if presets.iter().any(|known| known.name == preset.name) {
+            return Err(bad("named twice".into()));
+        }
+        if preset.tests.is_empty() {
+            return Err(bad("it has no tests".into()));
+        }
+        let picked = select(tests, &preset.tests).map_err(|err| match err {
+            Error::Usage(why) | Error::Harness(why) | Error::Busy(why) => bad(why),
+        })?;
+        presets.push(Preset {
+            tests: picked.iter().map(|test| test.id.clone()).collect(),
+            name: preset.name,
+            title: preset.title,
+            about: preset.about,
+        });
+    }
+    Ok(presets)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[test]
+    fn presets_name_tests_and_categories() {
+        let dir = TempDir::new("suite-presets");
+        let tiny = "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n";
+        for file in ["boot/a.toml", "drivers/b.toml", "drivers/c.toml"] {
+            dir.write(file, tiny);
+        }
+        let tests = load(dir.path()).unwrap();
+        assert_eq!(load_presets(dir.path(), &tests).unwrap(), [], "no file, no presets");
+        dir.write(
+            "presets.toml",
+            "[[preset]]\nname = \"quick\"\ntitle = \"Quick check\"\ntests = [\"drivers\", \"boot/a\"]\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        let presets = load_presets(dir.path(), &tests).unwrap();
+        assert_eq!(presets[0].tests, ["drivers/b", "drivers/c", "boot/a"]);
+        dir.write(
+            "presets.toml",
+            "[[preset]]\nname = \"q\"\ntitle = \"Q\"\ntests = [\"boot/x\"]\n",
+        );
+        let err = load_presets(dir.path(), &tests).unwrap_err();
+        assert!(
+            matches!(err, Error::Usage(why) if why.contains("preset \"q\"") && why.contains("boot/x"))
+        );
+    }
 
     const LINK_PULL: &str = r#"
 about = "The network link drops and comes back"

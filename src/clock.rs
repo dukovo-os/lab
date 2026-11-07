@@ -44,10 +44,26 @@ impl Utc {
         format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
     }
 
-    /// The date alone, as `2026-11-07`: a bundle's folder.
-    pub fn date(self) -> String {
-        let (year, month, day, ..) = self.fields();
-        format!("{year:04}-{month:02}-{day:02}")
+    /// Reads an RFC 3339 time in UTC as [`Utc::rfc3339`] writes it.
+    pub fn parse_rfc3339(text: &str) -> Option<Self> {
+        let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<u32>().ok();
+        let bytes = text.as_bytes();
+        if bytes.len() != 20 || bytes[4] != b'-' || bytes[10] != b'T' || bytes[19] != b'Z' {
+            return None;
+        }
+        let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+        let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+            return None;
+        }
+        let days = days_from_civil(i64::from(year), month, day);
+        let seconds = days * 86_400 + i64::from(hour * 3600 + minute * 60 + second);
+        u64::try_from(seconds).ok().map(|seconds| Self { seconds })
+    }
+
+    /// Seconds from `earlier` to this time; zero if it is not later.
+    pub fn seconds_since(self, earlier: Self) -> u64 {
+        self.seconds.saturating_sub(earlier.seconds)
     }
 
     /// Compact, for run ids: `20261107-153012`.
@@ -73,6 +89,17 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// The days from 1970-01-01 to a civil date: [`civil_from_days`] undone.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_index = i64::from(if month > 2 { month - 3 } else { month + 9 }); // March is 0
+    let day_of_year = (153 * month_index + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +110,18 @@ mod tests {
         // 2026-11-07 15:30:12 UTC, and the leap day of 2024.
         assert_eq!(Utc::from_seconds(1_794_065_412).rfc3339(), "2026-11-07T15:30:12Z");
         assert_eq!(Utc::from_seconds(1_794_065_412).compact(), "20261107-153012");
-        assert_eq!(Utc::from_seconds(1_709_164_800).date(), "2024-02-29");
+        assert_eq!(Utc::from_seconds(1_709_164_800).rfc3339(), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn reads_back_what_it_writes() {
+        for seconds in [0, 951_782_400, 1_709_164_800, 1_794_065_412] {
+            let time = Utc::from_seconds(seconds);
+            assert_eq!(Utc::parse_rfc3339(&time.rfc3339()), Some(time));
+        }
+        assert_eq!(Utc::parse_rfc3339("2026-11-07 15:30:12"), None);
+        assert_eq!(Utc::parse_rfc3339("2026-13-07T15:30:12Z"), None);
+        let later = Utc::parse_rfc3339("2026-11-07T15:31:00Z").unwrap();
+        assert_eq!(later.seconds_since(Utc::from_seconds(1_794_065_412)), 48);
     }
 }

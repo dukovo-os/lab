@@ -18,6 +18,7 @@ struct FakeMachine {
     serial: PathBuf,
     boot: u32,
     on: bool,
+    stop: crate::stop::Stop,
     /// Whether it boots again after reset; the machine named `stuck`
     /// does not.
     restarts: bool,
@@ -89,7 +90,9 @@ impl Driver for FakeMachine {
             "uname" => (Some(0), "Dukovo\n".into()),
             "false" => (Some(1), String::new()),
             "hang" => {
-                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                while Instant::now() < deadline && !self.stop.requested() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
                 (None, String::new())
             }
             other => (Some(127), format!("{other}: not found\n")),
@@ -116,6 +119,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         serial: PathBuf::new(),
         boot: 0,
         on: false,
+        stop: setup.stop,
         restarts: machine.name != "stuck",
     }))
 }
@@ -171,6 +175,16 @@ struct Done {
 }
 
 fn run_on(setting: &Setting, machines: Vec<&Machine>) -> (Done, Vec<ResultRecord>) {
+    run_with(setting, machines, false, None)
+}
+
+/// A run with Needs you tests or without, under a chosen id or a new one.
+fn run_with(
+    setting: &Setting,
+    machines: Vec<&Machine>,
+    with_person: bool,
+    id: Option<&str>,
+) -> (Done, Vec<ResultRecord>) {
     let request = Request {
         tests: setting.tests.iter().collect(),
         machines,
@@ -178,15 +192,38 @@ fn run_on(setting: &Setting, machines: Vec<&Machine>) -> (Done, Vec<ResultRecord
         build: Some("0.13.0 test".into()),
         store: setting.dir.path().join("store"),
         key: Some(setting.dir.path().join("lab_ed25519")),
+        with_person,
+        preset: None,
+        id: Some(
+            id.map_or_else(|| crate::bundle::new_run_id(crate::clock::Utc::now()), String::from),
+        ),
     };
-    let ended = run(&request, &Reporter::new(true), &start_fake).unwrap();
-    // The store holds this one run: runs/<date>/<id>/.
-    let runs = request.store.join("runs");
-    let date = fs::read_dir(&runs).unwrap().next().unwrap().unwrap().path();
-    let bundle = fs::read_dir(date).unwrap().next().unwrap().unwrap().path();
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
     let results: crate::bundle::ResultsFile =
         serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
     (Done { summary: ended.summary, bundle }, results.results)
+}
+
+/// Waits until the run's events hold `text`, as a person watching the
+/// page would, then does `then`.
+fn when_events_say(
+    store: PathBuf,
+    id: &'static str,
+    text: &'static str,
+    then: impl FnOnce() + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let events = crate::store::bundle_dir(&store, id).join("events.jsonl");
+        for _ in 0..500 {
+            if fs::read_to_string(&events).is_ok_and(|events| events.contains(text)) {
+                then();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the events never said {text}");
+    });
 }
 
 fn outcomes(results: &[ResultRecord], machine: &str) -> Vec<(String, Outcome, Option<u32>)> {
@@ -307,4 +344,70 @@ fn a_new_boot_is_waited_for_and_an_off_machine_runs_nothing() {
     let (result, why) = reason("qemu", "stress/off");
     assert_eq!(result, Outcome::Fail);
     assert_eq!(why, "step 2: the machine was off, so `true` could not run");
+}
+
+#[test]
+fn a_stopped_run_skips_what_it_did_not_finish() {
+    let setting = setting_with(&[
+        ("stress/hang.toml", "about = \"hangs\"\ntime = \"1m\"\n[[step]]\nrun = \"hang\"\n"),
+        ("stress/later.toml", "about = \"later\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+    ]);
+    let id = "20261107-153012-0001";
+    let store = setting.dir.path().join("store");
+    let asker = store.clone();
+    when_events_say(store.clone(), id, "\"step\":\"boot afresh", move || {
+        crate::store::request_stop(&asker, id).unwrap();
+    });
+    let started = Instant::now();
+    let (ended, results) = run_with(&setting, vec![&setting.qemu], false, Some(id));
+    assert!(started.elapsed().as_secs() < 30, "the hanging command was cut short");
+    let reasons: Vec<(&str, Outcome, &str)> = results
+        .iter()
+        .map(|r| (r.test.as_str(), r.result, r.reason.as_deref().unwrap_or("")))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("stress/hang", Outcome::Skip, "the run was stopped during this test"),
+            ("stress/later", Outcome::Skip, "the run was stopped before this test"),
+        ]
+    );
+    let run: RunRecord =
+        serde_json::from_str(&fs::read_to_string(ended.bundle.join("run.json")).unwrap()).unwrap();
+    assert!(run.stopped);
+    assert!(!crate::store::is_running(&store, id), "the run let go of its lock");
+}
+
+#[test]
+fn a_needs_you_step_waits_for_a_person() {
+    let setting = setting_with(&[(
+        "drivers/link.toml",
+        "about = \"link\"\ntime = \"2s\"\n[[step]]\nlink = \"down\"\n[[step]]\nrun = \"true\"\n",
+    )]);
+    let mut person = setting.qemu.clone();
+    person.name = "person".into();
+    person.controls.insert(Control::Link, Who::Person);
+
+    // Without --with-person, it is skipped.
+    let (_, results) = run_with(&setting, vec![&person], false, Some("20261107-153012-0002"));
+    assert_eq!(results[0].reason.as_deref(), Some("needs a person for link"));
+
+    // With it, the run asks and waits for `done`.
+    let id = "20261107-153012-0003";
+    let store = setting.dir.path().join("store");
+    let teller = store.clone();
+    when_events_say(store, id, "person-needed", move || {
+        crate::store::say_done(&teller, id, "person").unwrap();
+    });
+    let (ended, results) = run_with(&setting, vec![&person], true, Some(id));
+    assert_eq!(results[0].result, Outcome::Pass, "{:?}", results[0].reason);
+    assert_eq!(results[0].steps[1].note.as_deref(), Some("a person said it was done"));
+    let events = fs::read_to_string(ended.bundle.join("events.jsonl")).unwrap();
+    assert!(events.contains(&format!("\"done\":\"dukovo-lab done {id} --machine person\"")));
+
+    // No one answers: skipped at the time limit, not failed.
+    let (_, results) = run_with(&setting, vec![&person], true, Some("20261107-153012-0004"));
+    assert_eq!(results[0].result, Outcome::Skip);
+    let why = results[0].reason.as_deref().unwrap();
+    assert!(why.contains("no one said \"pull the network cable\" was done"), "{why}");
 }

@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::stop::Stop;
+
 /// The account `ob image --lab` makes for the lab.
 pub const LAB_ACCOUNT: &str = "lab";
 
@@ -49,8 +51,9 @@ pub struct Output {
 }
 
 impl Target {
-    /// Runs `command` on the machine, stopping it at `deadline`.
-    pub fn run(&self, command: &str, deadline: Instant) -> Result<Output, String> {
+    /// Runs `command` on the machine, stopping it at `deadline` or when
+    /// the run is stopped.
+    pub fn run(&self, command: &str, deadline: Instant, stop: &Stop) -> Result<Output, String> {
         let output_file = File::create(&self.scratch)
             .map_err(|err| format!("making {}: {err}", self.scratch.display()))?;
         let errors_file = output_file.try_clone().map_err(|err| err.to_string())?;
@@ -65,7 +68,7 @@ impl Target {
             if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
                 break status.code();
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || stop.requested() {
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;

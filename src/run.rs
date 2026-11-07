@@ -16,10 +16,17 @@
 //! or the machine breaks. Each test's log in the bundle lists its steps
 //! with what each did; start there when a result surprises you, then the
 //! boot's serial log.
+//!
+//! A step whose control a person does on the machine (a Needs you step,
+//! run only with `--with-person`) is not done by the driver: the run
+//! reports a `person-needed` event and waits until someone runs
+//! `dukovo-lab done` or presses Done on the runner page. A run can be
+//! stopped part way (see stop.rs); what it did not finish is skipped.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::Error;
@@ -30,9 +37,15 @@ use crate::bundle::{
 use crate::clock::Utc;
 use crate::driver::{Driver, Setup};
 use crate::machines::{Control, Machine, Who};
-use crate::output::{Event, Reporter};
-use crate::suite::{Command, PowerAction, Step, Test};
+use crate::output::{Event, Reporter, short_note};
+use crate::stop::Stop;
+use crate::store::Running;
+use crate::suite::{Command, Fit, PowerAction, Step, Test};
 use crate::units::format_duration;
+
+/// What a stopped test's result says.
+const STOPPED_DURING: &str = "the run was stopped during this test";
+const STOPPED_BEFORE: &str = "the run was stopped before this test";
 
 /// What to run.
 pub struct Request<'a> {
@@ -46,11 +59,28 @@ pub struct Request<'a> {
     pub store: PathBuf,
     /// The lab key, when there is one.
     pub key: Option<PathBuf>,
+    /// Whether to run Needs you tests, asking a person to do their steps.
+    pub with_person: bool,
+    /// The preset the tests came from, for run.json.
+    pub preset: Option<String>,
+    /// The run's id, when the caller chose it (a detached run's parent
+    /// does, to name the run before it starts); else a new one.
+    pub id: Option<String>,
 }
 
 /// How a run went.
 pub struct Ended {
     pub summary: Summary,
+}
+
+/// What every machine's worker shares.
+struct Shared<'a> {
+    run_id: &'a str,
+    bundle: &'a Bundle,
+    reporter: &'a Reporter,
+    running: &'a Running,
+    stop: &'a Stop,
+    with_person: bool,
 }
 
 /// Starts a machine's driver; [`crate::driver::start`] outside tests.
@@ -63,7 +93,11 @@ pub fn run(
     start: &StartDriver,
 ) -> Result<Ended, Error> {
     let started = Utc::now();
-    let id = new_run_id(started);
+    let id = request.id.clone().unwrap_or_else(|| new_run_id(started));
+    // Before anything is written: a machine another run is using stops
+    // this run here, with nothing left behind.
+    let names: Vec<&str> = request.machines.iter().map(|machine| machine.name.as_str()).collect();
+    let running = Running::start(&request.store, &id, &names)?;
     let record = RunRecord {
         schema: SCHEMA,
         id: id.clone(),
@@ -82,9 +116,15 @@ pub fn run(
             })
             .collect(),
         tests: request.tests.iter().map(|test| test.id.clone()).collect(),
+        preset: request.preset.clone(),
         summary: None,
+        stopped: false,
     };
-    let mut bundle = Bundle::create(&request.store, record, started).map_err(Error::Harness)?;
+    let mut bundle = Bundle::create(&request.store, record).map_err(Error::Harness)?;
+    let events = bundle.dir().join("events.jsonl");
+    let events = File::create(&events)
+        .map_err(|err| Error::Harness(format!("making {}: {err}", events.display())))?;
+    reporter.keep_in(events);
     reporter.report(&Event::RunStarted {
         id: &id,
         bundle: bundle.dir(),
@@ -93,24 +133,49 @@ pub fn run(
     });
 
     let work = request.store.join("work").join(&id);
+    let image = pin_image(&request.image, &work);
     let sockets = socket_folder(&id);
+    let stop = Stop::default();
+    let finished = AtomicBool::new(false);
+    let shared = Shared {
+        run_id: &id,
+        bundle: &bundle,
+        reporter,
+        running: &running,
+        stop: &stop,
+        with_person: request.with_person,
+    };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
+        // Ends the watcher below however this ends, a worker's panic too,
+        // or the scope would wait for it for ever.
+        let _finished = SetOnDrop(&finished);
+        // Watches for `dukovo-lab stop` while the machines work.
+        scope.spawn(|| {
+            while !finished.load(Ordering::Relaxed) {
+                if running.stop_requested() {
+                    stop.request();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
         let workers: Vec<_> = request
             .machines
             .iter()
             .enumerate()
             .map(|(index, &machine)| {
                 let setup = Setup {
-                    image: request.image.clone(),
+                    image: image.clone(),
                     logs: bundle.logs(&machine.name),
                     work: work.join(&machine.name),
                     // By number, not name: socket paths must stay short.
                     sockets: sockets.join(index.to_string()),
                     key: request.key.clone(),
+                    stop: stop.clone(),
                 };
-                let bundle = &bundle;
+                let shared = &shared;
                 let tests = &request.tests;
-                scope.spawn(move || run_machine(machine, tests, setup, bundle, reporter, start))
+                scope.spawn(move || run_machine(machine, tests, setup, shared, start))
             })
             .collect();
         workers
@@ -122,16 +187,51 @@ pub fn run(
     let _ = fs::remove_dir_all(&sockets);
 
     let summary = Summary::of(&results);
+    let stopped = stop.requested();
     bundle.write_results(&results).map_err(Error::Harness)?;
     bundle.record.ended = Some(Utc::now().rfc3339());
     bundle.record.summary = Some(summary);
+    bundle.record.stopped = stopped;
     bundle.write_run().map_err(Error::Harness)?;
-    reporter.report(&Event::RunEnded { id: &id, bundle: bundle.dir(), summary });
+    reporter.report(&Event::RunEnded { id: &id, bundle: bundle.dir(), summary, stopped });
+    // The run's locks go only now, once run.json says it ended, so a
+    // reader never sees a run that is neither going nor ended.
+    running.end();
     Ok(Ended { summary })
 }
 
 /// A short folder for the run's sockets: the user's runtime folder when
 /// there is one, else the system's temporary folder.
+/// Sets its flag when dropped.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Keeps the image under test the same for the whole run: a second name
+/// for it in the run's work folder, which every boot then uses.
+///
+/// `ob image` makes a new file where the image was rather than writing
+/// over it, so a build started while this run goes (another `ob lab run`,
+/// say) leaves this run's image as it was, instead of changing it between
+/// one test's boot and the next. When the store is on another file system
+/// than the image, there can be no second name, and the run uses the
+/// image where it is.
+fn pin_image(image: &Path, work: &Path) -> PathBuf {
+    let Ok(real) = fs::canonicalize(image) else { return image.to_path_buf() };
+    // A dot, so no machine's folder beside it can have its name; the
+    // extension stays, as it says the image's format.
+    let qcow2 = real.extension().is_some_and(|ext| ext == "qcow2");
+    let pinned = work.join(if qcow2 { "under-test.qcow2" } else { "under-test.img" });
+    match fs::create_dir_all(work).and_then(|()| fs::hard_link(&real, &pinned)) {
+        Ok(()) => pinned,
+        Err(_) => image.to_path_buf(),
+    }
+}
+
 fn socket_folder(id: &str) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
     base.join("dukovo-lab").join(id)
@@ -142,29 +242,38 @@ fn run_machine(
     machine: &Machine,
     tests: &[&Test],
     setup: Setup,
-    bundle: &Bundle,
-    reporter: &Reporter,
+    shared: &Shared<'_>,
     start: &StartDriver,
 ) -> Vec<ResultRecord> {
     let has_key = setup.key.is_some();
     let (mut worker, broken) = match start(machine, setup) {
-        Ok(driver) => (Some(Worker::new(machine, driver, has_key, bundle, reporter)), None),
+        Ok(driver) => (Some(Worker::new(machine, driver, has_key, shared)), None),
         Err(err) => (None, Some(format!("the {} machine did not start: {err}", machine.name))),
     };
     let mut results = Vec::new();
     for &test in tests {
-        let result = match (test.fit(machine).skip_reason(), &mut worker) {
+        let skip = match test.fit(machine) {
+            _ if shared.stop.requested() => Some(STOPPED_BEFORE.to_string()),
+            Fit::NeedsPerson(_) if shared.with_person => None,
+            fit => fit.skip_reason(),
+        };
+        let ran_here = skip.is_none() && worker.is_some();
+        let result = match (skip, &mut worker) {
             (Some(reason), _) => skipped(test, machine, reason),
             (None, Some(worker)) => worker.run_test(test),
             (None, None) => errored(test, machine, broken.clone().unwrap_or_default()),
         };
-        if result.result == Outcome::Skip || worker.is_none() {
-            reporter.report(&Event::TestEnded {
+        // A test that ran reported its own end.
+        if !ran_here {
+            shared.reporter.report(&Event::TestEnded {
                 machine: &machine.name,
                 test: &test.id,
                 result: result.result,
                 reason: result.reason.as_deref(),
                 milliseconds: 0,
+                boot: None,
+                log: None,
+                screenshots: &[],
             });
         }
         results.push(result);
@@ -203,6 +312,9 @@ enum StepFailure {
     Fail(String),
     /// The harness or machine broke.
     Error(String),
+    /// It could not go on, and that says nothing about Dukovo or the
+    /// lab: the run was stopped, or no one did a Needs you step in time.
+    Skip(String),
 }
 
 /// One machine's worker.
@@ -211,8 +323,7 @@ struct Worker<'a> {
     driver: Box<dyn Driver>,
     /// Whether the lab has a key, so the machine's SSH channel can work.
     has_key: bool,
-    bundle: &'a Bundle,
-    reporter: &'a Reporter,
+    shared: &'a Shared<'a>,
     /// The machine's current boot, counted from 1; 0 before the first.
     boot: u32,
     /// Whether the last test passed and left the machine on, so the next
@@ -229,15 +340,13 @@ impl<'a> Worker<'a> {
         machine: &'a Machine,
         driver: Box<dyn Driver>,
         has_key: bool,
-        bundle: &'a Bundle,
-        reporter: &'a Reporter,
+        shared: &'a Shared<'a>,
     ) -> Self {
         Worker {
             machine,
             driver,
             has_key,
-            bundle,
-            reporter,
+            shared,
             boot: 0,
             reusable: false,
             serial: SerialWatch::new(PathBuf::new()),
@@ -249,7 +358,7 @@ impl<'a> Worker<'a> {
     /// Runs one test, from its boot (if it needs one) to its last step.
     fn run_test(&mut self, test: &Test) -> ResultRecord {
         let machine = &self.machine.name;
-        self.reporter.report(&Event::TestStarted { machine, test: &test.id });
+        self.shared.reporter.report(&Event::TestStarted { machine, test: &test.id });
         let started = Instant::now();
         let limit = test.time * self.driver.slowdown();
         let deadline = started + limit;
@@ -259,8 +368,10 @@ impl<'a> Worker<'a> {
 
         let mut failure = None;
         if test.fresh || !self.reusable || !self.driver.is_on() {
-            let (record, outcome) = self
-                .timed("boot afresh and wait until booted", |worker| worker.boot_fresh(deadline));
+            let (record, outcome) =
+                self.timed(test, "boot afresh and wait until booted", |worker| {
+                    worker.boot_fresh(deadline)
+                });
             steps.push(record);
             failure = outcome.err();
         } else {
@@ -271,34 +382,49 @@ impl<'a> Worker<'a> {
             if failure.is_some() {
                 break;
             }
+            if self.shared.stop.requested() {
+                failure = Some(StepFailure::Skip(STOPPED_DURING.into()));
+                break;
+            }
             let (record, outcome) =
-                self.timed(&step.describe(), |worker| worker.run_step(test, step, deadline));
+                self.timed(test, &step.describe(), |worker| worker.run_step(test, step, deadline));
             steps.push(record);
             failure = outcome.err().map(|failure| match failure {
                 StepFailure::Fail(why) => StepFailure::Fail(format!("step {}: {why}", index + 1)),
                 StepFailure::Error(why) => StepFailure::Error(format!("step {}: {why}", index + 1)),
+                StepFailure::Skip(why) => StepFailure::Skip(format!("step {}: {why}", index + 1)),
             });
         }
 
         let (result, reason) = match failure {
             None => (Outcome::Pass, None),
+            // Whatever the step said as it was cut short, the stop is why.
+            Some(_) if self.shared.stop.requested() => {
+                (Outcome::Skip, Some(STOPPED_DURING.to_string()))
+            }
             Some(StepFailure::Fail(why)) => {
                 (Outcome::Fail, Some(self.with_time_limit(why, deadline, test)))
             }
             Some(StepFailure::Error(why)) => (Outcome::Error, Some(why)),
+            Some(StepFailure::Skip(why)) => (Outcome::Skip, Some(why)),
         };
-        if result != Outcome::Pass {
+        if matches!(result, Outcome::Fail | Outcome::Error) {
             self.screenshot_after_failure(test);
         }
         self.reusable = result == Outcome::Pass && self.driver.is_on();
         let log = self.write_log(test, result, reason.as_deref());
         let milliseconds = started.elapsed().as_millis() as u64;
-        self.reporter.report(&Event::TestEnded {
+        let boot = (self.boot > 0).then_some(self.boot);
+        let screenshots = std::mem::take(&mut self.screenshots);
+        self.shared.reporter.report(&Event::TestEnded {
             machine,
             test: &test.id,
             result,
             reason: reason.as_deref(),
             milliseconds,
+            boot,
+            log: log.as_deref(),
+            screenshots: &screenshots,
         });
         ResultRecord {
             test: test.id.clone(),
@@ -306,16 +432,18 @@ impl<'a> Worker<'a> {
             result,
             reason,
             milliseconds,
-            boot: (self.boot > 0).then_some(self.boot),
+            boot,
             log,
             steps,
-            screenshots: std::mem::take(&mut self.screenshots),
+            screenshots,
         }
     }
 
-    /// Runs `action` as a step named `what`, logging and timing it.
+    /// Runs `action` as a step of `test` named `what`, logging, timing
+    /// and reporting it.
     fn timed(
         &mut self,
+        test: &Test,
         what: &str,
         action: impl FnOnce(&mut Self) -> Result<Option<String>, StepFailure>,
     ) -> (StepRecord, Result<(), StepFailure>) {
@@ -330,16 +458,28 @@ impl<'a> Worker<'a> {
             Err(StepFailure::Error(why)) => {
                 (Outcome::Error, Some(why.clone()), Err(StepFailure::Error(why)))
             }
+            Err(StepFailure::Skip(why)) => {
+                (Outcome::Skip, Some(why.clone()), Err(StepFailure::Skip(why)))
+            }
         };
         let word = match result {
             Outcome::Pass => "passed",
             Outcome::Fail => "FAILED",
-            _ => "ERROR",
+            Outcome::Skip => "skipped",
+            Outcome::Error => "ERROR",
         };
         self.log.push(format!("{what}: {word} after {milliseconds} ms"));
         if let Some(note) = &note {
             self.log.extend(note.lines().map(|line| format!("    {line}")));
         }
+        self.shared.reporter.report(&Event::StepEnded {
+            machine: &self.machine.name,
+            test: &test.id,
+            step: what,
+            result,
+            milliseconds,
+            note: note.as_deref().map(short_note),
+        });
         (StepRecord { step: what.into(), result, milliseconds, note }, outcome)
     }
 
@@ -371,7 +511,7 @@ impl<'a> Worker<'a> {
     }
 
     fn relative_serial(&self) -> String {
-        self.bundle.relative(self.driver.serial_log())
+        self.shared.bundle.relative(self.driver.serial_log())
     }
 
     /// Waits for the machine's ready line on the serial console, then,
@@ -387,6 +527,9 @@ impl<'a> Worker<'a> {
         }
         let mut last = String::new();
         while Instant::now() < deadline {
+            if self.shared.stop.requested() {
+                return Err(StepFailure::Skip(STOPPED_DURING.into()));
+            }
             let attempt = deadline.min(Instant::now() + Duration::from_secs(20));
             match self.driver.run_command("true", attempt) {
                 Ok(output) if output.status == Some(0) => return Ok(None),
@@ -406,6 +549,12 @@ impl<'a> Worker<'a> {
         step: &Step,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
+        // A control a person does here is theirs to do, whichever it is.
+        if let Some(control) = step.control()
+            && self.machine.who(control) == Who::Person
+        {
+            return self.ask_person(test, step, deadline);
+        }
         match step {
             Step::Run(command) => self.run_command(command, deadline),
             Step::Serial(text) => self.wait_serial(text, deadline),
@@ -424,7 +573,14 @@ impl<'a> Worker<'a> {
             Step::WaitReady => self.wait_ready(deadline),
             Step::Sleep(time) => {
                 let until = Instant::now() + *time;
-                std::thread::sleep(until.min(deadline).saturating_duration_since(Instant::now()));
+                let end = until.min(deadline);
+                while Instant::now() < end {
+                    if self.shared.stop.requested() {
+                        return Err(StepFailure::Skip(STOPPED_DURING.into()));
+                    }
+                    let slice = end.saturating_duration_since(Instant::now());
+                    std::thread::sleep(slice.min(Duration::from_millis(100)));
+                }
                 if until > deadline {
                     return Err(StepFailure::Fail(
                         "the wait ran past the test's time limit".into(),
@@ -432,6 +588,42 @@ impl<'a> Worker<'a> {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// Asks a person to do `step` on the machine, and waits until they
+    /// say they did (`dukovo-lab done`, or Done on the runner page).
+    fn ask_person(
+        &mut self,
+        test: &Test,
+        step: &Step,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let machine = &self.machine.name;
+        let what = step.describe();
+        let done = format!("dukovo-lab done {} --machine {machine}", self.shared.run_id);
+        // Only a `done` given after this ask counts.
+        self.shared.running.clear_done(machine);
+        self.shared.reporter.report(&Event::PersonNeeded {
+            machine,
+            test: &test.id,
+            step: &what,
+            done: &done,
+        });
+        self.log.push(format!("Asked a person to {what}; waiting for `{done}`."));
+        loop {
+            if self.shared.running.take_done(machine) {
+                return Ok(Some("a person said it was done".into()));
+            }
+            if self.shared.stop.requested() {
+                return Err(StepFailure::Skip(STOPPED_DURING.into()));
+            }
+            if Instant::now() >= deadline {
+                return Err(StepFailure::Skip(format!(
+                    "no one said \"{what}\" was done before the test's time limit"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
@@ -450,6 +642,10 @@ impl<'a> Worker<'a> {
         }
         let output =
             self.driver.run_command(&command.command, deadline).map_err(StepFailure::Error)?;
+        // Cut short by a stop: the command's end says nothing.
+        if output.status.is_none() && self.shared.stop.requested() {
+            return Err(StepFailure::Skip(STOPPED_DURING.into()));
+        }
         let shown = format!("$ {}\n{}", command.command, output.text.trim_end());
         let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
         match output.status {
@@ -503,6 +699,9 @@ impl<'a> Worker<'a> {
                     self.relative_serial()
                 )));
             }
+            if self.shared.stop.requested() {
+                return Err(StepFailure::Skip(STOPPED_DURING.into()));
+            }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -529,11 +728,11 @@ impl<'a> Worker<'a> {
     }
 
     fn screenshot(&mut self, test: &Test, name: &str) -> Result<(), String> {
-        let folder = self.bundle.screenshots(&self.machine.name);
+        let folder = self.shared.bundle.screenshots(&self.machine.name);
         fs::create_dir_all(&folder).map_err(|err| format!("making {}: {err}", folder.display()))?;
         let path = folder.join(format!("{}-{name}.png", test.id.replace('/', "-")));
         self.driver.screenshot(&path)?;
-        self.screenshots.push(self.bundle.relative(&path));
+        self.screenshots.push(self.shared.bundle.relative(&path));
         Ok(())
     }
 
@@ -553,12 +752,12 @@ impl<'a> Worker<'a> {
             Some(reason) => format!("Result: {result:?}: {reason}"),
             None => format!("Result: {result:?}"),
         });
-        let folder = self.bundle.logs(&self.machine.name);
+        let folder = self.shared.bundle.logs(&self.machine.name);
         let path = folder.join(format!("{}.log", test.id.replace('/', "-")));
         let mut text = std::mem::take(&mut self.log).join("\n");
         text.push('\n');
         fs::create_dir_all(&folder).and_then(|()| fs::write(&path, text)).ok()?;
-        Some(self.bundle.relative(&path))
+        Some(self.shared.bundle.relative(&path))
     }
 }
 
@@ -767,5 +966,22 @@ mod tests {
         assert!(watch.find("two"));
         watch.skip_to_end();
         assert!(!watch.find("one"));
+    }
+
+    #[test]
+    fn a_new_build_does_not_change_a_run_s_image() {
+        let dir = crate::testing::TempDir::new("pin-image");
+        let image = dir.write("out/dukovo-lab.img", "build one");
+        let pinned = pin_image(&image, &dir.path().join("work/run"));
+        assert_ne!(pinned, image);
+        // `ob image` makes a new file where the old one was.
+        fs::remove_file(&image).unwrap();
+        fs::write(&image, "build two").unwrap();
+        assert_eq!(fs::read_to_string(&pinned).unwrap(), "build one");
+        assert_eq!(pinned.extension().unwrap(), "img");
+        // No image there: the run uses the path it was given, and fails
+        // on it as before.
+        let missing = dir.path().join("none.img");
+        assert_eq!(pin_image(&missing, &dir.path().join("work/other")), missing);
     }
 }

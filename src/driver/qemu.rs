@@ -257,12 +257,15 @@ impl Qemu {
         Ok(&mut self.running.as_mut().expect("is_on said so").qmp)
     }
 
-    /// Waits for QEMU to end until `deadline`; kills it if `kill` and it
-    /// has not.
+    /// Waits for QEMU to end until `deadline`, or until the run is
+    /// stopped; kills it if `kill` and it has not ended.
     fn wait_for_exit(&mut self, deadline: Instant, kill: bool) -> bool {
         while Instant::now() < deadline {
             if !self.is_on() {
                 return true;
+            }
+            if !kill && self.setup.stop.requested() {
+                break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -414,7 +417,7 @@ impl Driver for Qemu {
             known_hosts: self.setup.work.join(format!("known_hosts-{}", self.boot)),
             scratch: self.setup.work.join("ssh-output"),
         };
-        target.run(command, deadline)
+        target.run(command, deadline, &self.setup.stop)
     }
 
     fn slowdown(&self) -> u32 {
@@ -493,6 +496,7 @@ mod tests {
             work: dir.path().join("work"),
             sockets: dir.path().join("s"),
             key: None,
+            stop: crate::stop::Stop::default(),
         };
         Qemu::new(settings, setup).unwrap()
     }
