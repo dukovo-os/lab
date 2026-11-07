@@ -66,6 +66,7 @@ Each step has exactly one action key, and only the options that go with it.
 | --- | --- | --- | --- |
 | `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. | ssh |
 | `bench = "<command>"` | `rows` (required), `limit` (default 1.00), `root` | Runs a benchmark program over SSH and holds each of its `rows` to the same row on the machine's Linux twin: passes when Dukovo takes at most `limit` times Linux's time per operation (see [Performance tests](#performance-tests)). | ssh, linux |
+| `attack = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command on the attacker, a second machine on a private network only it and the machine under test share, and holds its output as `run` does. `{target}` in the command, `expect` or `expect_not` becomes the machine's address on that network. See [Attack tests](#attack-tests-the-security-range). | attack |
 | `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started; after `power = "on"` or `"reset"`, only what the new boot printed. | serial |
 | `power = "on"` | | Powers the machine on. | power |
 | `power = "off"` | | Presses the power button and waits until the machine is off. Fails if it is still on at the time limit. | power |
@@ -208,6 +209,52 @@ rows = ["posix_fork_wait", "posix_fork_exec_wait"]
   passed or failed.
 - A run without a kit (no `--linux`) skips tests with bench steps and
   says why. Machines with no Linux twin (`linux = "none"`) skip them too.
+
+## Attack tests (the security range)
+
+A test with an `attack` step probes the machine under test from the
+outside, the way someone on the same network would. For it the runner
+sets up a security range: a private network that only the machine under
+test and an attacker share, reachable from nowhere else — not the lab's
+own network, not the internet. The attacker is a second machine the
+driver stands up for the test; under QEMU it is a second Dukovo guest
+joined to the machine by a private virtual network, with no way out of
+its own.
+
+```toml
+about = "The machine answers SSH on its port and nothing else"
+time = "5m"
+fresh = true
+
+[[step]]
+attack = "nc -z -w2 {target} 22"
+[[step]]
+attack = "nc -z -w2 {target} 23"
+exit = 1
+```
+
+- `{target}` becomes the machine under test's address on the private
+  network (`10.9.9.1`); the attacker's is `10.9.9.2`. A test uses
+  `{target}` rather than a fixed address, so the same test reads on any
+  machine. It is replaced in the command and in `expect` and
+  `expect_not`.
+- An `attack` step runs its command on the attacker and passes on the
+  same terms as a `run` step: the exit status, and the text its output
+  must and must not hold. It runs over SSH as the attacker's `lab`
+  account, or as root with `root = true`.
+- The first `attack` step of a boot brings the attacker up and gives each
+  side its address on the private network. That setup runs as root, so an
+  attack test needs the lab password, as a root step does (see [Running
+  as root](#running-as-root)).
+- The private network port is there only on a boot armed for an attack,
+  so an idle port never shows up in a network test: an attack test always
+  boots afresh, and its boot is never shared with the test after it.
+- A machine with no attacker (`attack = "none"` in its file) skips these
+  tests and says so. The attacker is the machine's own, never a person's.
+
+Attack tests live under `lab/tests/security/`. Keep them to probing the
+machine from the outside over the private range; a check of the machine's
+own state belongs in a `run` step.
 
 ## How a test runs
 

@@ -86,7 +86,9 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
 
 ## Rules
 
-- The lab network never faces the internet, and attacks stay on it.
+- The lab network never faces the internet, and an attack stays on a
+  private network only the attacker and the machine under test share,
+  reachable from nowhere else.
 - Lab images carry a test agent that release images never contain.
 - Security findings stay private until they are fixed.
 

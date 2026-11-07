@@ -31,6 +31,10 @@ struct FakeMachine {
     typing: String,
     /// Where the pointer points, which a click shows on the console.
     pointer: (u32, u32),
+    /// Whether the next boot gives the machine its private network port.
+    want_attacker: bool,
+    /// Whether the attacker is up on that network.
+    attacker_on: bool,
 }
 
 /// The characters the fake console draws, in the test font.
@@ -56,6 +60,8 @@ impl FakeMachine {
         fs::create_dir_all(&self.logs).unwrap();
         self.serial = self.logs.join(format!("serial-{}.log", self.boot));
         self.on = true;
+        // A new boot starts with no attacker up, as a real machine does.
+        self.attacker_on = false;
         self.say(FAKE_GEOMETRY);
     }
 
@@ -224,12 +230,52 @@ impl Driver for FakeMachine {
             "true" => (Some(0), String::new()),
             "uname" => (Some(0), "Dukovo\n".into()),
             "false" => (Some(1), String::new()),
+            // Giving the machine its address on the private network, as
+            // root, when an attack test sets the attacker up.
+            cmd if cmd.starts_with("elevate -S ip address add") => match input {
+                Some("sesame\n") => (Some(0), String::new()),
+                _ => (Some(1), "elevate: a password is needed\n".into()),
+            },
             "hang" => {
                 while Instant::now() < deadline && !self.stop.requested() {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 (None, String::new())
             }
+            other => (Some(127), format!("{other}: not found\n")),
+        };
+        Ok(Output { status, text })
+    }
+
+    fn want_attacker(&mut self, yes: bool) {
+        self.want_attacker = yes;
+    }
+
+    fn start_attacker(&mut self, _deadline: Instant) -> Result<(), String> {
+        if !self.want_attacker {
+            return Err("this boot was not given an attacker".into());
+        }
+        self.attacker_on = true;
+        Ok(())
+    }
+
+    fn attack(
+        &mut self,
+        command: &str,
+        input: Option<&str>,
+        _deadline: Instant,
+    ) -> Result<Output, String> {
+        if !self.attacker_on {
+            return Err("the attacker is not up".into());
+        }
+        let (status, text) = match command {
+            // The attacker's own address on the private network, as root.
+            cmd if cmd.starts_with("elevate -S ip address add") => match input {
+                Some("sesame\n") => (Some(0), String::new()),
+                _ => (Some(1), "elevate: a password is needed\n".into()),
+            },
+            // A port scan of the machine under test, which answers on 22.
+            "scan 10.9.9.1" => (Some(0), "10.9.9.1 22 open\n".into()),
             other => (Some(127), format!("{other}: not found\n")),
         };
         Ok(Output { status, text })
@@ -278,6 +324,8 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         screen: Vec::new(),
         typing: String::new(),
         pointer: (0, 0),
+        want_attacker: false,
+        attacker_on: false,
     }))
 }
 
@@ -604,6 +652,58 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         }
     }
     assert!(files > 3, "the bundle has its files");
+}
+
+#[test]
+fn attack_steps_run_on_a_private_lab_network() {
+    let setting = setting_with(&[
+        (
+            "security/scan.toml",
+            "about = \"a scan from the attacker\"\ntime = \"1m\"\nfresh = true\n\
+             [[step]]\nattack = \"scan {target}\"\nexpect = \"{target} 22 open\"\n",
+        ),
+        // Sorts after `scan` in the same category, so it runs next.
+        (
+            "security/zz-after.toml",
+            "about = \"after the attack boot\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+        ),
+    ]);
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        // The address setup on each side runs as root, through elevate.
+        password: Some("sesame".into()),
+        with_person: false,
+        linux: None,
+        fonts: None,
+        stick: None,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let by_test = |test: &str| results.results.iter().find(|r| r.test == test).unwrap().clone();
+
+    // The scan ran on the attacker and saw the machine's SSH port; its log
+    // shows the command with `{target}` resolved to the machine's address.
+    let scan = by_test("security/scan");
+    assert_eq!(scan.result, Outcome::Pass, "{:?}", scan.reason);
+    let log = fs::read_to_string(bundle.join(scan.log.as_ref().unwrap())).unwrap();
+    assert!(log.contains("scan 10.9.9.1"), "{log}");
+
+    // The attack boot is not shared, so the next test boots afresh and its
+    // private network port is gone.
+    let after = by_test("security/zz-after");
+    assert_eq!(after.result, Outcome::Pass, "{:?}", after.reason);
+    assert_eq!(after.steps[0].step, "boot afresh and wait until booted");
+    assert_eq!(ended.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
 }
 
 #[test]

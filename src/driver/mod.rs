@@ -22,6 +22,13 @@ use crate::ssh;
 use crate::stop::Stop;
 use crate::suite::{Button, PowerAction, Stick};
 
+/// The machine under test's address on the private lab network an attack
+/// runs over. An `attack` step's `{target}` becomes this.
+pub const TARGET_ON_SEGMENT: &str = "10.9.9.1";
+
+/// The attacker's address on that same network.
+pub const ATTACKER_ON_SEGMENT: &str = "10.9.9.2";
+
 /// A machine the runner is driving.
 pub trait Driver: Send {
     /// Turns the machine off if it is on, then boots it from a clean disk
@@ -80,6 +87,33 @@ pub trait Driver: Send {
         input: Option<&str>,
         deadline: Instant,
     ) -> Result<ssh::Output, String>;
+
+    /// Says whether the next [`Driver::boot_fresh`] gives the machine a
+    /// second network port on a private network of its own, for an
+    /// attacker to reach it on. The runner calls it before booting a test
+    /// that attacks, and with `false` before one that does not, so the
+    /// port is there only when it is wanted (an idle one would show up in
+    /// a network test). A driver with no attacker ignores it.
+    fn want_attacker(&mut self, _yes: bool) {}
+
+    /// Brings the attacker up on the private network, if it is not up
+    /// already, so [`Driver::attack`] can run commands on it. Fails when
+    /// this machine has no attacker, or it does not come up by `deadline`.
+    fn start_attacker(&mut self, _deadline: Instant) -> Result<(), String> {
+        Err("this machine has no attacker".into())
+    }
+
+    /// Runs `command` on the attacker, with `input` as its standard input,
+    /// and gives back what it printed. As [`Driver::run_command`], but on
+    /// the attacker rather than the machine under test.
+    fn attack(
+        &mut self,
+        _command: &str,
+        _input: Option<&str>,
+        _deadline: Instant,
+    ) -> Result<ssh::Output, String> {
+        Err("this machine has no attacker".into())
+    }
 
     /// How many times longer than on real hardware tests may take here.
     fn slowdown(&self) -> u32;
