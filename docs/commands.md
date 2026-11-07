@@ -203,8 +203,8 @@ dukovo-lab runs [--limit <n>]
 ```
 
 The newest runs (20 unless `--limit` says), newest first, each with its
-state, start, build, preset, machines, test count and summary. With
-`--json`: `{"runs": [...]}`.
+state, start, build, preset, machines, test count, summary and whether
+it was sent to lab-results (`sent`). With `--json`: `{"runs": [...]}`.
 
 ## findings
 
@@ -250,15 +250,15 @@ thread proposes a fix for each. `--all` sends every finding with
 something new (and any already there that a person has since marked not
 a bug); `--run <run>` sends a run and its findings. It uses a clone of
 lab-results on the lab PC, `lab-results` in the store unless
-`--results` names another, and the PC's own git and GitHub sign-in:
-it pulls, copies each run's bundle in (logs compressed), merges each
-finding with the copy there, commits and pushes. See
-[Sending findings](sending.md).
+`--results` names another, and the PC's own git and GitHub sign-in: it
+starts the clone afresh from lab-results, copies each run's bundle in
+(logs compressed), merges each finding with the copy there, commits and
+pushes. See [Sending findings](sending.md).
 
 With `--json`: `{"commit": "<sha>" or null, "runs": [...], "findings":
 [...]}`; `commit` is null when lab-results already had all of it. It
 exits 2 when there is no clone or nothing named exists, and 3 when git
-or the network fails; the store then still says unsent, so the next Send
+or the network fails; nothing is then marked sent, so the next Send
 tries again.
 
 ## ui
@@ -333,6 +333,6 @@ JSON. Times are UTC, in RFC 3339.
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |
 | `status` says a run `died` | Its process ended part way (killed, crashed, or the PC went down). `results` has what it finished; a detached run's own last messages are in `status`'s `output`. |
 | `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |
-| `send` exits 3 saying the clone has changes not committed | A send was cut short, or someone edited the clone. `git -C <clone> status` shows what; commit or drop it, then send again. |
-| `send` exits 3 saying it could not push | The commit is made in the clone and goes with the next send. Check the network and that `git -C <clone> push` works. |
+| `send` exits 3 saying the clone has changes not committed | Someone edited the clone outside `runs/` and `findings/`. `git -C <clone> status` shows what; commit and push it, or drop it, then send again. |
+| `send` exits 3 saying it could not push | Nothing was marked sent; the next send tries again. Check the network, and that `git -C <clone> push` works as the PC's GitHub account (`gh auth status`). |
 | The runner page says its key has changed | `dukovo-lab ui` was started again: open the address it printed this time. |

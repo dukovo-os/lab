@@ -181,10 +181,14 @@ impl Finding {
     /// What lab-results should hold once this finding is sent over `theirs`
     /// (its copy there, if it has one): every time it failed, from both,
     /// and the state lab-results moved it to, unless a person here said
-    /// it is not a bug or reopened it since.
+    /// it is not a bug. A finding lab-results calls fixed that has failed
+    /// again since, in a run lab-results does not have, is new again.
     pub fn merged_with(&self, theirs: Option<&Finding>) -> Finding {
         let mut merged = self.clone();
         if let Some(theirs) = theirs {
+            let failed_since = self.runs.iter().any(|seen| {
+                !theirs.runs.iter().any(|old| old.run == seen.run && old.machine == seen.machine)
+            });
             for seen in &theirs.runs {
                 merged.add(seen.clone());
             }
@@ -195,7 +199,11 @@ impl Finding {
                 && !self.state.set_in_results()
                 && self.state != State::NotABug
             {
-                merged.state = theirs.state;
+                merged.state = if theirs.state == State::Fixed && failed_since {
+                    State::New
+                } else {
+                    theirs.state
+                };
             }
             if theirs.fix.is_some() {
                 merged.fix.clone_from(&theirs.fix);
@@ -354,8 +362,11 @@ pub fn record(
             reason,
             sent: false,
         });
-        changed.push(id.clone());
-        failed_in.push(id);
+        // A test fails once per machine, so a finding can come up twice.
+        if !failed_in.contains(&id) {
+            changed.push(id.clone());
+            failed_in.push(id);
+        }
     }
     for result in results.iter().filter(|result| result.result == Outcome::Pass) {
         for finding in findings.iter_mut().filter(|finding| {
@@ -373,7 +384,6 @@ pub fn record(
     for finding in findings.iter().filter(|finding| changed.contains(&finding.id)) {
         write(store, finding)?;
     }
-    failed_in.dedup();
     Ok(failed_in)
 }
 
@@ -525,15 +535,17 @@ mod tests {
         assert_eq!(ids.len(), 1);
         let second = run("20261107-020000-0002", "2026-11-07T02:00:00Z");
         let again = link.replace("qemu/serial-1", "bios/serial-3");
-        record(
+        let both = record(
             store.path(),
             &second,
             &[
                 result("drivers/link-pull", "bios", Outcome::Fail, Some(&again)),
+                result("boot/a", "bios", Outcome::Pass, None),
                 result("drivers/link-pull", "qemu", Outcome::Fail, Some(link)),
             ],
         )
         .unwrap();
+        assert_eq!(both, ids, "named once, though it failed on two machines");
         // Recording a run twice changes nothing.
         record(
             store.path(),
@@ -613,5 +625,13 @@ mod tests {
         assert!(merged.runs.iter().all(|seen| seen.sent));
         ours.state = State::NotABug;
         assert_eq!(ours.merged_with(Some(&theirs)).state, State::NotABug, "a person here said so");
+
+        // Fixed in lab-results, then it failed here again: new again.
+        ours.state = State::New;
+        theirs.state = State::Fixed;
+        assert_eq!(ours.merged_with(Some(&theirs)).state, State::New, "it failed since the fix");
+        let mut all_sent = ours.clone();
+        all_sent.runs = theirs.runs.clone();
+        assert_eq!(all_sent.merged_with(Some(&theirs)).state, State::Fixed, "nothing new failed");
     }
 }

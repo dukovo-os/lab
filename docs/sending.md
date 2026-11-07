@@ -41,8 +41,8 @@ dukovo-lab send --all                   # every finding with something new
 
 Each send:
 
-1. Checks the clone is on `main` with nothing left uncommitted, and
-   pulls.
+1. Checks the clone is on `main`, then starts it afresh from
+   lab-results' `main` as it is now.
 2. Copies in each run's bundle that lab-results does not have yet, as
    `runs/<date>/<run>/`: `run.json`, `results.json`, `events.jsonl`,
    `logs/` (each `.log` compressed to `.log.gz`) and `screenshots/`.
@@ -50,15 +50,19 @@ Each send:
    `findings/<id>.json`: every run either side has, and the state
    lab-results moved it to, unless a person on the lab PC has since said
    it is not a bug.
-4. Commits, as one commit naming the findings and runs, and pushes to
-   `main`. If someone pushed first, it takes their commits and pushes
-   once more.
+4. Commits, as one commit naming the findings and the runs it copied,
+   and pushes to `main`. If someone pushed first (a thread marking a fix
+   proposed, say), it makes the whole send again on top of theirs, once.
 5. Notes in the store what went: each finding's runs are marked sent,
    and each bundle gets `sent.json`.
 
 When lab-results already has everything, nothing is committed. If the
-push fails, the commit waits in the clone and goes with the next send;
-the store still says unsent until then.
+push fails, nothing is marked sent, so the next send makes the same
+commit again. The clone is the lab's own working copy: each send drops
+what an earlier one left in `runs/` and `findings/` without pushing, and
+refuses to start while anything else in it is changed, so make your own
+changes to lab-results in another clone. One send goes through a clone
+at a time; a second waits for the first.
 
 ## What goes, and what never does
 

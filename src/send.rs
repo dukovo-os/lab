@@ -7,11 +7,16 @@
 //!
 //! The lab PC keeps a clone of lab-results (`<store>/lab-results` unless
 //! `--results` names another) and sends with plain git, as the person
-//! signed in on the lab PC: bring the clone up to date, copy each run's
-//! bundle in (logs compressed, as the repository's README says), merge
-//! each finding with the copy there, commit, push. Nothing else on the PC
-//! goes: only a bundle's own files, by name, and never through a link.
-//! The lab key is never in a bundle.
+//! signed in on the lab PC: bring the clone to lab-results' main, copy
+//! each run's bundle in (logs compressed, as the repository's README
+//! says), merge each finding with the copy there, commit, push. Nothing
+//! else on the PC goes: only a bundle's own files, by name, and never
+//! through a link. The lab key is never in a bundle.
+//!
+//! The clone is the lab's own working copy. Each send starts it afresh
+//! from lab-results' main, so a send cut short leaves nothing behind that
+//! matters: the store marks findings and runs sent only once the push
+//! succeeded, so the next send makes the same commit again.
 //!
 //! git never prompts here (`GIT_TERMINAL_PROMPT=0`): a clone that needs a
 //! password fails with git's message instead, as every command must.
@@ -88,30 +93,53 @@ pub fn send(
         }
     }
     check_clone(clone)?;
+    // One send at a time through a clone: the runner page and a terminal
+    // may both send.
+    let _lock = lock_clone(clone)?;
 
-    git(clone, &["pull", "-q", "--rebase", "origin", "main"]).map_err(|why| {
-        Error::Harness(format!("could not bring the lab-results clone up to date: {why}"))
-    })?;
-    for id in &runs {
-        copy_bundle(&store::bundle_dir(store, id), &store::bundle_dir(clone, id))?;
-    }
-    let mut merged: Vec<Finding> = Vec::new();
-    for finding in &picked {
-        let theirs = findings::load(clone, &finding.id);
-        let finding = finding.merged_with(theirs.as_ref());
-        findings::write(clone, &finding)?;
-        merged.push(finding);
-    }
+    // Someone may push between our fetch and our push (a thread marking a
+    // fix proposed, say): then the whole send is made again on theirs.
+    let mut tries = 0;
+    let (commit, merged) = loop {
+        tries += 1;
+        sync(clone)?;
+        let mut copied: Vec<String> = Vec::new();
+        for id in &runs {
+            if copy_bundle(&store::bundle_dir(store, id), &store::bundle_dir(clone, id))? {
+                copied.push(id.clone());
+            }
+        }
+        let mut merged: Vec<Finding> = Vec::new();
+        for finding in &picked {
+            let theirs = findings::load(clone, &finding.id);
+            let finding = finding.merged_with(theirs.as_ref());
+            findings::write(clone, &finding)?;
+            merged.push(finding);
+        }
 
-    git(clone, &["add", "-A", "--", "runs", "findings"]).map_err(Error::Harness)?;
-    let staged = git(clone, &["diff", "--cached", "--name-only"]).map_err(Error::Harness)?;
-    let commit = if staged.trim().is_empty() {
-        None
-    } else {
-        let message = commit_message(&runs, &merged);
+        // Only what this send wrote; runs/ or findings/ may not be there.
+        let mut add = vec!["add", "-A", "--"];
+        add.extend(["runs", "findings"].into_iter().filter(|dir| clone.join(dir).exists()));
+        git(clone, &add).map_err(Error::Harness)?;
+        let staged = git(clone, &["diff", "--cached", "--name-only"]).map_err(Error::Harness)?;
+        if staged.trim().is_empty() {
+            break (None, merged);
+        }
+        let message = commit_message(&copied, &merged);
         git(clone, &["commit", "-q", "-m", &message]).map_err(Error::Harness)?;
-        push(clone)?;
-        Some(git(clone, &["rev-parse", "HEAD"]).map_err(Error::Harness)?.trim().to_string())
+        match git(clone, &["push", "-q", "origin", "HEAD:main"]) {
+            Ok(_) => {
+                let head = git(clone, &["rev-parse", "HEAD"]).map_err(Error::Harness)?;
+                break (Some(head.trim().to_string()), merged);
+            }
+            Err(why) if tries >= 2 => {
+                return Err(Error::Harness(format!(
+                    "could not push to lab-results, so nothing is marked sent and the next send tries again: {why}"
+                )));
+            }
+            // Someone pushed first: make it again on top of theirs.
+            Err(_) => {}
+        }
     };
 
     // Only now, with lab-results holding it all, does the store say so.
@@ -139,30 +167,42 @@ fn check_clone(clone: &Path) -> Result<(), Error> {
             branch.trim()
         )));
     }
+    // A send cut short leaves files in runs/ and findings/, which the next
+    // one makes again; anything else is someone's work, never dropped.
     let changes = git(clone, &["status", "--porcelain"]).map_err(Error::Harness)?;
-    if !changes.trim().is_empty() {
+    let ours = |line: &str| {
+        let path = line.get(3..).unwrap_or_default().trim_matches('"');
+        path.starts_with("runs/") || path.starts_with("findings/")
+    };
+    if !changes.lines().all(ours) {
         return Err(Error::Harness(format!(
-            "the lab-results clone at {0} has changes not committed (a send cut short?); look with `git -C {0} status`, then commit or drop them",
+            "the lab-results clone at {0} has changes not committed outside runs/ and findings/; look with `git -C {0} status`, then commit or drop them",
             clone.display()
         )));
     }
     Ok(())
 }
 
-/// Pushes to lab-results' main; when someone pushed first, takes their
-/// commits under ours and tries once more.
-fn push(clone: &Path) -> Result<(), Error> {
-    if git(clone, &["push", "-q", "origin", "HEAD:main"]).is_ok() {
-        return Ok(());
-    }
-    git(clone, &["pull", "-q", "--rebase", "origin", "main"])
-        .and_then(|_| git(clone, &["push", "-q", "origin", "HEAD:main"]))
+/// Brings the clone to lab-results' main as it is now, dropping any
+/// commit of an earlier send that never got pushed (the next lines make
+/// it again).
+fn sync(clone: &Path) -> Result<(), Error> {
+    git(clone, &["fetch", "-q", "origin", "main"])
+        .and_then(|_| git(clone, &["reset", "-q", "--hard", "FETCH_HEAD"]))
+        .and_then(|_| git(clone, &["clean", "-q", "-f", "-d", "--", "runs", "findings"]))
         .map(|_| ())
         .map_err(|why| {
-            Error::Harness(format!(
-                "the send is committed in the lab-results clone but could not be pushed, so it goes with the next send: {why}"
-            ))
+            Error::Harness(format!("could not bring the lab-results clone up to date: {why}"))
         })
+}
+
+/// Takes the clone's send lock, waiting for a send already going.
+fn lock_clone(clone: &Path) -> Result<File, Error> {
+    let path = clone.join(".git").join("dukovo-lab-send.lock");
+    let file = File::create(&path)
+        .map_err(|err| Error::Harness(format!("opening {}: {err}", path.display())))?;
+    file.lock().map_err(|err| Error::Harness(format!("locking {}: {err}", path.display())))?;
+    Ok(file)
 }
 
 fn commit_message(runs: &[String], findings: &[Finding]) -> String {
@@ -211,11 +251,12 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Copies a bundle's own files from `from` to `to`, logs compressed.
-/// run.json goes last, so a copy cut short is redone by the next send.
-fn copy_bundle(from: &Path, to: &Path) -> Result<(), Error> {
+/// Copies a bundle's own files from `from` to `to`, logs compressed;
+/// answers false when lab-results already has it. run.json goes last, so
+/// a copy cut short is redone by the next send.
+fn copy_bundle(from: &Path, to: &Path) -> Result<bool, Error> {
     if to.join("run.json").is_file() {
-        return Ok(());
+        return Ok(false);
     }
     let failed = |what: &Path, err: std::io::Error| {
         Error::Harness(format!("copying {} to lab-results: {err}", what.display()))
@@ -230,7 +271,7 @@ fn copy_bundle(from: &Path, to: &Path) -> Result<(), Error> {
             fs::copy(&source, to.join(file)).map_err(|err| failed(&source, err))?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Copies the regular files under `from`, never following a link.
@@ -429,6 +470,63 @@ mod tests {
         let ours = findings::find(&store, &finding).unwrap();
         assert_eq!(ours.state, State::FixProposed);
         assert_eq!(ours.count, 2);
+    }
+
+    #[test]
+    fn a_send_cut_short_is_made_again() {
+        let dir = TempDir::new("send-again");
+        let store = dir.path().join("store");
+        let (origin, clone) = lab_results(dir.path(), &store);
+        let finding = failed_run(&store, "20261107-080000-0001");
+        // Left over: a finding written but not committed, and a commit
+        // that never got pushed.
+        fs::create_dir_all(clone.join("findings")).unwrap();
+        fs::write(clone.join("findings").join(format!("{finding}.json")), "half").unwrap();
+        fs::write(clone.join("unpushed.txt"), "x").unwrap();
+        run_git(&clone, &["add", "unpushed.txt"]);
+        run_git(&clone, &["commit", "-q", "-m", "Never pushed"]);
+
+        let sent = send(&store, &clone, std::slice::from_ref(&finding), &[]).unwrap();
+        assert!(sent.commit.is_some());
+        let files = run_git(&origin, &["ls-tree", "-r", "--name-only", "main"]);
+        assert!(files.contains(&format!("findings/{finding}.json")), "{files}");
+        assert!(!files.contains("unpushed.txt"), "an old unpushed commit is not sent");
+        let theirs = run_git(&origin, &["show", &format!("main:findings/{finding}.json")]);
+        assert!(theirs.contains("\"id\""), "the finding, not the half-written file");
+    }
+
+    #[test]
+    fn when_someone_pushes_first_the_send_is_made_again_on_theirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("send-race");
+        let store = dir.path().join("store");
+        let (origin, clone) = lab_results(dir.path(), &store);
+        let finding = failed_run(&store, "20261107-080000-0001");
+        // A thread pushes once, just as the send pushes.
+        let thread = dir.path().join("thread");
+        run_git(dir.path(), &["clone", "-q", origin.to_str().unwrap(), thread.to_str().unwrap()]);
+        run_git(&thread, &["config", "user.name", "Thread"]);
+        run_git(&thread, &["config", "user.email", "thread@example.org"]);
+        let hook = clone.join(".git/hooks/pre-push");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n[ -e {0}/raced ] && exit 0\ntouch {0}/raced\ncd {1} && echo note > note.md && git add note.md && git commit -q -m Note && git push -q origin main\n",
+                dir.path().display(),
+                thread.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let sent = send(&store, &clone, std::slice::from_ref(&finding), &[]).unwrap();
+        assert!(dir.path().join("raced").exists(), "the hook ran");
+        let files = run_git(&origin, &["ls-tree", "-r", "--name-only", "main"]);
+        assert!(
+            files.contains("note.md") && files.contains(&format!("findings/{finding}.json")),
+            "{files}"
+        );
+        assert_eq!(run_git(&origin, &["rev-parse", "main"]).trim(), sent.commit.unwrap());
     }
 
     #[test]
