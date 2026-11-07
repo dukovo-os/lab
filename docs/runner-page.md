@@ -72,7 +72,7 @@ wrong build.
 ## The same as the commands
 
 Every button runs a `dukovo-lab` command, and the bottom of the page
-shows the last one, such as `dukovo-lab run --detach drivers/link-pull
+shows the last one, such as `dukovo-lab run --detach network/link-pull
 --machine qemu --image … --json`. So anything done on the page can be
 done in a terminal or by an agent, and the other way round: a run
 started with `dukovo-lab run` shows on the page too.

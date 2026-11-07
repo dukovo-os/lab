@@ -25,7 +25,7 @@ come in the next pull requests.
 ## Getting started
 
 In a Dukovo checkout, one command sets the lab up and opens the runner
-page: it installs or updates `dukovo-lab`, makes the lab key, clones
+page: it installs or updates `dukovo-lab`, makes the lab key and password, clones
 lab-results for Send, puts the schedules' timer in place, builds the lab
 image and opens the page.
 
@@ -38,7 +38,7 @@ By hand, on a Linux PC with Rust (through rustup), QEMU and OpenSSH:
 ```sh
 sudo apt install qemu-system-x86 qemu-utils ovmf openssh-client git   # Linux Mint, Ubuntu
 cargo install --locked --git https://github.com/dukovo-os/lab
-dukovo-lab key          # once: the lab's SSH key, which lab images trust
+dukovo-lab key          # once: the lab's SSH key and password, which lab images trust
 git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results   # once: for Send
 ```
 
@@ -46,7 +46,7 @@ Then, in a Dukovo checkout:
 
 ```sh
 ./ob lab list                       # the tests, by category
-./ob lab run boot drivers           # build a lab image, run on QEMU
+./ob lab run boot network           # build a lab image, run on QEMU
 ./ob lab run --all --machine qemu,qemu-bios
 ./ob lab ui                         # the runner page, in a browser on this PC
 ```

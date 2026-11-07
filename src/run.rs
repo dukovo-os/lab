@@ -538,8 +538,10 @@ impl<'a> Worker<'a> {
     /// Waits for the machine's ready line on the serial console, then,
     /// when the machine has an SSH channel, for SSH to answer.
     fn wait_ready(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        // The ready line counts wherever it is in this boot, so a test may
+        // wait for it with a serial step first.
         let ready = self.machine.ready.clone();
-        self.wait_serial(&ready, deadline)?;
+        self.wait_serial_where(&ready, Search::ThisBoot, deadline)?;
         // Without a key, tests that have no `run` steps still run, on
         // the serial console alone; the run refuses the others before
         // it starts.
@@ -733,13 +735,26 @@ impl<'a> Worker<'a> {
         text: &str,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
+        self.wait_serial_where(text, Search::AfterLastFound, deadline)
+    }
+
+    fn wait_serial_where(
+        &mut self,
+        text: &str,
+        search: Search,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let found = |serial: &mut SerialWatch| match search {
+            Search::AfterLastFound => serial.find(text),
+            Search::ThisBoot => serial.seen_this_boot(text),
+        };
         loop {
-            if self.serial.find(text) {
+            if found(&mut self.serial) {
                 return Ok(None);
             }
             if !self.driver.is_on() {
                 // The last lines may have landed as the machine went off.
-                if self.serial.find(text) {
+                if found(&mut self.serial) {
                     return Ok(None);
                 }
                 return Err(StepFailure::Fail(format!(
@@ -768,7 +783,7 @@ impl<'a> Worker<'a> {
         // A new boot starts: serial steps and `wait = "ready"` after this
         // look only at what it prints, never at the boot before.
         if matches!(action, PowerAction::On | PowerAction::Reset) {
-            self.serial.skip_to_end();
+            self.serial.new_boot();
         }
         match self.driver.power(action, deadline) {
             Ok(()) => Ok(None),
@@ -817,6 +832,15 @@ impl<'a> Worker<'a> {
 
 /// Follows a serial log, finding text in order.
 ///
+/// Where a wait for serial text looks.
+#[derive(Clone, Copy)]
+enum Search {
+    /// After the last text a step found, as `serial` steps do.
+    AfterLastFound,
+    /// Anywhere in the boot going now, as `wait = "ready"` does.
+    ThisBoot,
+}
+
 /// The log is read as it grows, only its new bytes each time, since a
 /// soak test's log grows for hours. Whole lines are cleaned once and kept;
 /// the line still being written is cleaned again each time, with any
@@ -836,6 +860,10 @@ struct SerialWatch {
     lines_end: usize,
     /// Where the next search starts: the end of the last text found.
     cursor: usize,
+    /// Where the boot going now starts: the machine's last power on or
+    /// reset, or the log's start. `wait = "ready"` looks for the ready
+    /// line from here, whatever serial steps found since.
+    boot: usize,
 }
 
 impl SerialWatch {
@@ -847,6 +875,7 @@ impl SerialWatch {
             text: String::new(),
             lines_end: 0,
             cursor: 0,
+            boot: 0,
         }
     }
 
@@ -883,9 +912,25 @@ impl SerialWatch {
         self.cursor = self.text.len();
     }
 
-    /// Searches from the start of the log again.
+    /// A new boot starts at the end of the log as it is now: power on or
+    /// reset. Searches start there, and so does the boot.
+    fn new_boot(&mut self) {
+        self.skip_to_end();
+        self.boot = self.cursor;
+    }
+
+    /// Searches from the start of the log again, a fresh boot's.
     fn rewind(&mut self) {
         self.cursor = 0;
+        self.boot = 0;
+    }
+
+    /// Whether `needle` has appeared anywhere in the boot going now. It
+    /// moves nothing, so a serial step that already found the same text
+    /// does not hide it.
+    fn seen_this_boot(&mut self, needle: &str) -> bool {
+        self.refresh();
+        self.text.get(self.boot..).is_some_and(|boot| boot.contains(needle))
     }
 
     /// Whether `needle` has appeared since the last text found; moves past it.
@@ -1020,6 +1065,25 @@ mod tests {
         assert!(watch.find("two"));
         watch.skip_to_end();
         assert!(!watch.find("one"));
+    }
+
+    #[test]
+    fn the_ready_line_counts_anywhere_in_the_boot_going_now() {
+        let dir = crate::testing::TempDir::new("serial-boot");
+        let path = dir.write("serial.log", "Boot complete.\n");
+        let mut watch = SerialWatch::new(path.clone());
+        // A serial step found the ready line; waiting for ready still sees it.
+        assert!(watch.find("Boot complete."));
+        assert!(watch.seen_this_boot("Boot complete."));
+        // A test sharing the boot starts after it, and still sees it.
+        watch.skip_to_end();
+        assert!(watch.seen_this_boot("Boot complete."));
+        // After power on, only the new boot's own counts.
+        watch.new_boot();
+        assert!(!watch.seen_this_boot("Boot complete."));
+        fs::write(&path, "Boot complete.\nRadix\nBoot complete.\n").unwrap();
+        assert!(watch.seen_this_boot("Boot complete."));
+        assert!(watch.find("Boot complete."), "the serial step's own place is untouched");
     }
 
     #[test]
