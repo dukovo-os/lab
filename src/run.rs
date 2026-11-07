@@ -47,6 +47,8 @@ use crate::units::format_duration;
 /// What a stopped test's result says.
 const STOPPED_DURING: &str = "the run was stopped during this test";
 const STOPPED_BEFORE: &str = "the run was stopped before this test";
+/// Why a `root` step cannot run.
+pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no password: run `dukovo-lab key`, then build the image again with `ob image --lab`";
 
 /// What to run.
 pub struct Request<'a> {
@@ -60,6 +62,9 @@ pub struct Request<'a> {
     pub store: PathBuf,
     /// The lab key, when there is one.
     pub key: Option<PathBuf>,
+    /// The lab account's password, which `root` steps give `elevate`,
+    /// when the lab has one.
+    pub password: Option<String>,
     /// Whether to run Needs you tests, asking a person to do their steps.
     pub with_person: bool,
     /// The preset the tests came from, for run.json.
@@ -84,6 +89,7 @@ struct Shared<'a> {
     running: &'a Running,
     stop: &'a Stop,
     with_person: bool,
+    password: Option<&'a str>,
 }
 
 /// Starts a machine's driver; [`crate::driver::start`] outside tests.
@@ -148,6 +154,7 @@ pub fn run(
         running: &running,
         stop: &stop,
         with_person: request.with_person,
+        password: request.password.as_deref(),
     };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
         // Ends the watcher below however this ends, a worker's panic too,
@@ -545,7 +552,7 @@ impl<'a> Worker<'a> {
                 return Err(StepFailure::Skip(STOPPED_DURING.into()));
             }
             let attempt = deadline.min(Instant::now() + Duration::from_secs(20));
-            match self.driver.run_command("true", attempt) {
+            match self.driver.run_command("true", None, attempt) {
                 Ok(output) if output.status == Some(0) => return Ok(None),
                 Ok(output) => last = output.text.trim().to_string(),
                 Err(err) => return Err(StepFailure::Error(err)),
@@ -574,8 +581,8 @@ impl<'a> Worker<'a> {
             Step::Serial(text) => self.wait_serial(text, deadline),
             Step::Power(action) => self.power(*action, deadline),
             Step::Link(up) => self.driver.set_link(*up).map(|()| None).map_err(StepFailure::Error),
-            Step::PlugUsb(image) => {
-                self.driver.plug_usb(image).map(|()| None).map_err(StepFailure::Error)
+            Step::PlugUsb(stick) => {
+                self.driver.plug_usb(stick).map(|()| None).map_err(StepFailure::Error)
             }
             Step::UnplugUsb => self.driver.unplug_usb().map(|()| None).map_err(StepFailure::Error),
             Step::Keys(keys) => {
@@ -585,6 +592,7 @@ impl<'a> Worker<'a> {
                 self.screenshot(test, name).map(|()| None).map_err(StepFailure::Error)
             }
             Step::WaitReady => self.wait_ready(deadline),
+            Step::WaitOff => self.wait_off(deadline),
             Step::Sleep(time) => {
                 let until = Instant::now() + *time;
                 let end = until.min(deadline);
@@ -654,13 +662,29 @@ impl<'a> Worker<'a> {
                 command.command
             )));
         }
-        let output =
-            self.driver.run_command(&command.command, deadline).map_err(StepFailure::Error)?;
+        // As root: `elevate -S` reads the lab's password from the
+        // command's input, so it is never on a command line, and it is
+        // taken out of whatever comes back.
+        let (line, input, prompt) = if command.root {
+            let Some(password) = self.shared.password else {
+                return Err(StepFailure::Error(NO_PASSWORD.into()));
+            };
+            (format!("elevate -S {}", command.command), Some(format!("{password}\n")), "#")
+        } else {
+            (command.command.clone(), None, "$")
+        };
+        let mut output = self
+            .driver
+            .run_command(&line, input.as_deref(), deadline)
+            .map_err(StepFailure::Error)?;
+        if let Some(password) = self.shared.password {
+            output.text = output.text.replace(password, "********");
+        }
         // Cut short by a stop: the command's end says nothing.
         if output.status.is_none() && self.shared.stop.requested() {
             return Err(StepFailure::Skip(STOPPED_DURING.into()));
         }
-        let shown = format!("$ {}\n{}", command.command, output.text.trim_end());
+        let shown = format!("{prompt} {}\n{}", command.command, output.text.trim_end());
         let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
         match output.status {
             None => return fail("it was still running at the test's time limit".into()),
@@ -685,6 +709,22 @@ impl<'a> Worker<'a> {
             return fail(format!("its output holds \"{found}\""));
         }
         Ok(Some(shown))
+    }
+
+    /// Waits until the machine turns itself off, as after `poweroff`.
+    fn wait_off(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        while self.driver.is_on() {
+            if self.shared.stop.requested() {
+                return Err(StepFailure::Skip(STOPPED_DURING.into()));
+            }
+            if Instant::now() >= deadline {
+                return Err(StepFailure::Fail(
+                    "the machine was still on at the test's time limit".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Ok(None)
     }
 
     /// Waits for `text` on the serial console after the last text found.

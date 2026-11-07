@@ -392,6 +392,7 @@ fn list(arguments: &Arguments) -> Result<u8, Error> {
         suite::select(&tests, &arguments.names)?
     };
     let presets = arguments.load_presets(&tests)?;
+    let categories = suite::load_categories(&arguments.tests_dir())?;
     if arguments.json {
         // How long each test took last time, by machine, for time estimates.
         let typical = arguments
@@ -413,20 +414,16 @@ fn list(arguments: &Arguments) -> Result<u8, Error> {
                 value
             })
             .collect();
-        let categories: Vec<Value> = suite::CATEGORIES
-            .iter()
-            .map(|&(id, title)| json!({ "id": id, "title": title }))
-            .collect();
         println!("{}", json!({ "tests": tests, "categories": categories, "presets": presets }));
         return Ok(0);
     }
-    for &(category, title) in suite::CATEGORIES {
+    for category in &categories {
         let in_category: Vec<&&Test> =
-            picked.iter().filter(|test| test.category == category).collect();
+            picked.iter().filter(|test| test.category == category.id).collect();
         if in_category.is_empty() {
             continue;
         }
-        println!("{title}");
+        println!("{}", category.title);
         for test in in_category {
             println!("  {:<32} {:>4}  {}", test.id, units::format_duration(test.time), test.about);
             for machine in &machines {
@@ -552,6 +549,11 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     if key.is_none() {
         refuse_commands_without_key(&picked, &machines, arguments.with_person)?;
     }
+    let password =
+        ssh::read_password(&ssh::password_path(&arguments.config_dir()?)).map_err(Error::Usage)?;
+    if password.is_none() {
+        refuse_root_without_password(&picked)?;
+    }
     let store = arguments.store_dir()?;
     if arguments.detach {
         return detach(arguments, &store, &machines);
@@ -568,6 +570,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         build: arguments.build.clone(),
         store,
         key,
+        password,
         with_person: arguments.with_person,
         preset: arguments.preset.clone(),
         schedule: arguments.schedule.clone(),
@@ -602,6 +605,16 @@ fn refuse_commands_without_key(
             "{} runs commands, and the lab has no key: run `dukovo-lab key`, then build the image again with `ob image --lab`",
             test.id
         ))),
+        None => Ok(()),
+    }
+}
+
+/// Stops a run before it starts when a test would run a command as root
+/// and the lab has no password for `elevate`.
+fn refuse_root_without_password(tests: &[&Test]) -> Result<(), Error> {
+    let root = |step: &Step| matches!(step, Step::Run(command) if command.root);
+    match tests.iter().find(|test| test.steps.iter().any(root)) {
+        Some(test) => Err(Error::Usage(format!("{}: {}", test.id, run::NO_PASSWORD))),
         None => Ok(()),
     }
 }
@@ -1063,17 +1076,41 @@ fn send_findings(arguments: &Arguments) -> Result<u8, Error> {
     Ok(0)
 }
 
-/// `key`: makes the lab key if there is none.
+/// `key`: makes the lab key and the lab password, each if there is none.
+/// Only their paths are printed: the password and the private key never
+/// leave their files.
 fn make_key(arguments: &Arguments) -> Result<u8, Error> {
-    let path = ssh::key_path(&arguments.config_dir()?);
+    let config = arguments.config_dir()?;
+    let path = ssh::key_path(&config);
     let made = ssh::make_key(&path).map_err(Error::Harness)?;
+    let password = ssh::password_path(&config);
+    let made_password = ssh::make_password(&password).map_err(Error::Harness)?;
     let public = path.with_file_name(format!("{}.pub", ssh::KEY_FILE));
     if arguments.json {
-        println!("{}", json!({ "public_key": public, "made": made }));
-    } else if made {
+        println!(
+            "{}",
+            json!({
+                "public_key": public,
+                "made": made,
+                "password_file": password,
+                "made_password": made_password,
+            })
+        );
+        return Ok(0);
+    }
+    if made {
         println!("Made the lab key. Its public key, for `ob image --lab`, is {}", public.display());
     } else {
         println!("The lab key is already made. Its public key is {}", public.display());
+    }
+    if made_password {
+        println!(
+            "Made the lab password, for `ob image --lab` and tests that run as root, in {}",
+            password.display()
+        );
+    }
+    if made || made_password {
+        println!("Build the lab image again so it holds them: `ob lab` does.");
     }
     Ok(0)
 }

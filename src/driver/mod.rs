@@ -19,7 +19,7 @@ use std::time::Instant;
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
-use crate::suite::PowerAction;
+use crate::suite::{PowerAction, Stick};
 
 /// A machine the runner is driving.
 pub trait Driver: Send {
@@ -41,8 +41,8 @@ pub trait Driver: Send {
     /// Plugs the network cable in or pulls it.
     fn set_link(&mut self, up: bool) -> Result<(), String>;
 
-    /// Plugs in a USB stick holding a copy of `image`.
-    fn plug_usb(&mut self, image: &Path) -> Result<(), String>;
+    /// Plugs in a USB stick: a copy of an image, or a blank one.
+    fn plug_usb(&mut self, stick: &Stick) -> Result<(), String>;
 
     /// Pulls the USB stick out.
     fn unplug_usb(&mut self) -> Result<(), String>;
@@ -53,11 +53,17 @@ pub trait Driver: Send {
     /// Saves the screen as a PNG file at `to`.
     fn screenshot(&mut self, to: &Path) -> Result<(), String>;
 
-    /// Runs `command` on the machine as the lab account, stopping it at
-    /// `deadline`, or sooner when the run is stopped (the output's status
-    /// is then none). Fails when there is no way to run it: the machine
-    /// is off, or the lab has no key.
-    fn run_command(&mut self, command: &str, deadline: Instant) -> Result<ssh::Output, String>;
+    /// Runs `command` on the machine as the lab account, with `input` as
+    /// its standard input (none: empty), stopping it at `deadline`, or
+    /// sooner when the run is stopped (the output's status is then none).
+    /// Fails when there is no way to run it: the machine is off, or the
+    /// lab has no key.
+    fn run_command(
+        &mut self,
+        command: &str,
+        input: Option<&str>,
+        deadline: Instant,
+    ) -> Result<ssh::Output, String>;
 
     /// How many times longer than on real hardware tests may take here.
     fn slowdown(&self) -> u32;
