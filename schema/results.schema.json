@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dukovo-os/lab/blob/main/schema/results.schema.json",
+  "title": "Dukovo Lab results",
+  "description": "results.json in a results bundle: each test's result on each machine. Version 1.",
+  "type": "object",
+  "required": ["schema", "run", "results"],
+  "additionalProperties": false,
+  "$defs": {
+    "outcome": {
+      "description": "pass: every step passed. fail: a check failed or the time limit passed, a finding. skip: not run on this machine. error: the harness or machine broke.",
+      "enum": ["pass", "fail", "skip", "error"]
+    }
+  },
+  "properties": {
+    "schema": { "const": 1 },
+    "run": { "description": "The run id, as in run.json.", "type": "string" },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["test", "machine", "result", "reason", "milliseconds", "boot", "log", "steps", "screenshots"],
+        "additionalProperties": false,
+        "properties": {
+          "test": { "description": "<category>/<name>", "type": "string", "pattern": "^[a-z]+/[a-z0-9][a-z0-9-]*$" },
+          "machine": { "type": "string" },
+          "result": { "$ref": "#/$defs/outcome" },
+          "reason": { "description": "Why it failed, was skipped or broke.", "type": ["string", "null"] },
+          "milliseconds": { "description": "How long it took, boot included.", "type": "integer", "minimum": 0 },
+          "boot": { "description": "The boot it ran in: logs/<machine>/serial-<boot>.log.", "type": ["integer", "null"], "minimum": 1 },
+          "log": { "description": "The test's log, relative to the bundle.", "type": ["string", "null"] },
+          "steps": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["step", "result", "milliseconds", "note"],
+              "additionalProperties": false,
+              "properties": {
+                "step": { "description": "The step in words.", "type": "string" },
+                "result": { "$ref": "#/$defs/outcome" },
+                "milliseconds": { "type": "integer", "minimum": 0 },
+                "note": { "description": "What went wrong, or what the step saw.", "type": ["string", "null"] }
+              }
+            }
+          },
+          "screenshots": { "description": "Relative to the bundle.", "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

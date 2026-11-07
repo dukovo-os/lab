@@ -18,3 +18,9 @@ SPDX-License-Identifier = "LicenseRef-DCO"
 path = ["LICENSE-APACHE", "LICENSE-MIT"]
 SPDX-FileCopyrightText = "2026 The Dukovo contributors"
 SPDX-License-Identifier = "Apache-2.0 OR MIT"
+
+# JSON has no comments, and Cargo writes its lock file itself.
+[[annotations]]
+path = ["schema/*.json", "Cargo.lock"]
+SPDX-FileCopyrightText = "2026 The Dukovo contributors"
+SPDX-License-Identifier = "Apache-2.0 OR MIT"

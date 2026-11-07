@@ -1,0 +1,653 @@
+// SPDX-FileCopyrightText: 2026 The Dukovo contributors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! Running tests: the picked tests on each picked machine, the machines
+//! side by side.
+//!
+//! Each machine gets a worker thread that runs the tests in order. A test
+//! with `fresh = true` gets a boot of its own; the others share the boot
+//! the last test left, which keeps a full run short. A boot is shared only
+//! after a test passed, because a failed test leaves the machine in a
+//! state no later test should depend on.
+//!
+//! A test fails when a step's check fails or the test passes its time
+//! limit (several times longer under QEMU's emulator, see
+//! [`Driver::slowdown`]). It is an error, not a failure, when the harness
+//! or the machine breaks. Each test's log in the bundle lists its steps
+//! with what each did; start there when a result surprises you, then the
+//! boot's serial log.
+
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crate::Error;
+use crate::bundle::{
+    Bundle, MachineRecord, Outcome, ResultRecord, RunRecord, SCHEMA, StepRecord, Summary,
+    new_run_id,
+};
+use crate::clock::Utc;
+use crate::driver::{Driver, Setup};
+use crate::machines::{Control, Machine, Who};
+use crate::output::{Event, Reporter};
+use crate::suite::{Command, PowerAction, Step, Test};
+use crate::units::format_duration;
+
+/// What to run.
+pub struct Request<'a> {
+    pub tests: Vec<&'a Test>,
+    pub machines: Vec<&'a Machine>,
+    /// The image under test.
+    pub image: PathBuf,
+    /// The build's name for run.json, as `ob lab` gives it.
+    pub build: Option<String>,
+    /// Where bundles and work files go.
+    pub store: PathBuf,
+    /// The lab key, when there is one.
+    pub key: Option<PathBuf>,
+}
+
+/// How a run went.
+pub struct Ended {
+    pub summary: Summary,
+}
+
+/// Starts a machine's driver; [`crate::driver::start`] outside tests.
+pub type StartDriver = dyn Fn(&Machine, Setup) -> Result<Box<dyn Driver>, String> + Sync;
+
+/// Runs `request`, reporting as it goes, and writes the bundle.
+pub fn run(
+    request: &Request<'_>,
+    reporter: &Reporter,
+    start: &StartDriver,
+) -> Result<Ended, Error> {
+    let started = Utc::now();
+    let id = new_run_id(started);
+    let record = RunRecord {
+        schema: SCHEMA,
+        id: id.clone(),
+        harness: format!("dukovo-lab {}", env!("CARGO_PKG_VERSION")),
+        started: started.rfc3339(),
+        ended: None,
+        build: request.build.clone(),
+        image: request.image.display().to_string(),
+        machines: request
+            .machines
+            .iter()
+            .map(|machine| MachineRecord {
+                name: machine.name.clone(),
+                about: machine.about.clone(),
+                driver: format!("{:?}", machine.driver).to_lowercase(),
+            })
+            .collect(),
+        tests: request.tests.iter().map(|test| test.id.clone()).collect(),
+        summary: None,
+    };
+    let mut bundle = Bundle::create(&request.store, record, started).map_err(Error::Harness)?;
+    reporter.report(&Event::RunStarted {
+        id: &id,
+        bundle: bundle.dir(),
+        machines: request.machines.iter().map(|machine| machine.name.as_str()).collect(),
+        tests: request.tests.iter().map(|test| test.id.as_str()).collect(),
+    });
+
+    let work = request.store.join("work").join(&id);
+    let sockets = socket_folder(&id);
+    let results: Vec<ResultRecord> = std::thread::scope(|scope| {
+        let workers: Vec<_> = request
+            .machines
+            .iter()
+            .enumerate()
+            .map(|(index, &machine)| {
+                let setup = Setup {
+                    image: request.image.clone(),
+                    logs: bundle.logs(&machine.name),
+                    work: work.join(&machine.name),
+                    // By number, not name: socket paths must stay short.
+                    sockets: sockets.join(index.to_string()),
+                    key: request.key.clone(),
+                };
+                let bundle = &bundle;
+                let tests = &request.tests;
+                scope.spawn(move || run_machine(machine, tests, setup, bundle, reporter, start))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a machine's worker panicked"))
+            .collect()
+    });
+    let _ = fs::remove_dir_all(&work);
+    let _ = fs::remove_dir_all(&sockets);
+
+    let summary = Summary::of(&results);
+    bundle.write_results(&results).map_err(Error::Harness)?;
+    bundle.record.ended = Some(Utc::now().rfc3339());
+    bundle.record.summary = Some(summary);
+    bundle.write_run().map_err(Error::Harness)?;
+    reporter.report(&Event::RunEnded { id: &id, bundle: bundle.dir(), summary });
+    Ok(Ended { summary })
+}
+
+/// A short folder for the run's sockets: the user's runtime folder when
+/// there is one, else the system's temporary folder.
+fn socket_folder(id: &str) -> PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    base.join("dukovo-lab").join(id)
+}
+
+/// Runs every test on one machine, in order.
+fn run_machine(
+    machine: &Machine,
+    tests: &[&Test],
+    setup: Setup,
+    bundle: &Bundle,
+    reporter: &Reporter,
+    start: &StartDriver,
+) -> Vec<ResultRecord> {
+    let has_key = setup.key.is_some();
+    let (mut worker, broken) = match start(machine, setup) {
+        Ok(driver) => (Some(Worker::new(machine, driver, has_key, bundle, reporter)), None),
+        Err(err) => (None, Some(format!("the {} machine did not start: {err}", machine.name))),
+    };
+    let mut results = Vec::new();
+    for &test in tests {
+        let result = match (test.fit(machine).skip_reason(), &mut worker) {
+            (Some(reason), _) => skipped(test, machine, reason),
+            (None, Some(worker)) => worker.run_test(test),
+            (None, None) => errored(test, machine, broken.clone().unwrap_or_default()),
+        };
+        if result.result == Outcome::Skip || worker.is_none() {
+            reporter.report(&Event::TestEnded {
+                machine: &machine.name,
+                test: &test.id,
+                result: result.result,
+                reason: result.reason.as_deref(),
+                milliseconds: 0,
+            });
+        }
+        results.push(result);
+    }
+    if let Some(worker) = &mut worker {
+        worker.driver.shut_off();
+    }
+    results
+}
+
+fn skipped(test: &Test, machine: &Machine, reason: String) -> ResultRecord {
+    blank_result(test, machine, Outcome::Skip, reason)
+}
+
+fn errored(test: &Test, machine: &Machine, reason: String) -> ResultRecord {
+    blank_result(test, machine, Outcome::Error, reason)
+}
+
+fn blank_result(test: &Test, machine: &Machine, result: Outcome, reason: String) -> ResultRecord {
+    ResultRecord {
+        test: test.id.clone(),
+        machine: machine.name.clone(),
+        result,
+        reason: Some(reason),
+        milliseconds: 0,
+        boot: None,
+        log: None,
+        steps: Vec::new(),
+        screenshots: Vec::new(),
+    }
+}
+
+/// Why a step did not pass.
+enum StepFailure {
+    /// Its check failed: a finding about Dukovo.
+    Fail(String),
+    /// The harness or machine broke.
+    Error(String),
+}
+
+/// One machine's worker.
+struct Worker<'a> {
+    machine: &'a Machine,
+    driver: Box<dyn Driver>,
+    /// Whether the lab has a key, so the machine's SSH channel can work.
+    has_key: bool,
+    bundle: &'a Bundle,
+    reporter: &'a Reporter,
+    /// The machine's current boot, counted from 1; 0 before the first.
+    boot: u32,
+    /// Whether the last test passed and left the machine on, so the next
+    /// may share its boot.
+    reusable: bool,
+    serial: SerialWatch,
+    /// The test being run: its log lines and screenshots.
+    log: Vec<String>,
+    screenshots: Vec<String>,
+}
+
+impl<'a> Worker<'a> {
+    fn new(
+        machine: &'a Machine,
+        driver: Box<dyn Driver>,
+        has_key: bool,
+        bundle: &'a Bundle,
+        reporter: &'a Reporter,
+    ) -> Self {
+        Worker {
+            machine,
+            driver,
+            has_key,
+            bundle,
+            reporter,
+            boot: 0,
+            reusable: false,
+            serial: SerialWatch::new(PathBuf::new()),
+            log: Vec::new(),
+            screenshots: Vec::new(),
+        }
+    }
+
+    /// Runs one test, from its boot (if it needs one) to its last step.
+    fn run_test(&mut self, test: &Test) -> ResultRecord {
+        let machine = &self.machine.name;
+        self.reporter.report(&Event::TestStarted { machine, test: &test.id });
+        let started = Instant::now();
+        let limit = test.time * self.driver.slowdown();
+        let deadline = started + limit;
+        self.log = vec![format!("Test {} on {machine}: {}", test.id, test.about)];
+        self.screenshots = Vec::new();
+        let mut steps = Vec::new();
+
+        let mut failure = None;
+        if test.fresh || !self.reusable || !self.driver.is_on() {
+            let (record, outcome) = self
+                .timed("boot afresh and wait until booted", |worker| worker.boot_fresh(deadline));
+            steps.push(record);
+            failure = outcome.err();
+        } else {
+            self.log.push(format!("Sharing boot {} with the test before.", self.boot));
+            self.serial.skip_to_end();
+        }
+        for (index, step) in test.steps.iter().enumerate() {
+            if failure.is_some() {
+                break;
+            }
+            let (record, outcome) =
+                self.timed(&step.describe(), |worker| worker.run_step(test, step, deadline));
+            steps.push(record);
+            failure = outcome.err().map(|failure| match failure {
+                StepFailure::Fail(why) => StepFailure::Fail(format!("step {}: {why}", index + 1)),
+                StepFailure::Error(why) => StepFailure::Error(format!("step {}: {why}", index + 1)),
+            });
+        }
+
+        let (result, reason) = match failure {
+            None => (Outcome::Pass, None),
+            Some(StepFailure::Fail(why)) => {
+                (Outcome::Fail, Some(self.with_time_limit(why, deadline, test)))
+            }
+            Some(StepFailure::Error(why)) => (Outcome::Error, Some(why)),
+        };
+        if result != Outcome::Pass {
+            self.screenshot_after_failure(test);
+        }
+        self.reusable = result == Outcome::Pass && self.driver.is_on();
+        let log = self.write_log(test, result, reason.as_deref());
+        let milliseconds = started.elapsed().as_millis() as u64;
+        self.reporter.report(&Event::TestEnded {
+            machine,
+            test: &test.id,
+            result,
+            reason: reason.as_deref(),
+            milliseconds,
+        });
+        ResultRecord {
+            test: test.id.clone(),
+            machine: machine.clone(),
+            result,
+            reason,
+            milliseconds,
+            boot: (self.boot > 0).then_some(self.boot),
+            log,
+            steps,
+            screenshots: std::mem::take(&mut self.screenshots),
+        }
+    }
+
+    /// Runs `action` as a step named `what`, logging and timing it.
+    fn timed(
+        &mut self,
+        what: &str,
+        action: impl FnOnce(&mut Self) -> Result<Option<String>, StepFailure>,
+    ) -> (StepRecord, Result<(), StepFailure>) {
+        let started = Instant::now();
+        let outcome = action(self);
+        let milliseconds = started.elapsed().as_millis() as u64;
+        let (result, note, outcome) = match outcome {
+            Ok(note) => (Outcome::Pass, note, Ok(())),
+            Err(StepFailure::Fail(why)) => {
+                (Outcome::Fail, Some(why.clone()), Err(StepFailure::Fail(why)))
+            }
+            Err(StepFailure::Error(why)) => {
+                (Outcome::Error, Some(why.clone()), Err(StepFailure::Error(why)))
+            }
+        };
+        let word = match result {
+            Outcome::Pass => "passed",
+            Outcome::Fail => "FAILED",
+            _ => "ERROR",
+        };
+        self.log.push(format!("{what}: {word} after {milliseconds} ms"));
+        if let Some(note) = &note {
+            self.log.extend(note.lines().map(|line| format!("    {line}")));
+        }
+        (StepRecord { step: what.into(), result, milliseconds, note }, outcome)
+    }
+
+    /// Says how long the limit was when a failure came from reaching it.
+    fn with_time_limit(&self, why: String, deadline: Instant, test: &Test) -> String {
+        if Instant::now() < deadline {
+            return why;
+        }
+        let slowdown = self.driver.slowdown();
+        let limit = format_duration(test.time);
+        if slowdown > 1 {
+            let slow = format_duration(test.time * slowdown);
+            format!("{why} (time limit {limit}, {slow} under QEMU's emulator)")
+        } else {
+            format!("{why} (time limit {limit})")
+        }
+    }
+
+    fn boot_fresh(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        self.driver.boot_fresh().map_err(StepFailure::Error)?;
+        self.boot += 1;
+        self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
+        self.log.push(format!("Boot {}: serial log {}", self.boot, self.relative_serial()));
+        let note = self.wait_ready(deadline)?;
+        // The test that boots sees its whole boot: its serial steps may
+        // check what came before the ready line.
+        self.serial.rewind();
+        Ok(note)
+    }
+
+    fn relative_serial(&self) -> String {
+        self.bundle.relative(self.driver.serial_log())
+    }
+
+    /// Waits for the machine's ready line on the serial console, then,
+    /// when the machine has an SSH channel, for SSH to answer.
+    fn wait_ready(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        let ready = self.machine.ready.clone();
+        self.wait_serial(&ready, deadline)?;
+        // Without a key, tests that have no `run` steps still run, on
+        // the serial console alone; the run refuses the others before
+        // it starts.
+        if self.machine.who(Control::Ssh) != Who::Driver || !self.has_key {
+            return Ok(None);
+        }
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let attempt = deadline.min(Instant::now() + Duration::from_secs(20));
+            match self.driver.run_command("true", attempt) {
+                Ok(output) if output.status == Some(0) => return Ok(None),
+                Ok(output) => last = output.text.trim().to_string(),
+                Err(err) => return Err(StepFailure::Error(err)),
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Err(StepFailure::Fail(format!(
+            "booted, but SSH did not answer as the lab account; last answer: {last}"
+        )))
+    }
+
+    fn run_step(
+        &mut self,
+        test: &Test,
+        step: &Step,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        match step {
+            Step::Run(command) => self.run_command(command, deadline),
+            Step::Serial(text) => self.wait_serial(text, deadline),
+            Step::Power(action) => self.power(*action, deadline),
+            Step::Link(up) => self.driver.set_link(*up).map(|()| None).map_err(StepFailure::Error),
+            Step::PlugUsb(image) => {
+                self.driver.plug_usb(image).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::UnplugUsb => self.driver.unplug_usb().map(|()| None).map_err(StepFailure::Error),
+            Step::Keys(keys) => {
+                self.driver.press_keys(keys).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::Screenshot(name) => {
+                self.screenshot(test, name).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::WaitReady => self.wait_ready(deadline),
+            Step::Sleep(time) => {
+                let until = Instant::now() + *time;
+                std::thread::sleep(until.min(deadline).saturating_duration_since(Instant::now()));
+                if until > deadline {
+                    return Err(StepFailure::Fail(
+                        "the wait ran past the test's time limit".into(),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn run_command(
+        &mut self,
+        command: &Command,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let output =
+            self.driver.run_command(&command.command, deadline).map_err(StepFailure::Error)?;
+        let shown = format!("$ {}\n{}", command.command, output.text.trim_end());
+        let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
+        match output.status {
+            None => return fail("it was still running at the test's time limit".into()),
+            Some(255) if command.exit != 255 => {
+                return fail(
+                    "SSH could not run it (exit status 255); SSH's message is below".into(),
+                );
+            }
+            Some(status) if status != command.exit => {
+                return fail(format!("it exited with status {status}, not {}", command.exit));
+            }
+            Some(_) => {}
+        }
+        if let Some(missing) =
+            command.expect.iter().find(|text| !output.text.contains(text.as_str()))
+        {
+            return fail(format!("its output lacks \"{missing}\""));
+        }
+        if let Some(found) =
+            command.expect_not.iter().find(|text| output.text.contains(text.as_str()))
+        {
+            return fail(format!("its output holds \"{found}\""));
+        }
+        Ok(Some(shown))
+    }
+
+    /// Waits for `text` on the serial console after the last text found.
+    fn wait_serial(
+        &mut self,
+        text: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        loop {
+            if self.serial.find(text) {
+                return Ok(None);
+            }
+            if !self.driver.is_on() {
+                // The last lines may have landed as the machine went off.
+                if self.serial.find(text) {
+                    return Ok(None);
+                }
+                return Err(StepFailure::Fail(format!(
+                    "the machine turned off before \"{text}\" appeared on the serial console ({})",
+                    self.relative_serial()
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(StepFailure::Fail(format!(
+                    "\"{text}\" did not appear on the serial console ({})",
+                    self.relative_serial()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn power(
+        &mut self,
+        action: PowerAction,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        match self.driver.power(action, deadline) {
+            Ok(()) => Ok(None),
+            // A machine that does not shut down when asked is Dukovo's
+            // failure; anything else here is the driver's.
+            Err(why) if action == PowerAction::Off && self.driver.is_on() => {
+                Err(StepFailure::Fail(why))
+            }
+            Err(why) => Err(StepFailure::Error(why)),
+        }
+    }
+
+    fn screenshot(&mut self, test: &Test, name: &str) -> Result<(), String> {
+        let folder = self.bundle.screenshots(&self.machine.name);
+        fs::create_dir_all(&folder).map_err(|err| format!("making {}: {err}", folder.display()))?;
+        let path = folder.join(format!("{}-{name}.png", test.id.replace('/', "-")));
+        self.driver.screenshot(&path)?;
+        self.screenshots.push(self.bundle.relative(&path));
+        Ok(())
+    }
+
+    /// Keeps the screen as a failure left it, when the machine can show it.
+    fn screenshot_after_failure(&mut self, test: &Test) {
+        if self.machine.who(Control::Screen) == Who::Driver
+            && self.driver.is_on()
+            && let Err(err) = self.screenshot(test, "at-failure")
+        {
+            self.log.push(format!("No screenshot at the failure: {err}"));
+        }
+    }
+
+    /// Writes the test's log; returns its path in the bundle.
+    fn write_log(&mut self, test: &Test, result: Outcome, reason: Option<&str>) -> Option<String> {
+        self.log.push(match reason {
+            Some(reason) => format!("Result: {result:?}: {reason}"),
+            None => format!("Result: {result:?}"),
+        });
+        let folder = self.bundle.logs(&self.machine.name);
+        let path = folder.join(format!("{}.log", test.id.replace('/', "-")));
+        let mut text = std::mem::take(&mut self.log).join("\n");
+        text.push('\n');
+        fs::create_dir_all(&folder).and_then(|()| fs::write(&path, text)).ok()?;
+        Some(self.bundle.relative(&path))
+    }
+}
+
+/// Follows a serial log, finding text in order.
+struct SerialWatch {
+    path: PathBuf,
+    /// The log read so far, with terminal escapes removed.
+    text: String,
+    /// Where the next search starts: the end of the last text found.
+    cursor: usize,
+}
+
+impl SerialWatch {
+    fn new(path: PathBuf) -> SerialWatch {
+        SerialWatch { path, text: String::new(), cursor: 0 }
+    }
+
+    fn refresh(&mut self) {
+        if let Ok(bytes) = fs::read(&self.path) {
+            self.text = without_escapes(&String::from_utf8_lossy(&bytes));
+        }
+    }
+
+    /// Searches from the end of the log as it is now: a test that shares a
+    /// boot sees only what comes after it starts.
+    fn skip_to_end(&mut self) {
+        self.refresh();
+        self.cursor = self.text.len();
+    }
+
+    /// Searches from the start of the log again.
+    fn rewind(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Whether `needle` has appeared since the last text found; moves past it.
+    fn find(&mut self, needle: &str) -> bool {
+        self.refresh();
+        let Some(at) = self.text.get(self.cursor..).and_then(|rest| rest.find(needle)) else {
+            return false;
+        };
+        self.cursor += at + needle.len();
+        true
+    }
+}
+
+/// `text` without terminal escape sequences and carriage returns, as a
+/// person reading the console sees it. Removing a sequence cut short at
+/// the end keeps what came before unchanged as the log grows, so places
+/// found in it stay valid.
+fn without_escapes(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // CSI: ESC [ parameters, then a final byte from @ to ~.
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            '\r' => {}
+            c => clean.push(c),
+        }
+    }
+    clean
+}
+
+/// Lets tests run whole runs without QEMU.
+#[cfg(test)]
+mod fake;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removes_escapes_the_same_way_as_the_log_grows() {
+        let log = "\u{1b}[2J\u{1b}[1;32mBoot complete.\u{1b}[0m\r\nlogin: ";
+        assert_eq!(without_escapes(log), "Boot complete.\nlogin: ");
+        // Cut inside an escape: the text before it is the same.
+        assert_eq!(without_escapes(&log[..8]), "");
+        assert_eq!(without_escapes(&log[..12]), "B");
+    }
+
+    #[test]
+    fn finds_serial_text_in_order() {
+        let dir = crate::testing::TempDir::new("serial");
+        let path = dir.write("serial.log", "one\ntwo\none\n");
+        let mut watch = SerialWatch::new(path.clone());
+        assert!(watch.find("one"));
+        assert!(watch.find("one"), "the second one");
+        assert!(!watch.find("two"), "two came before the second one");
+        fs::write(&path, "one\ntwo\none\ntwo\n").unwrap();
+        assert!(watch.find("two"));
+        watch.skip_to_end();
+        assert!(!watch.find("one"));
+    }
+}
