@@ -17,9 +17,10 @@ a feature and its lab test land together and the lab always runs the
 tests that match the build.
 
 **Status:** in progress (item 14f of Dukovo's roadmap). `dukovo-lab`
-runs tests on QEMU machines, writes results bundles, and serves the
-runner page; findings, Send, schedules and real machines come in the
-next pull requests.
+runs tests on QEMU machines, writes results bundles, groups failures
+into findings, sends them to the private results repository, and serves
+the runner page; schedules and real machines come in the next pull
+requests.
 
 ## Getting started
 
@@ -45,6 +46,8 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
 - [The runner page](docs/runner-page.md): `./ob lab ui`
 - [Commands](docs/commands.md): every command, its JSON and exit statuses,
   results bundles, and troubleshooting
+- [Sending findings](docs/sending.md): the lab-results repository, and
+  what goes there
 - [Test files](docs/test-files.md): writing a lab test
 - [Machine files](docs/machine-files.md): adding a machine
 - [Driving the lab from an agent](docs/agents.md)

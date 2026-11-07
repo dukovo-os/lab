@@ -5,7 +5,8 @@
 //!
 //! The page does nothing a command cannot: each of its buttons runs a
 //! `dukovo-lab` command with `--json` (`run --detach`, `status`, `stop`,
-//! `done`, `results`, `runs`, `list`, `machines`) and shows the answer,
+//! `done`, `results`, `runs`, `list`, `machines`, `findings`, `send`)
+//! and shows the answer,
 //! and every answer names the command it ran. So whatever a person does
 //! on the page, an agent can do with the same commands, and the page can
 //! never drift from them.
@@ -41,7 +42,7 @@ use serde_json::{Value, json};
 
 use crate::http::{Request, Response, read_request, write_response};
 use crate::machines::is_plain_name;
-use crate::{Arguments, Error, store};
+use crate::{Arguments, Error, findings, send, store};
 
 /// The port `ui` listens on unless told otherwise.
 const DEFAULT_PORT: u16 = 7420;
@@ -76,6 +77,8 @@ struct Page {
     /// The folder options every command gets, with absolute paths.
     folders: Vec<OsString>,
     store: PathBuf,
+    /// The lab-results clone that Send commits to.
+    results: PathBuf,
     /// The image under test and its build, which runs from the page use.
     image: Option<PathBuf>,
     build: Option<String>,
@@ -96,7 +99,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         std::path::absolute(&path).map_err(|err| Error::Usage(format!("{}: {err}", path.display())))
     };
     let store = absolute(arguments.store_dir()?)?;
-    let folders = vec![
+    let mut folders = vec![
         "--tests".into(),
         absolute(arguments.tests_dir())?.into(),
         "--config".into(),
@@ -104,6 +107,10 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         "--store".into(),
         store.clone().into(),
     ];
+    let results = absolute(send::clone_dir(&store, arguments.results.as_deref()))?;
+    if arguments.results.is_some() {
+        folders.extend(["--results".into(), results.clone().into()]);
+    }
     let image = match &arguments.image {
         Some(image) if !image.is_file() => {
             return Err(Error::Usage(format!("the image {} does not exist", image.display())));
@@ -126,6 +133,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         folders,
         image_made: image.as_deref().and_then(modified),
         store,
+        results,
         image,
         build: arguments.build.clone(),
     });
@@ -228,11 +236,19 @@ impl Page {
                     "build": self.build,
                     "image": self.image,
                     "can_run": self.image.is_some(),
+                    // Send needs a lab-results clone (docs/sending.md).
+                    "can_send": self.results.join(".git").exists(),
+                    "results": self.results,
                 }),
             ),
             ("GET", "/api/list") => self.command(&["list"]),
             ("GET", "/api/machines") => self.command(&["machines"]),
             ("GET", "/api/runs") => self.command(&["runs", "--limit", "20"]),
+            ("GET", "/api/findings") => match request.query("run") {
+                None => self.command(&["findings", "--all"]),
+                Some(id) if store::valid_run_id(id) => self.command(&["findings", "--run", id]),
+                Some(_) => bad("not a run id"),
+            },
             ("GET", "/api/status" | "/api/results") => {
                 let command = request.path.trim_start_matches("/api/");
                 match request.query("run") {
@@ -260,6 +276,8 @@ impl Page {
                         }
                         _ => bad("which run and machine?"),
                     },
+                    "/api/send" => self.send(&body),
+                    "/api/findings" => self.change_finding(&body),
                     _ => Response::text(404, "No such action."),
                 }
             }
@@ -327,6 +345,53 @@ impl Page {
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.command(&args)
+    }
+
+    /// Sends to lab-results: `{"findings": [ids]}`, `{"run": id}` (a run
+    /// and its findings) or `{"all": true}` (every finding not sent yet).
+    fn send(&self, body: &Value) -> Response {
+        let mut args: Vec<&str> = vec!["send"];
+        if body["all"].as_bool() == Some(true) {
+            args.push("--all");
+        } else if let Some(id) = run_id(body) {
+            args.extend(["--run", id]);
+        } else {
+            let ids: Vec<&str> = body["findings"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if ids.is_empty() || !ids.iter().all(|id| findings::valid_id(id)) {
+                return bad("which findings?");
+            }
+            args.extend(ids);
+        }
+        self.command(&args)
+    }
+
+    /// Says a finding is not a bug, with an optional note, or reopens it:
+    /// `{"finding": id, "not_a_bug": true, "note": text}` or
+    /// `{"finding": id, "reopen": true}`.
+    fn change_finding(&self, body: &Value) -> Response {
+        let Some(id) = body["finding"].as_str().filter(|id| findings::valid_id(id)) else {
+            return bad("which finding?");
+        };
+        if body["reopen"].as_bool() == Some(true) {
+            return self.command(&["findings", id, "--reopen"]);
+        }
+        if body["not_a_bug"].as_bool() != Some(true) {
+            return bad("say not_a_bug or reopen");
+        }
+        // One line, kept short: it shows in lists and in lab-results.
+        let note =
+            body["note"].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+        if note.chars().count() > 500 {
+            return bad("keep the note under 500 characters");
+        }
+        if note.is_empty() {
+            self.command(&["findings", id, "--not-a-bug"])
+        } else {
+            self.command(&["findings", id, "--not-a-bug", "--note", &note])
+        }
     }
 
     /// Runs `dukovo-lab <args> --json` and answers with what it printed,
@@ -440,10 +505,26 @@ mod tests {
             program: "/bin/false".into(),
             folders: Vec::new(),
             store: store.to_path_buf(),
+            results: store.join("lab-results"),
             image: None,
             build: None,
             image_made: None,
         }
+    }
+
+    /// A POST from the page itself.
+    fn post(page: &Page, path: &str, body: &str) -> Response {
+        let mut request = get(path, "127.0.0.1:7420", Some(&page.key));
+        request.method = "POST".into();
+        request.headers.push(("x-dukovo-lab".into(), "1".into()));
+        request.body = body.as_bytes().to_vec();
+        page.route(&request)
+    }
+
+    /// The command a page action ran, from its answer.
+    fn command_of(response: &Response) -> String {
+        let answer: Value = serde_json::from_slice(&response.body).unwrap();
+        answer["command"].as_str().unwrap_or_default().to_string()
     }
 
     fn get(path: &str, host: &str, cookie: Option<&str>) -> Request {
@@ -484,6 +565,36 @@ mod tests {
         post.headers.push(("x-dukovo-lab".into(), "1".into()));
         post.headers.push(("origin".into(), "http://evil.example".into()));
         assert_eq!(page.route(&post).status, 403);
+    }
+
+    #[test]
+    fn sends_and_marks_findings_only_by_their_ids() {
+        let store = TempDir::new("ui-findings");
+        let page = page(store.path());
+        let id = "f-3a9c51d2e07b";
+        let sent = post(&page, "/api/send", &format!(r#"{{"findings":["{id}"]}}"#));
+        assert_eq!(command_of(&sent), format!("dukovo-lab send {id} --json"));
+        let run = post(&page, "/api/send", r#"{"run":"20261107-153012-4f2a"}"#);
+        assert_eq!(command_of(&run), "dukovo-lab send --run 20261107-153012-4f2a --json");
+        // Anything else that would read as an option or a path is refused.
+        for body in [r#"{"findings":["--all"]}"#, r#"{"findings":[]}"#, r#"{"run":"../x"}"#] {
+            assert_eq!(post(&page, "/api/send", body).status, 400, "{body}");
+        }
+        let marked = post(
+            &page,
+            "/api/findings",
+            &format!(r#"{{"finding":"{id}","not_a_bug":true,"note":"the cable\nwas out"}}"#),
+        );
+        assert_eq!(
+            command_of(&marked),
+            format!("dukovo-lab findings {id} --not-a-bug --note 'the cable was out' --json")
+        );
+        let reopened =
+            post(&page, "/api/findings", &format!(r#"{{"finding":"{id}","reopen":true}}"#));
+        assert_eq!(command_of(&reopened), format!("dukovo-lab findings {id} --reopen --json"));
+        assert_eq!(post(&page, "/api/findings", r#"{"finding":"-x","reopen":true}"#).status, 400);
+        let long = format!(r#"{{"finding":"{id}","not_a_bug":true,"note":"{}"}}"#, "x".repeat(501));
+        assert_eq!(post(&page, "/api/findings", &long).status, 400);
     }
 
     #[test]

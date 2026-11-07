@@ -13,7 +13,7 @@
 
 /** What the page knows; render() draws it all. */
 const state = {
-  page: null, // { version, build, image, can_run }
+  page: null, // { version, build, image, can_run, can_send, results }
   tests: [], // from `list --json`
   categories: [],
   presets: [],
@@ -28,6 +28,13 @@ const state = {
   status: null, // `status --json` of that run
   results: null, // `results --json` of that run
   resultsFor: "", // which status the results were fetched for
+  findings: [], // from `findings --all --json`, most recently seen first
+  findingsFor: "", // which runs the findings were fetched for
+  open: new Set(), // findings panel items opened, by run:machine:test
+  tabs: new Map(), // and the view shown in each
+  noting: new Map(), // finding id to the Not a bug note being typed
+  sending: false, // a send is going
+  drawn: "", // what the findings panel was last drawn from
 };
 
 // ---- Talking to the server ----
@@ -44,7 +51,7 @@ async function read(path) {
   return reply.answer !== undefined ? reply.answer : reply;
 }
 
-/** Runs an action (run, stop, done); answers the command's JSON. */
+/** Runs an action (run, stop, done, send, findings); answers the command's JSON. */
 async function act(path, body) {
   const response = await fetch(path, {
     method: "POST",
@@ -168,7 +175,7 @@ function render() {
   renderMachines();
   renderTests();
   renderRun();
-  renderFailures();
+  renderFindings();
   renderRuns();
 }
 
@@ -397,25 +404,93 @@ function logLine(event) {
       bad = event.result === "fail" || event.result === "error";
       text = WORDS[event.result].toUpperCase() + (event.reason ? ": " + event.reason.split("\n")[0] : "");
       break;
-    case "run-ended": text = event.stopped ? "stopped" : "ended"; break;
+    case "run-ended": {
+      const found = (event.findings || []).length;
+      text = (event.stopped ? "stopped" : "ended") + (found ? " · " + found + (found === 1 ? " finding" : " findings") : "");
+      break;
+    }
     default: return null;
   }
   return el("div", {}, el("span", { class: "t" }, time), " ", el("span", { class: "k" }, where), " ", el("span", { class: bad ? "e" : "" }, text));
 }
 
-function renderFailures() {
-  const results = state.results;
-  const failed = results ? results.results.filter((r) => r.result === "fail" || r.result === "error") : [];
-  byId("failures-panel").hidden = !failed.length;
-  byId("failure-count").textContent = "· " + failed.length;
-  byId("failures").replaceChildren(...failed.map((result) => failure(results, result)));
+// ---- Findings ----
+//
+// A failed result belongs to a finding: the same test failing the same
+// way, in every run it did (see findings.rs). A result that broke (an
+// error) is a lab problem instead, which says nothing about Dukovo, so
+// it is shown but never sent.
+
+const STATE_WORDS = { new: "New", "not-a-bug": "Not a bug", "fix-proposed": "Fix proposed", approved: "Fix approved", fixed: "Fixed" };
+
+/** Whether a finding failed in a run lab-results does not have yet. */
+function unsent(finding) {
+  return finding.runs.some((seen) => !seen.sent);
 }
 
-/** One failure: why, its steps, its logs and screenshots, Run again. */
-function failure(results, result) {
+/** Whether Send has something of a finding's to send. */
+function sendable(finding) {
+  return finding.state !== "not-a-bug" && unsent(finding);
+}
+
+/** The finding a failed result belongs to, if it is known yet. */
+function findingOf(run, result) {
+  return state.findings.find((f) => f.test === result.test && f.runs.some((s) => s.run === run && s.machine === result.machine));
+}
+
+/** The findings of a run, each once. */
+function findingsOfRun(run) {
+  return state.findings.filter((f) => f.runs.some((s) => s.run === run));
+}
+
+function renderFindings() {
+  const results = state.results;
+  const broken = results ? results.results.filter((r) => r.result === "fail" || r.result === "error") : [];
+  const run = results ? results.run.id : "";
+  const ofRun = findingsOfRun(run);
+  const allNew = state.findings.filter(sendable);
+  // Drawn again only when what it shows changed: a redraw would close
+  // what a person opened and lose a note being typed.
+  const drawn = JSON.stringify([state.resultsFor, run, broken.length, ofRun, allNew.length, state.sending, state.page, [...state.noting.keys()]]);
+  if (drawn === state.drawn) return;
+  state.drawn = drawn;
+
+  byId("findings-panel").hidden = !broken.length;
+  if (!broken.length) return;
+  const errors = broken.filter((r) => r.result === "error").length;
+  const counts = [ofRun.length + (ofRun.length === 1 ? " finding" : " findings")];
+  if (errors) counts.push(errors + (errors === 1 ? " lab problem" : " lab problems"));
+  byId("finding-count").textContent = "· " + counts.join(", ");
+  byId("findings").replaceChildren(...broken.map((result) => item(results, result)));
+
+  // Send, for this run's findings; and for every finding, when others wait too.
+  const canSend = state.page && state.page.can_send;
+  const toSend = ofRun.filter(sendable);
+  const bar = byId("send-bar");
+  const button = byId("send-run");
+  bar.hidden = !ofRun.length;
+  if (!canSend) {
+    byId("send-note").textContent = "Send needs the lab-results clone at " + ((state.page && state.page.results) || "lab-results in the store") + ": ob lab makes it, or see docs/sending.md.";
+  } else if (toSend.length) {
+    byId("send-note").textContent = "Sends the findings, their runs and logs to the project's private lab-results repository. A thread proposes a fix for each, and nothing is fixed until you approve it.";
+  } else {
+    byId("send-note").textContent = "Everything here is in lab-results, or marked not a bug.";
+  }
+  button.hidden = !toSend.length;
+  button.disabled = !canSend || state.sending;
+  button.textContent = state.sending ? "Sending…" : "Send " + toSend.length + (toSend.length === 1 ? " finding" : " findings");
+  const all = byId("send-all");
+  all.hidden = allNew.length <= toSend.length;
+  all.disabled = !canSend || state.sending;
+  all.textContent = "Send all new (" + allNew.length + ")";
+}
+
+/** One broken result: its finding (or lab problem), why, its logs, and what to do. */
+function item(results, result) {
   const run = results.run.id;
+  const finding = result.result === "fail" ? findingOf(run, result) : null;
+  const key = run + ":" + result.machine + ":" + result.test;
   const file = (path) => "/files/" + run + "/" + path;
-  const detail = el("div", { class: "detail" });
   const views = {
     Steps: () => el("ol", { class: "steps" }, result.steps.map((s) =>
       el("li", { class: s.result === "pass" ? "" : "bad" },
@@ -431,23 +506,94 @@ function failure(results, result) {
   const tabs = el("div", { class: "tabs", role: "tablist" });
   const body = el("div");
   const show = (name) => {
+    state.tabs.set(key, name);
     for (const tab of tabs.children) tab.classList.toggle("sel", tab.textContent === name);
     body.replaceChildren(views[name]());
   };
   for (const name of Object.keys(views)) {
     tabs.append(el("button", { class: "tab", type: "button", role: "tab", onclick: () => show(name) }, name));
   }
+
+  const lines = [result.machine];
+  let badge;
+  if (finding) {
+    badge = pill(finding.state, STATE_WORDS[finding.state]);
+    lines.push(seenText(finding));
+    if (finding.state === "not-a-bug" && finding.note) lines.push("not a bug: " + finding.note);
+  } else if (result.result === "error") {
+    badge = pill("lab-problem", "Lab problem");
+    lines.push("the harness or the machine broke, so this says nothing about Dukovo; it is not sent");
+  } else {
+    badge = pill("fail");
+  }
+  const meta = lines.join(" · ") + "\n" + (result.reason || "").split("\n").slice(0, 3).join("\n");
+
+  const detail = el("div", { class: "detail" }, tabs, body, actions(result, finding));
+  const box = el("details", { class: "finding" + (finding ? (finding.state === "new" ? "" : " closed") : result.result === "error" ? " lab" : ""), open: state.open.has(key) },
+    el("summary", {}, el("div", { class: "top" }, el("span", { class: "title" }, result.test), badge), el("div", { class: "meta" }, meta)),
+    detail);
+  // Logs are fetched only once a view shows: they can be long.
+  const draw = () => box.open && !body.childElementCount && show(state.tabs.get(key) || "Steps");
+  box.addEventListener("toggle", () => {
+    box.open ? state.open.add(key) : state.open.delete(key);
+    draw();
+  });
+  draw();
+  return box;
+}
+
+/** "first time", or "failed 3 times on qemu, optiplex since Nov 3 19:05; passes again on qemu". */
+function seenText(finding) {
+  let text = finding.count === 1
+    ? "first time"
+    : "failed " + finding.count + " times on " + finding.machines.join(", ") + " since " + when(finding.first_seen);
+  const passing = Object.keys(finding.passing || {});
+  if (passing.length) text += "; passed since on " + passing.join(", ");
+  return text;
+}
+
+/** Send, Run again, Not a bug (with a note typed in place) or Reopen. */
+function actions(result, finding) {
+  const canSend = state.page && state.page.can_send;
   const again = el("button", { class: "btn", type: "button", disabled: !state.page || !state.page.can_run,
     onclick: () => startRun([result.test], [result.machine]) }, "Run again");
-  detail.append(tabs, body, el("div", { class: "tools" }, again));
-  const box = el("details", { class: "finding" },
-    el("summary", {},
-      el("div", { class: "top" }, el("span", { class: "title" }, result.test), pill(result.result)),
-      el("div", { class: "meta" }, result.machine + " · " + (result.reason || "").split("\n").slice(0, 3).join("\n"))),
-    detail);
-  // Draw the first view only when opened: logs can be long.
-  box.addEventListener("toggle", () => box.open && !body.childElementCount && show("Steps"));
-  return box;
+  if (!finding) return el("div", { class: "tools" }, again);
+  if (state.noting.has(finding.id)) {
+    const input = el("input", { type: "text", maxlength: "500", "aria-label": "Why it is not a bug",
+      placeholder: "Why, if you like: the test is wrong, the cable was out…",
+      value: state.noting.get(finding.id),
+      oninput: (event) => state.noting.set(finding.id, event.target.value),
+      onkeydown: (event) => event.key === "Enter" && say(),
+    });
+    const say = () => changeFinding({ finding: finding.id, not_a_bug: true, note: input.value });
+    const cancel = () => {
+      state.noting.delete(finding.id);
+      renderFindings();
+    };
+    setTimeout(() => input.focus(), 0);
+    return el("div", { class: "nab" }, input,
+      el("button", { class: "btn primary", type: "button", onclick: say }, "Say not a bug"),
+      el("button", { class: "btn", type: "button", onclick: cancel }, "Cancel"));
+  }
+  const tools = el("div", { class: "tools" });
+  if (finding.state !== "not-a-bug") {
+    tools.append(el("button", {
+      class: "btn primary", type: "button",
+      disabled: !canSend || state.sending || !unsent(finding),
+      title: canSend ? null : "Send needs a lab-results clone: ob lab makes it",
+      onclick: () => sendNow({ findings: [finding.id] }),
+    }, unsent(finding) ? (state.sending ? "Sending…" : "Send this finding") : "Sent"));
+  }
+  tools.append(again);
+  if (finding.state === "not-a-bug") {
+    tools.append(el("button", { class: "btn", type: "button", onclick: () => changeFinding({ finding: finding.id, reopen: true }) }, "Reopen"));
+  } else {
+    tools.append(el("button", { class: "btn", type: "button", onclick: () => {
+      state.noting.set(finding.id, "");
+      renderFindings();
+    } }, "Not a bug"));
+  }
+  return tools;
 }
 
 /** A log file, fetched when shown. */
@@ -474,11 +620,46 @@ function renderRuns() {
     const name = preset ? preset.title : run.tests + (run.tests === 1 ? " test" : " tests");
     return el("tr", { class: run.id === state.viewing ? "sel" : "", tabindex: "0", onclick: () => view(run.id), onkeydown: (e) => e.key === "Enter" && view(run.id) },
       el("td", {}, when(run.started)), el("td", {}, name), el("td", {}, run.machines.join(", ")),
-      el("td", { class: "mono" }, run.build || ""), el("td", {}, result));
+      el("td", { class: "mono" }, run.build || ""), el("td", { class: "res" }, result), el("td", {}, runFindings(run)));
   }));
 }
 
+/** A past run's findings, and whether they went to lab-results. */
+function runFindings(run) {
+  if (run.state === "running") return "";
+  const found = findingsOfRun(run.id);
+  if (!found.length) return run.sent ? "Sent" : "Nothing to send";
+  let text = found.length + (found.length === 1 ? " finding" : " findings");
+  if (found.every((f) => f.state === "fixed")) text += ", fixed";
+  else if (found.every((f) => f.state === "not-a-bug")) text += ", not bugs";
+  else text += run.sent ? ", sent" : found.some(sendable) ? ", not sent" : "";
+  return text;
+}
+
 // ---- Acting ----
+
+/** Sends to lab-results, then shows what is sent. */
+async function sendNow(body) {
+  notice("");
+  state.sending = true;
+  renderFindings();
+  try {
+    await act("/api/send", body);
+  } finally {
+    state.sending = false;
+    state.findingsFor = "";
+    await refresh();
+  }
+}
+
+/** Says a finding is not a bug, or reopens it. */
+async function changeFinding(body) {
+  notice("");
+  const answer = await act("/api/findings", body);
+  if (!answer.error) state.noting.delete(body.finding);
+  state.findingsFor = "";
+  await refresh();
+}
 
 /** Starts a run of `tests` (or the chosen preset when tests is null and one is chosen). */
 async function startRun(tests, machines) {
@@ -522,6 +703,12 @@ async function refreshRun() {
 
 async function refresh() {
   state.runs = (await read("/api/runs")).runs || [];
+  // Findings change when a run ends or something is sent or marked.
+  const findingsFor = state.runs.map((r) => r.id + r.state + r.sent).join();
+  if (findingsFor !== state.findingsFor) {
+    state.findings = (await read("/api/findings")).findings || [];
+    state.findingsFor = findingsFor;
+  }
   if (!state.viewing && state.runs.length) {
     const going = state.runs.find((r) => r.state === "running");
     state.viewing = (going || state.runs[0]).id;
@@ -553,6 +740,8 @@ async function start() {
     render();
   });
   byId("run-picked").addEventListener("click", () => startRun(null, null));
+  byId("send-run").addEventListener("click", () => sendNow({ run: state.results.run.id }));
+  byId("send-all").addEventListener("click", () => sendNow({ all: true }));
   byId("stop").addEventListener("click", async () => {
     byId("stop").disabled = true;
     byId("stop").textContent = "Stopping…";

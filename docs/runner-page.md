@@ -6,8 +6,8 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 # The runner page
 
 The runner page is the lab's control panel: pick machines and tests, run
-them, watch the run, and read what failed. It runs on the lab PC and
-only a browser on that PC can open it.
+them, watch the run, read what failed and send it on. It runs on the lab
+PC and only a browser on that PC can open it.
 
 ```sh
 ./ob lab ui              # in a Dukovo checkout: builds the lab image, then serves the page
@@ -40,13 +40,27 @@ wrong build.
   press once it is done.
 - **This run.** Progress, counts, an estimate of the time left, each
   machine's tally, a live log of each step, and Stop.
-- **Failures.** Each failed test with why, its steps, its test log, the
-  boot's serial log and its screenshots, and Run again for that test on
-  that machine.
-- **Past runs.** Every run, newest first. Click one to show it above.
+- **Findings.** Each failed test with its finding: new, not a bug, fix
+  proposed, approved or fixed, how often and where it failed before, and
+  whether it passes again somewhere. Open one for why, its steps, its
+  test log, the boot's serial log and its screenshots. Then:
+  - **Send this finding** sends it, with its runs and logs, to the
+    private lab-results repository, where a thread proposes a fix and
+    nothing is fixed until the maintainer approves it.
+  - **Run again** runs that test on that machine.
+  - **Not a bug** asks, in place, why (the test is wrong, a cable was
+    out; it can stay empty), then marks it so: it is not offered to send
+    again. **Reopen** takes that back.
 
-Sending findings to the results repository, and schedules, come in a
-later update of the lab.
+  A test that broke rather than failed shows as a **lab problem**: the
+  harness or the machine broke, so it says nothing about Dukovo and is
+  never sent. Under the list, **Send** sends every new finding of the
+  run, and **Send all new** those of other runs too. Send needs a
+  lab-results clone ([Sending findings](sending.md)); `ob lab` makes it.
+- **Past runs.** Every run, newest first, with its findings and whether
+  they were sent. Click one to show it above.
+
+Schedules come in a later update of the lab.
 
 ## The same as the commands
 
@@ -63,7 +77,10 @@ started with `dukovo-lab run` shows on the page too.
 | This run | `status <run>` |
 | Stop | `stop <run>` |
 | Done | `done <run> --machine <name>` |
-| Failures | `results <run>` |
+| Findings | `results <run>`, `findings --all` |
+| Send this finding | `send <finding>` |
+| Send, Send all new | `send --run <run>`, `send --all` |
+| Not a bug, Reopen | `findings <finding> --not-a-bug [--note <text>]`, `findings <finding> --reopen` |
 | Past runs | `runs` |
 | Tests, Machines | `list`, `machines` |
 
@@ -73,7 +90,8 @@ The page listens on 127.0.0.1 only, answers only to that address and
 `localhost`, needs the printed key (which it keeps in a cookie), and
 takes actions only from its own script. It serves its own files, the
 commands' answers and files inside results bundles; never anything else
-on the PC, and never the lab key.
+on the PC, and never the lab key. Send pushes only bundles and findings,
+as `dukovo-lab send` does.
 
 The lab PC is meant to have one account. If it has others, know that
 opening the browser hands it the address, key and all, and other
