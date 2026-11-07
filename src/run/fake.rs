@@ -194,6 +194,7 @@ fn run_with(
         key: Some(setting.dir.path().join("lab_ed25519")),
         with_person,
         preset: None,
+        schedule: None,
         id: Some(
             id.map_or_else(|| crate::bundle::new_run_id(crate::clock::Utc::now()), String::from),
         ),

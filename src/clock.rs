@@ -25,7 +25,6 @@ impl Utc {
     }
 
     /// The time `seconds` after the Unix epoch.
-    #[cfg(test)]
     pub fn from_seconds(seconds: u64) -> Self {
         Self { seconds }
     }
@@ -61,6 +60,11 @@ impl Utc {
         u64::try_from(seconds).ok().map(|seconds| Self { seconds })
     }
 
+    /// Seconds since the Unix epoch.
+    pub fn seconds(self) -> u64 {
+        self.seconds
+    }
+
     /// Seconds from `earlier` to this time; zero if it is not later.
     pub fn seconds_since(self, earlier: Self) -> u64 {
         self.seconds.saturating_sub(earlier.seconds)
@@ -75,7 +79,7 @@ impl Utc {
 
 /// The civil date `days` after 1970-01-01, in the proleptic Gregorian
 /// calendar.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z.rem_euclid(146_097);
@@ -90,7 +94,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 /// The days from 1970-01-01 to a civil date: [`civil_from_days`] undone.
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year.rem_euclid(400);

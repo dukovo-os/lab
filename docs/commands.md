@@ -22,7 +22,7 @@ person does.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--tests <dir>` | `lab/tests` | The test folder. |
-| `--config <dir>` | `~/.config/dukovo-lab` | Machine files (`machines/`) and the lab key. |
+| `--config <dir>` | `~/.config/dukovo-lab` | Machine files (`machines/`), the schedules (`schedules.json`) and the lab key. |
 | `--store <dir>` | `~/.local/share/dukovo-lab` | Results bundles (`runs/`) and the run's work files while it runs. |
 | `--json` | | Answer in JSON. |
 
@@ -203,8 +203,9 @@ dukovo-lab runs [--limit <n>]
 ```
 
 The newest runs (20 unless `--limit` says), newest first, each with its
-state, start, build, preset, machines, test count, summary and whether
-it was sent to lab-results (`sent`). With `--json`: `{"runs": [...]}`.
+state, start, build, preset, the schedule that started it (`schedule`,
+if one did), machines, test count, summary and whether it was sent to
+lab-results (`sent`). With `--json`: `{"runs": [...]}`.
 
 ## findings
 
@@ -261,6 +262,42 @@ exits 2 when there is no clone or nothing named exists, and 3 when git
 or the network fails; nothing is then marked sent, so the next Send
 tries again.
 
+## schedule
+
+```
+dukovo-lab schedule
+dukovo-lab schedule save <name> <test or category>... | --all | --preset <name>
+                     (--at <HH:MM> [--days <mon,...>] | --each-build)
+                     [--machine <a,b>] [--send | --hold] [--title <text>]
+dukovo-lab schedule remove | pause | resume | start <name>
+dukovo-lab schedule install
+dukovo-lab schedule tick
+```
+
+Schedules run tests by themselves: at a time of day in the lab's zone
+(Mountain Time), on the days `--days` names or every day, or on each new
+build on Dukovo's main (`--each-build`), on the lab's own Dukovo checkout
+and with the runner page closed. See [Schedules](schedules.md).
+
+- With no action, it lists the schedules: each with what it runs, when
+  in words (`"when": "Every day, 1:00 AM"`), its next time (`next`, UTC),
+  what its start is doing if one is going (`going`), and how the last
+  one went (`last`: its run, the commit of main it tested, `result`
+  passed, failed, broke, stopped, missed or error, its findings and
+  whether they were sent). With `--json`: `{"zone": "America/Denver",
+  "zone_short": "MT", "timer": true, "schedules": [...]}`; `timer` says
+  whether the timer is installed.
+- `save` makes a schedule, or changes the one of that name (a paused one
+  stays paused). Its findings are sent to lab-results when it ends
+  unless `--hold` says to hold them. `--machine` defaults to `qemu`. A
+  time already passed today waits for tomorrow.
+- `start` starts it now, in the background, as its time would; it exits
+  4 if it is already going. `pause` and `resume` stop and restart its
+  timing; times passed while paused are not made up.
+- `install` puts the systemd timer in place and turns it on; `ob lab`
+  does this each time. `tick` is what the timer runs each minute: it
+  starts the schedules that are due, and is safe to run by hand.
+
 ## ui
 
 ```
@@ -311,7 +348,8 @@ logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.
 screenshots/<machine>/    <category>-<test>-<name>.png
 ```
 
-Once a run is sent, its bundle also holds `sent.json` (when, the commit,
+A run a schedule started names it in run.json (`schedule`). Once a run
+is sent, its bundle also holds `sent.json` (when, the commit,
 and which findings), which stays on the lab PC. Findings live beside the
 runs, in `findings/<id>.json` in the store.
 
@@ -335,4 +373,7 @@ JSON. Times are UTC, in RFC 3339.
 | `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |
 | `send` exits 3 saying the clone has changes not committed | Someone edited the clone outside `runs/` and `findings/`. `git -C <clone> status` shows what; commit and push it, or drop it, then send again. |
 | `send` exits 3 saying it could not push | Nothing was marked sent; the next send tries again. Check the network, and that `git -C <clone> push` works as the PC's GitHub account (`gh auth status`). |
+| A schedule's last result is `error` | It could not run: the lab's checkout would not update or the image would not build. `dukovo-lab schedule` says why, and its log (`schedules/<name>.log` in the store) holds what `ob` printed. |
+| A schedule never starts | Is the timer on? `systemctl --user status dukovo-lab-schedules.timer`; `dukovo-lab schedule install` (or `ob lab`) puts it in place. `journalctl --user -u dukovo-lab-schedules` shows each tick's problems. |
+| A schedule's result is `missed` | The lab PC was off or asleep at its time, for more than 12 hours. |
 | The runner page says its key has changed | `dukovo-lab ui` was started again: open the address it printed this time. |

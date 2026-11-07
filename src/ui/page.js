@@ -35,6 +35,8 @@ const state = {
   noting: new Map(), // finding id to the Not a bug note being typed
   sending: false, // a send is going
   drawn: "", // what the findings panel was last drawn from
+  schedules: null, // from `schedule --json`
+  editing: null, // the schedule form's values while it is open
 };
 
 // ---- Talking to the server ----
@@ -123,6 +125,20 @@ function when(rfc3339) {
   return time.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + clock;
 }
 
+/** A time to come as this PC shows it: "Today 01:00", "Tomorrow 01:00", "Sun, Nov 8 02:00". */
+function whenAhead(rfc3339) {
+  const time = new Date(rfc3339);
+  const clock = time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const day = new Date(time);
+  day.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Math.round((day - today) / 86400000);
+  if (days === 0) return "Today " + clock;
+  if (days === 1) return "Tomorrow " + clock;
+  return time.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " " + clock;
+}
+
 const WORDS = { pass: "Passed", fail: "Failed", skip: "Skipped", error: "Error", running: "Running", queued: "Queued" };
 
 function pill(kind, text) {
@@ -176,6 +192,7 @@ function render() {
   renderTests();
   renderRun();
   renderFindings();
+  renderSchedules();
   renderRuns();
 }
 
@@ -617,7 +634,8 @@ function renderRuns() {
     else if (run.state === "stopped") result = pill("skip", "Stopped · " + s.passed + " passed");
     else result = pill(s.failed || s.errors ? "fail" : "pass", s.passed + " of " + (s.passed + s.failed + s.errors));
     const preset = state.presets.find((p) => p.name === run.preset);
-    const name = preset ? preset.title : run.tests + (run.tests === 1 ? " test" : " tests");
+    let name = preset ? preset.title : run.tests + (run.tests === 1 ? " test" : " tests");
+    if (run.schedule) name = scheduleTitle(run.schedule) + " (scheduled)";
     return el("tr", { class: run.id === state.viewing ? "sel" : "", tabindex: "0", onclick: () => view(run.id), onkeydown: (e) => e.key === "Enter" && view(run.id) },
       el("td", {}, when(run.started)), el("td", {}, name), el("td", {}, run.machines.join(", ")),
       el("td", { class: "mono" }, run.build || ""), el("td", { class: "res" }, result), el("td", {}, runFindings(run)));
@@ -634,6 +652,191 @@ function runFindings(run) {
   else if (found.every((f) => f.state === "not-a-bug")) text += ", not bugs";
   else text += run.sent ? ", sent" : found.some(sendable) ? ", not sent" : "";
   return text;
+}
+
+// ---- Schedules ----
+
+const DAYS = [["mon", "Mon"], ["tue", "Tue"], ["wed", "Wed"], ["thu", "Thu"], ["fri", "Fri"], ["sat", "Sat"], ["sun", "Sun"]];
+
+/** What a schedule is called: its title, its preset's, or its name. */
+function scheduleTitle(name) {
+  const schedule = ((state.schedules && state.schedules.schedules) || []).find((s) => s.name === name);
+  if (!schedule) return name;
+  const preset = state.presets.find((p) => p.name === schedule.preset);
+  return schedule.title || (preset ? preset.title : schedule.name);
+}
+
+function renderSchedules() {
+  const listed = state.schedules;
+  if (!listed) return;
+  const schedules = listed.schedules || [];
+  byId("when-head").textContent = "When (" + (listed.zone_short || listed.zone) + ")";
+  byId("schedules-table").hidden = !schedules.length;
+  byId("no-schedules").hidden = schedules.length > 0 || !!state.editing;
+  byId("schedules").replaceChildren(...schedules.map((schedule) => {
+    let next;
+    if (schedule.going) next = pill("running", schedule.going.run ? "Running" : "Starting");
+    else if (schedule.paused) next = "Paused";
+    else if (schedule.each_build) next = "On the next build on main";
+    else next = schedule.next ? whenAhead(schedule.next) : "";
+    const title = el("td", {}, scheduleTitle(schedule.name));
+    const line = schedule.going ? schedule.going.doing : lastText(schedule.last);
+    if (line) title.append(el("span", { class: "why" }, line));
+    const edit = el("button", { class: "mini", type: "button", onclick: () => openForm(schedule) }, "Edit");
+    return el("tr", {}, title, el("td", {}, schedule.when), el("td", {}, schedule.machines.join(", ")),
+      el("td", {}, schedule.send ? "Send when done" : "Hold for me"), el("td", { class: "res" }, next), el("td", {}, edit));
+  }));
+  let note = "Scheduled runs always skip tests that need you. A scheduled run waits if a run is already going on that machine, and tests main as it is then, on the lab's own Dukovo checkout.";
+  if (listed.zone_problem) note += " Times cannot be worked out: " + listed.zone_problem;
+  if (!listed.timer) note += " The timer that starts schedules is not installed yet: ob lab installs it.";
+  byId("schedule-note").textContent = note;
+}
+
+/** How a schedule's last start went, in a few words. */
+function lastText(last) {
+  if (!last) return "";
+  const words = { passed: "passed", failed: "failed", broke: "the lab broke", stopped: "stopped", missed: "missed", error: "could not run" };
+  let text = "Last: " + when(last.started) + ", " + (words[last.result] || last.result);
+  const count = (last.findings || []).length;
+  if (count) text += ", " + count + (count === 1 ? " finding" : " findings") + (last.sent ? " sent" : " held");
+  if (last.note) text += " (" + last.note + ")";
+  return text;
+}
+
+/** Opens the schedule form, for a new schedule or to change one. */
+function openForm(schedule) {
+  notice("");
+  const firstPreset = state.presets[0];
+  let what;
+  if (schedule) what = schedule.preset ? "preset:" + schedule.preset : schedule.all ? "all" : "own";
+  else if (state.preset) what = "preset:" + state.preset;
+  else if (state.chosen.size) what = "picked";
+  else what = firstPreset ? "preset:" + firstPreset.name : "all";
+  state.editing = {
+    isNew: !schedule,
+    name: schedule ? schedule.name : "",
+    title: (schedule && schedule.title) || "",
+    what,
+    tests: schedule ? schedule.tests || [] : [],
+    machines: new Set(schedule ? schedule.machines : state.picked),
+    kind: schedule && schedule.each_build ? "build" : "time",
+    at: (schedule && schedule.at) || "01:00",
+    days: new Set(schedule && schedule.days && schedule.days.length ? schedule.days : DAYS.map(([d]) => d)),
+    send: schedule ? schedule.send : true,
+    paused: schedule ? !!schedule.paused : false,
+    removing: false,
+  };
+  drawForm();
+  renderSchedules();
+  byId("schedule-form").scrollIntoView({ block: "nearest" });
+}
+
+function closeForm() {
+  state.editing = null;
+  byId("schedule-form").hidden = true;
+  byId("schedule-form").replaceChildren();
+  renderSchedules();
+}
+
+/** Draws the form from state.editing. Polls never redraw it, so what is typed stays. */
+function drawForm() {
+  const f = state.editing;
+  const form = byId("schedule-form");
+  const row = (label, ...content) => el("div", { class: "row" }, el("span", {}, label), el("div", { class: "opts" }, ...content));
+  const radio = (name, value, checked, label, onpick) =>
+    el("label", {}, el("input", { type: "radio", name, value, checked, onchange: onpick }), label);
+  const box = (checked, label, onflip) => el("label", {}, el("input", { type: "checkbox", checked, onchange: onflip }), label);
+
+  const name = el("input", { type: "text", value: f.name, placeholder: "nightly", disabled: !f.isNew, "aria-label": "Schedule name",
+    oninput: (e) => (f.name = e.target.value.trim()) });
+  const title = el("input", { type: "text", value: f.title, placeholder: "Full run", maxlength: "80", "aria-label": "What to call it",
+    oninput: (e) => (f.title = e.target.value) });
+  const options = state.presets.map((p) => el("option", { value: "preset:" + p.name, selected: f.what === "preset:" + p.name }, p.title));
+  options.push(el("option", { value: "picked", selected: f.what === "picked" }, "The tests picked above (" + state.chosen.size + ")"));
+  options.push(el("option", { value: "all", selected: f.what === "all" }, "Every test"));
+  if (f.what === "own") options.push(el("option", { value: "own", selected: true }, "Its own tests (" + f.tests.length + ")"));
+  const what = el("select", { "aria-label": "What runs", onchange: (e) => (f.what = e.target.value) }, options);
+  const machines = state.machines.map((m) => box(f.machines.has(m.name), m.name, () => {
+    f.machines.has(m.name) ? f.machines.delete(m.name) : f.machines.add(m.name);
+  }));
+  const time = el("input", { type: "time", value: f.at, "aria-label": "Time", disabled: f.kind !== "time",
+    oninput: (e) => (f.at = e.target.value) });
+  const days = DAYS.map(([day, label]) => {
+    const input = el("input", { type: "checkbox", checked: f.days.has(day), disabled: f.kind !== "time",
+      onchange: () => (f.days.has(day) ? f.days.delete(day) : f.days.add(day)) });
+    return el("label", {}, input, label);
+  });
+  const pick = (kind) => () => {
+    f.kind = kind;
+    drawForm();
+  };
+  const zone = (state.schedules && (state.schedules.zone_short || state.schedules.zone)) || "";
+
+  const buttons = [el("button", { class: "btn primary", type: "submit" }, f.isNew ? "Make schedule" : "Save")];
+  buttons.push(el("button", { class: "btn", type: "button", onclick: closeForm }, "Cancel"));
+  const others = [];
+  if (!f.isNew) {
+    others.push(el("button", { class: "btn", type: "button", onclick: () => scheduleAction({ start: f.name }) }, "Run now"));
+    others.push(el("button", { class: "btn", type: "button", onclick: () => scheduleAction(f.paused ? { resume: f.name } : { pause: f.name }) }, f.paused ? "Resume" : "Pause"));
+    others.push(el("button", { class: "btn danger", type: "button", onclick: () => {
+      if (!f.removing) {
+        f.removing = true;
+        drawForm();
+        return;
+      }
+      scheduleAction({ remove: f.name });
+    } }, f.removing ? "Remove it for good" : "Remove"));
+  }
+
+  form.replaceChildren(
+    el("h3", {}, f.isNew ? "New schedule" : "Change " + f.name),
+    row("Name", name),
+    row("Call it", title),
+    row("Runs", what),
+    row("On", ...machines),
+    row("When", radio("kind", "time", f.kind === "time", "At", pick("time")), time, el("span", { class: "note" }, zone)),
+    row("", ...days),
+    row("", radio("kind", "build", f.kind === "build", "On each new build on main", pick("build"))),
+    row("Findings", radio("send", "send", f.send, "Send when done", () => (f.send = true)),
+      radio("send", "hold", !f.send, "Hold for me", () => (f.send = false))),
+    el("div", { class: "acts" }, el("div", {}, ...buttons), el("div", {}, ...others)),
+  );
+  form.onsubmit = (event) => {
+    event.preventDefault();
+    saveSchedule();
+  };
+  form.hidden = false;
+}
+
+/** Saves the form as a schedule. */
+async function saveSchedule() {
+  notice("");
+  const f = state.editing;
+  const save = { name: f.name, title: f.title, machines: [...f.machines], send: f.send };
+  if (f.what.startsWith("preset:")) save.preset = f.what.slice(7);
+  else if (f.what === "all") save.all = true;
+  else save.tests = f.what === "own" ? f.tests : [...state.chosen];
+  if (f.kind === "build") save.each_build = true;
+  else {
+    save.at = f.at;
+    // Every day is said by naming none.
+    save.days = f.days.size === DAYS.length ? [] : DAYS.map(([d]) => d).filter((d) => f.days.has(d));
+    if (!save.days.length && f.days.size === 0) return notice("Pick the days it runs on.");
+  }
+  const answer = await act("/api/schedules", { save });
+  if (answer.error) return;
+  closeForm();
+  await refresh();
+}
+
+/** Starts, pauses, resumes or removes a schedule. */
+async function scheduleAction(body) {
+  notice("");
+  const answer = await act("/api/schedules", body);
+  if (answer.error) return;
+  closeForm();
+  if (body.start) notice("Schedule " + body.start + " started. It shows under This run once its image is built.");
+  await refresh();
 }
 
 // ---- Acting ----
@@ -703,6 +906,7 @@ async function refreshRun() {
 
 async function refresh() {
   state.runs = (await read("/api/runs")).runs || [];
+  state.schedules = await read("/api/schedules");
   // Findings change when a run ends or something is sent or marked.
   const findingsFor = state.runs.map((r) => r.id + r.state + r.sent).join();
   if (findingsFor !== state.findingsFor) {
@@ -742,6 +946,7 @@ async function start() {
   byId("run-picked").addEventListener("click", () => startRun(null, null));
   byId("send-run").addEventListener("click", () => sendNow({ run: state.results.run.id }));
   byId("send-all").addEventListener("click", () => sendNow({ all: true }));
+  byId("new-schedule").addEventListener("click", () => openForm(null));
   byId("stop").addEventListener("click", async () => {
     byId("stop").disabled = true;
     byId("stop").textContent = "Stopping…";

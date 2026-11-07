@@ -18,15 +18,16 @@ tests that match the build.
 
 **Status:** in progress (item 14f of Dukovo's roadmap). `dukovo-lab`
 runs tests on QEMU machines, writes results bundles, groups failures
-into findings, sends them to the private results repository, and serves
-the runner page; schedules and real machines come in the next pull
-requests.
+into findings, sends them to the private results repository, runs
+schedules on a systemd timer, and serves the runner page; real machines
+come in the next pull requests.
 
 ## Getting started
 
 In a Dukovo checkout, one command sets the lab up and opens the runner
 page: it installs or updates `dukovo-lab`, makes the lab key, clones
-lab-results for Send, builds the lab image and opens the page.
+lab-results for Send, puts the schedules' timer in place, builds the lab
+image and opens the page.
 
 ```sh
 ./ob lab
@@ -57,6 +58,8 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
   results bundles, and troubleshooting
 - [Sending findings](docs/sending.md): the lab-results repository, and
   what goes there
+- [Schedules](docs/schedules.md): tests that run by themselves, at a time
+  or on each new build on main
 - [Test files](docs/test-files.md): writing a lab test
 - [Machine files](docs/machine-files.md): adding a machine
 - [Driving the lab from an agent](docs/agents.md)

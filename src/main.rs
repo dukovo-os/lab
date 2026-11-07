@@ -21,6 +21,7 @@ mod machines;
 mod output;
 mod qmp;
 mod run;
+mod schedule;
 mod send;
 mod ssh;
 mod status;
@@ -29,6 +30,7 @@ mod store;
 mod suite;
 mod ui;
 mod units;
+mod zone;
 
 #[cfg(test)]
 mod testing;
@@ -70,6 +72,16 @@ Commands:
   send <finding>... | --all | --run <run>
                    Sends findings, and the runs they failed in, to the
                    lab-results repository, where they are worked on
+  schedule         The schedules: when each runs next and how it went last
+  schedule save <name> <test or category>... | --all | --preset <name>
+                   (--at <HH:MM> [--days <mon,...>] | --each-build)
+                   Makes a schedule, or changes it: tests that run by
+                   themselves at a time (in Mountain Time) or on each new
+                   build on main, on the lab's own Dukovo checkout
+  schedule remove | pause | resume | start <name>
+                   Removes, pauses or resumes a schedule, or starts it now
+  schedule install Puts in place the systemd timer that starts schedules
+  schedule tick    What the timer runs each minute: starts those due
   ui               Serves the runner page on this PC, for a browser here
   key              Makes the lab key, once, and prints its public key's path
   help             This text
@@ -107,6 +119,15 @@ Options for other commands:
   --results <dir>  send: the lab-results clone (default: lab-results in
                    the store)
 
+Options for schedule save (and --machine, --preset, --all as for run):
+  --at <HH:MM>     The time it runs, 24-hour, in the lab's zone
+  --days <a,b>     The days it runs on, such as sun or mon,wed,fri
+                   (default: every day)
+  --each-build     Runs on each new commit on Dukovo's main instead
+  --send           Sends its findings to lab-results when it ends (default)
+  --hold           Holds its findings for a person to send from the page
+  --title <text>   What to call it, such as \"Full run\"
+
 Exit status:
   0  every test that ran passed (tests may be skipped)
   1  a test failed
@@ -114,7 +135,8 @@ Exit status:
   3  the harness or a machine broke, so some results say nothing about Dukovo
   4  a machine the run needs is busy with another run; nothing ran
 status and results exit as the run did (0, 1 or 3; 3 for a run that died),
-or 0 while it is going.
+or 0 while it is going. schedule start exits 4 when that schedule is
+already going.
 ";
 
 /// Why a command did not finish.
@@ -158,6 +180,15 @@ struct Arguments {
     note: Option<String>,
     not_a_bug: bool,
     reopen: bool,
+    /// schedule save: when, which days, or each build; send or hold.
+    at: Option<String>,
+    days: Option<String>,
+    each_build: bool,
+    send: bool,
+    hold: bool,
+    title: Option<String>,
+    /// run: the schedule that started it.
+    schedule: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -208,6 +239,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--run" => arguments.run = Some(value("--run")?),
             "--results" => arguments.results = Some(value("--results")?.into()),
             "--note" => arguments.note = Some(value("--note")?),
+            "--at" => arguments.at = Some(value("--at")?),
+            "--days" => arguments.days = Some(value("--days")?),
+            "--title" => arguments.title = Some(value("--title")?),
+            "--schedule" => arguments.schedule = Some(value("--schedule")?),
+            "--each-build" => arguments.each_build = true,
+            "--send" => arguments.send = true,
+            "--hold" => arguments.hold = true,
             "--not-a-bug" => arguments.not_a_bug = true,
             "--reopen" => arguments.reopen = true,
             "--all" => arguments.all = true,
@@ -256,6 +294,7 @@ fn dispatch(arguments: &Arguments) -> Result<u8, Error> {
         Some("runs") => list_runs(arguments),
         Some("findings") => show_findings(arguments),
         Some("send") => send_findings(arguments),
+        Some("schedule") => schedule::command(arguments),
         Some("ui") => ui::serve(arguments),
         Some("key") => make_key(arguments),
         Some(other) => Err(Error::Usage(format!("no command \"{other}\"; see `dukovo-lab help`"))),
@@ -531,6 +570,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         key,
         with_person: arguments.with_person,
         preset: arguments.preset.clone(),
+        schedule: arguments.schedule.clone(),
         id: arguments.run_id.clone(),
     };
     let reporter = output::Reporter::new(arguments.json);

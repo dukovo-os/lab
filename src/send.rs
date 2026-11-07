@@ -234,7 +234,7 @@ fn commit_message(runs: &[String], findings: &[Finding]) -> String {
 }
 
 /// Runs git in `dir`; answers what it printed, or why it failed.
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -391,6 +391,7 @@ mod tests {
             machines: Vec::new(),
             tests: vec!["drivers/link-pull".into()],
             preset: None,
+            schedule: None,
             summary: None,
             stopped: false,
         };

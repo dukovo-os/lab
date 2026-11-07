@@ -57,10 +57,17 @@ wrong build.
   never sent. Under the list, **Send** sends every new finding of the
   run, and **Send all new** those of other runs too. Send needs a
   lab-results clone ([Sending findings](sending.md)); `ob lab` makes it.
+- **Schedules.** Each schedule: what it runs, when (in Mountain Time),
+  on which machines, whether it sends its findings or holds them, and
+  when it runs next; under its name, what its start is doing now or how
+  its last one went. **New schedule** opens a form under the list: a
+  name, what to call it, what it runs (a preset, the tests picked above,
+  or every test), the machines, a time and days or each new build on
+  main, and Send when done or Hold for me. **Edit** opens the same form
+  for a schedule, with **Run now**, **Pause** or **Resume**, and
+  **Remove** (pressed twice). See [Schedules](schedules.md).
 - **Past runs.** Every run, newest first, with its findings and whether
-  they were sent. Click one to show it above.
-
-Schedules come in a later update of the lab.
+  they were sent; a scheduled run says so. Click one to show it above.
 
 ## The same as the commands
 
@@ -81,6 +88,9 @@ started with `dukovo-lab run` shows on the page too.
 | Send this finding | `send <finding>` |
 | Send, Send all new | `send --run <run>`, `send --all` |
 | Not a bug, Reopen | `findings <finding> --not-a-bug [--note <text>]`, `findings <finding> --reopen` |
+| Schedules | `schedule` |
+| Make schedule, Save | `schedule save <name> ...` |
+| Run now, Pause, Resume, Remove | `schedule start`, `pause`, `resume`, `remove <name>` |
 | Past runs | `runs` |
 | Tests, Machines | `list`, `machines` |
 

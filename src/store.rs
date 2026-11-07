@@ -70,7 +70,7 @@ pub fn open_output_log(store: &Path, id: &str) -> Result<File, Error> {
 }
 
 /// Whether some process holds the lock file at `path`.
-fn held(path: &Path) -> bool {
+pub fn held(path: &Path) -> bool {
     let Ok(file) = File::open(path) else { return false };
     matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
 }
@@ -82,7 +82,7 @@ const LOCK_TRIES: u32 = 20;
 const LOCK_PAUSE: Duration = Duration::from_millis(5);
 
 /// Opens `path` and takes its lock; `Ok(None)` when another process has it.
-fn take_lock(path: &Path) -> Result<Option<File>, Error> {
+pub fn take_lock(path: &Path) -> Result<Option<File>, Error> {
     if let Some(folder) = path.parent() {
         fs::create_dir_all(folder)
             .map_err(|err| Error::Harness(format!("making {}: {err}", folder.display())))?;

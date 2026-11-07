@@ -71,6 +71,9 @@ impl Setting {
         command
             .env("PATH", path)
             .env("XDG_RUNTIME_DIR", self.dir.join("runtime"))
+            // Never this machine's own systemd: a schedule's start runs
+            // as a plain process here.
+            .env_remove("INVOCATION_ID")
             .arg("--tests")
             .arg(self.dir.join("tests"))
             .arg("--config")
@@ -352,4 +355,143 @@ fn findings_are_marked_and_sent_as_an_agent_would() {
     let (code, again) = setting.run(&["send", "--all", "--results", results_dir]);
     assert_eq!(code, Some(0), "{again}");
     assert!(again["findings"].as_array().unwrap().is_empty());
+}
+
+/// Waits for schedule `name`'s start to end, and answers how it went.
+fn last_of(setting: &Setting, name: &str) -> Value {
+    for _ in 0..300 {
+        let (_, listed) = setting.run(&["schedule"]);
+        let schedule = listed["schedules"]
+            .as_array()
+            .and_then(|all| all.iter().find(|schedule| schedule["name"] == name))
+            .cloned()
+            .unwrap_or(Value::Null);
+        if schedule["going"].is_null() && !schedule["last"].is_null() {
+            return schedule["last"].clone();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("schedule {name} did not end");
+}
+
+#[test]
+fn a_schedule_tests_main_on_the_lab_s_own_checkout() {
+    let setting = Setting::new("schedule");
+    // Dukovo's main, as a local repository: its own tests, an image, and
+    // a pretend `ob` that runs `ob lab` as the real one does, on them.
+    let source = setting.dir.join("source");
+    for (relative, from) in [
+        ("lab/tests/boot/ready.toml", "tests/boot/ready.toml"),
+        ("lab/tests/presets.toml", "tests/presets.toml"),
+    ] {
+        fs::create_dir_all(source.join(relative).parent().unwrap()).unwrap();
+        fs::copy(setting.dir.join(from), source.join(relative)).unwrap();
+    }
+    fs::write(source.join("image.img"), "").unwrap();
+    let ob = source.join("ob");
+    fs::write(
+        &ob,
+        "#!/bin/sh\n\
+         root=$(cd \"$(dirname \"$0\")\" && pwd)\n\
+         [ \"$1\" = lab ] || exit 2\n\
+         shift\n\
+         echo 'pretend ob: building the lab image'\n\
+         exec \"$OB_LAB\" --tests \"$root/lab/tests\" \"$@\" --image \"$root/image.img\" \\\n\
+             --build \"test $(git -C \"$root\" rev-parse --short HEAD)\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ob, fs::Permissions::from_mode(0o755)).unwrap();
+    git(&setting.dir, &["init", "-q", "-b", "main", source.to_str().unwrap()]);
+    let commit = |message: &str| {
+        git(&source, &["add", "-A"]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.name=Lab",
+                "-c",
+                "user.email=lab@example.org",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                message,
+            ],
+        );
+        git(&source, &["rev-parse", "HEAD"]).trim().to_string()
+    };
+    let first = commit("First");
+    fs::write(
+        setting.dir.join("config/schedules.json"),
+        format!("{{\"source\": \"{}\"}}\n", source.display()),
+    )
+    .unwrap();
+
+    // Made with a command, as the page makes it.
+    let (code, saved) = setting.run(&[
+        "schedule",
+        "save",
+        "quick",
+        "--preset",
+        "quick",
+        "--each-build",
+        "--title",
+        "Quick check",
+    ]);
+    assert_eq!(code, Some(0), "{saved}");
+    assert_eq!(saved["new"], true);
+    let (_, listed) = setting.run(&["schedule"]);
+    assert_eq!(listed["schedules"][0]["when"], "Each new build on main");
+    assert_eq!(listed["schedules"][0]["send"], true);
+    // Bad ones are refused, and change nothing.
+    for bad in [
+        vec!["schedule", "save", "Quick", "--preset", "quick", "--each-build"],
+        vec!["schedule", "save", "x", "--preset", "quick"],
+        vec!["schedule", "save", "x", "--preset", "nope", "--each-build"],
+        vec!["schedule", "save", "x", "boot", "--each-build", "--machine", "nowhere"],
+        vec!["schedule", "save", "x", "boot", "--at", "1am"],
+    ] {
+        assert_eq!(setting.run(&bad).0, Some(2), "{bad:?}");
+    }
+    assert_eq!(setting.run(&["schedule"]).1["schedules"].as_array().unwrap().len(), 1);
+
+    // Started by hand: it clones main, builds and runs there. The boot
+    // breaks (no QEMU here), so the run broke.
+    let (code, started) = setting.run(&["schedule", "start", "quick"]);
+    assert_eq!(code, Some(0), "{started}");
+    let last = last_of(&setting, "quick");
+    assert_eq!(last["result"], "broke", "{last}");
+    assert_eq!(last["commit"], first.as_str());
+    let run = last["run"].as_str().unwrap().to_string();
+    let (_, runs) = setting.run(&["runs"]);
+    assert_eq!(runs["runs"][0]["id"], run.as_str());
+    assert_eq!(runs["runs"][0]["schedule"], "quick");
+    assert_eq!(runs["runs"][0]["build"], format!("test {}", &first[..7]));
+    let log = fs::read_to_string(setting.dir.join("store/schedules/quick.log")).unwrap();
+    assert!(log.contains("pretend ob: building the lab image"), "{log}");
+
+    // The timer's tick: the first look at main only notes where it is...
+    let (code, ticked) = setting.run(&["schedule", "tick"]);
+    assert_eq!(code, Some(0), "{ticked}");
+    assert_eq!(ticked["started"], serde_json::json!([]));
+    // ...and a new commit on main starts it (the look's five minutes are
+    // let pass by forgetting when it looked).
+    let second = commit("Second");
+    let state_file = setting.dir.join("store/schedules/quick.json");
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(state["commit"], first.as_str());
+    state["looked"] = Value::Null;
+    fs::write(&state_file, state.to_string()).unwrap();
+    let (_, ticked) = setting.run(&["schedule", "tick"]);
+    assert_eq!(ticked["started"], serde_json::json!(["quick"]), "{ticked}");
+    let last = last_of(&setting, "quick");
+    assert_eq!(last["commit"], second.as_str(), "{last}");
+    assert_ne!(last["run"], run.as_str());
+
+    // Paused, it says so and the tick leaves it; then it goes.
+    assert_eq!(setting.run(&["schedule", "pause", "quick"]).0, Some(0));
+    assert_eq!(setting.run(&["schedule"]).1["schedules"][0]["when"], "Paused");
+    assert_eq!(setting.run(&["schedule", "remove", "quick"]).0, Some(0));
+    assert!(setting.run(&["schedule"]).1["schedules"].as_array().unwrap().is_empty());
+    assert_eq!(setting.run(&["schedule", "start", "quick"]).0, Some(2));
 }

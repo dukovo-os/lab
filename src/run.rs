@@ -64,6 +64,8 @@ pub struct Request<'a> {
     pub with_person: bool,
     /// The preset the tests came from, for run.json.
     pub preset: Option<String>,
+    /// The schedule that started the run, for run.json.
+    pub schedule: Option<String>,
     /// The run's id, when the caller chose it (a detached run's parent
     /// does, to name the run before it starts); else a new one.
     pub id: Option<String>,
@@ -118,6 +120,7 @@ pub fn run(
             .collect(),
         tests: request.tests.iter().map(|test| test.id.clone()).collect(),
         preset: request.preset.clone(),
+        schedule: request.schedule.clone(),
         summary: None,
         stopped: false,
     };

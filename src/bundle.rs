@@ -51,6 +51,9 @@ pub struct RunRecord {
     /// The preset the tests came from, if they did.
     #[serde(default)]
     pub preset: Option<String>,
+    /// The schedule that started it, if one did (see schedule.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
     /// Counts of results, once the run has ended.
     pub summary: Option<Summary>,
     /// Whether `dukovo-lab stop` cut the run short; the tests it did not
@@ -233,6 +236,7 @@ mod tests {
             machines: vec![],
             tests: vec!["boot/reaches-ready".into()],
             preset: None,
+            schedule: None,
             summary: None,
             stopped: false,
         };
