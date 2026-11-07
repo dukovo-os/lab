@@ -48,11 +48,14 @@ pub enum Control {
     /// Booting Linux on the machine, or on one set up the same way, to
     /// measure what performance tests hold Dukovo to.
     Linux,
+    /// Running an attacker on a private lab network of the machine's own,
+    /// to probe it from the outside.
+    Attack,
 }
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 10] = [
+    pub const ALL: [Control; 11] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -63,6 +66,7 @@ impl Control {
         Control::Screen,
         Control::Ssh,
         Control::Linux,
+        Control::Attack,
     ];
 
     /// Its name in machine files and output.
@@ -78,6 +82,7 @@ impl Control {
             Control::Screen => "screen",
             Control::Ssh => "ssh",
             Control::Linux => "linux",
+            Control::Attack => "attack",
         }
     }
 }
@@ -313,6 +318,13 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
                 "linux is \"driver\" or \"none\": a person cannot measure Linux".into()
             ));
         }
+        // An attack is the attacker machine's to run, not a person's, so
+        // it is the driver's or no one's, as the Linux twin is.
+        if control == Control::Attack && who == Who::Person {
+            return Err(bad(
+                "attack is \"driver\" or \"none\": a person does not run the attacker".into(),
+            ));
+        }
         controls.insert(control, who);
     }
     let qemu = match file.driver {
@@ -430,6 +442,11 @@ mod tests {
                 "e.toml",
                 "about = \"x\"\ndriver = \"qemu\"\n[controls]\nlinux = \"person\"\n",
                 "a person cannot measure Linux",
+            ),
+            (
+                "f.toml",
+                "about = \"x\"\ndriver = \"qemu\"\n[controls]\nattack = \"person\"\n",
+                "a person does not run the attacker",
             ),
         ] {
             let dir = TempDir::new("machines-bad");

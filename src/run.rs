@@ -38,7 +38,7 @@ use crate::bundle::{
     new_run_id,
 };
 use crate::clock::Utc;
-use crate::driver::{Driver, Setup};
+use crate::driver::{ATTACKER_ON_SEGMENT, Driver, Setup, TARGET_ON_SEGMENT};
 use crate::findings;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
@@ -46,7 +46,9 @@ use crate::screen::{self, Font};
 use crate::ssh;
 use crate::stop::Stop;
 use crate::store::Running;
-use crate::suite::{Bench, Boot, Command, Fit, PASSWORD_TOKEN, PowerAction, Step, Test};
+use crate::suite::{
+    Bench, Boot, Command, Fit, PASSWORD_TOKEN, PowerAction, Step, TARGET_TOKEN, Test,
+};
 use crate::units::format_duration;
 
 /// What a stopped test's result says.
@@ -66,6 +68,36 @@ pub const NO_STICK: &str = "this test boots the install stick, and the run was g
 
 /// Why a `bench` step's numbers are kept but not held to Linux's.
 pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers (no KVM), so they are kept but not held to Linux's";
+
+/// Holds `output` of a `run` or `attack` command to what the command asked:
+/// its exit status, and the text its output must and must not hold. `shown`
+/// is how a log shows the command and what it printed, for a failure
+/// message. Returns `shown` on success, so the step's log line is the run.
+fn check_command(
+    command: &Command,
+    output: &ssh::Output,
+    shown: String,
+) -> Result<Option<String>, StepFailure> {
+    let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
+    match output.status {
+        None => return fail("it was still running at the test's time limit".into()),
+        Some(255) if command.exit != 255 => {
+            return fail("SSH could not run it (exit status 255); SSH's message is below".into());
+        }
+        Some(status) if status != command.exit => {
+            return fail(format!("it exited with status {status}, not {}", command.exit));
+        }
+        Some(_) => {}
+    }
+    if let Some(missing) = command.expect.iter().find(|text| !output.text.contains(text.as_str())) {
+        return fail(format!("its output lacks \"{missing}\""));
+    }
+    if let Some(found) = command.expect_not.iter().find(|text| output.text.contains(text.as_str()))
+    {
+        return fail(format!("its output holds \"{found}\""));
+    }
+    Ok(Some(shown))
+}
 
 /// What to run.
 pub struct Request<'a> {
@@ -398,6 +430,9 @@ struct Worker<'a> {
     linux: Option<BTreeMap<String, f64>>,
     /// Where the screen is saved to read its text, in the work folder.
     screen_file: PathBuf,
+    /// Whether this boot's attacker is up and both sides have their
+    /// addresses on the private network; set up on the first attack step.
+    attacker_ready: bool,
 }
 
 impl<'a> Worker<'a> {
@@ -420,6 +455,7 @@ impl<'a> Worker<'a> {
             screenshots: Vec::new(),
             linux: None,
             screen_file,
+            attacker_ready: false,
         }
     }
 
@@ -434,6 +470,13 @@ impl<'a> Worker<'a> {
         self.screenshots = Vec::new();
         let mut steps = Vec::new();
 
+        // A test that attacks the machine wants its private network port,
+        // which only an armed boot has; one that does not must not have it
+        // (an idle port would show up in a network test), so tell the
+        // driver which kind of boot to give before it boots.
+        let attacks = test.controls().contains(&Control::Attack);
+        self.driver.want_attacker(attacks);
+
         let mut failure = None;
         if let Boot::Stick { disk } = test.boot {
             let (record, outcome) =
@@ -442,7 +485,7 @@ impl<'a> Worker<'a> {
                 });
             steps.push(record);
             failure = outcome.err();
-        } else if test.fresh || !self.reusable || !self.driver.is_on() {
+        } else if test.fresh || attacks || !self.reusable || !self.driver.is_on() {
             let (record, outcome) =
                 self.timed(test, "boot afresh and wait until booted", |worker| {
                     worker.boot_fresh(deadline)
@@ -487,8 +530,11 @@ impl<'a> Worker<'a> {
             self.screenshot_after_failure(test);
         }
         // After the installer, the disk no longer holds the image under
-        // test, so the next test boots afresh.
-        self.reusable = result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image;
+        // test, so the next test boots afresh. An attack boot has the
+        // private network port a later test must not find, so it is not
+        // shared either.
+        self.reusable =
+            result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !attacks;
         let log = self.write_log(test, result, reason.as_deref());
         let milliseconds = started.elapsed().as_millis() as u64;
         let boot = (self.boot > 0).then_some(self.boot);
@@ -578,6 +624,9 @@ impl<'a> Worker<'a> {
     fn boot_fresh(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
         self.driver.boot_fresh().map_err(StepFailure::Error)?;
         self.boot += 1;
+        // A new boot starts with no attacker and no addresses on the
+        // private network; the first attack step sets them up again.
+        self.attacker_ready = false;
         self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
         self.log.push(format!("Boot {}: serial log {}", self.boot, self.relative_serial()));
         let note = self.wait_ready(deadline)?;
@@ -595,6 +644,7 @@ impl<'a> Worker<'a> {
         };
         self.driver.boot_stick(stick, disk).map_err(StepFailure::Error)?;
         self.boot += 1;
+        self.attacker_ready = false;
         self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
         self.log.push(format!(
             "Boot {}: from the install stick; serial log {}",
@@ -653,6 +703,7 @@ impl<'a> Worker<'a> {
         }
         match step {
             Step::Run(command) => self.run_command(command, deadline),
+            Step::Attack(command) => self.run_attack(command, deadline),
             Step::Bench(bench) => self.bench(bench, deadline),
             Step::Serial(text) => self.wait_serial(text, deadline),
             Step::Power(action) => self.power(*action, deadline),
@@ -740,30 +791,68 @@ impl<'a> Worker<'a> {
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
         let (output, shown) = self.execute(&command.command, command.root, deadline)?;
-        let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
-        match output.status {
-            None => return fail("it was still running at the test's time limit".into()),
-            Some(255) if command.exit != 255 => {
-                return fail(
-                    "SSH could not run it (exit status 255); SSH's message is below".into(),
-                );
-            }
-            Some(status) if status != command.exit => {
-                return fail(format!("it exited with status {status}, not {}", command.exit));
-            }
-            Some(_) => {}
+        check_command(command, &output, shown)
+    }
+
+    /// Runs an `attack` step on the attacker, bringing the attacker up and
+    /// giving both machines their private-network addresses the first time
+    /// this boot. The step's `{target}` names the machine under test on
+    /// that network, so a test need not know the address.
+    fn run_attack(
+        &mut self,
+        command: &Command,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        self.ready_attacker(deadline)?;
+        // `{target}` is the machine under test's address on the private
+        // network, in the command and in the text its output must hold.
+        let resolved = Command {
+            command: command.command.replace(TARGET_TOKEN, TARGET_ON_SEGMENT),
+            exit: command.exit,
+            expect: command
+                .expect
+                .iter()
+                .map(|text| text.replace(TARGET_TOKEN, TARGET_ON_SEGMENT))
+                .collect(),
+            expect_not: command
+                .expect_not
+                .iter()
+                .map(|text| text.replace(TARGET_TOKEN, TARGET_ON_SEGMENT))
+                .collect(),
+            root: command.root,
+        };
+        let (output, shown) = self.execute_attack(&resolved.command, resolved.root, deadline)?;
+        check_command(&resolved, &output, shown)
+    }
+
+    /// Brings the attacker up and gives it and the machine under test their
+    /// addresses on the private network, once per boot. Later attack steps
+    /// in the same boot find it ready and return at once.
+    fn ready_attacker(&mut self, deadline: Instant) -> Result<(), StepFailure> {
+        if self.attacker_ready {
+            return Ok(());
         }
-        if let Some(missing) =
-            command.expect.iter().find(|text| !output.text.contains(text.as_str()))
-        {
-            return fail(format!("its output lacks \"{missing}\""));
+        self.driver.start_attacker(deadline).map_err(StepFailure::Error)?;
+        // Neither machine can reach the other until each has an address on
+        // net1, the port on their private network.
+        let target_up =
+            format!("ip address add {TARGET_ON_SEGMENT}/24 dev net1 && ip link set net1 up");
+        let (output, shown) = self.execute(&target_up, true, deadline)?;
+        if output.status != Some(0) {
+            return Err(StepFailure::Error(format!(
+                "could not give the machine its address on the private network\n{shown}"
+            )));
         }
-        if let Some(found) =
-            command.expect_not.iter().find(|text| output.text.contains(text.as_str()))
-        {
-            return fail(format!("its output holds \"{found}\""));
+        let attacker_up =
+            format!("ip address add {ATTACKER_ON_SEGMENT}/24 dev net1 && ip link set net1 up");
+        let (output, shown) = self.execute_attack(&attacker_up, true, deadline)?;
+        if output.status != Some(0) {
+            return Err(StepFailure::Error(format!(
+                "could not give the attacker its address on the private network\n{shown}"
+            )));
         }
-        Ok(Some(shown))
+        self.attacker_ready = true;
+        Ok(())
     }
 
     /// Runs `command` on the machine, as root through elevate when `root`,
@@ -782,21 +871,58 @@ impl<'a> Worker<'a> {
                 "the machine was off, so `{command}` could not run"
             )));
         }
-        // As root: `elevate -S` reads the lab's password from the
-        // command's input, so it is never on a command line, and it is
-        // taken out of whatever comes back.
-        let (line, input, prompt) = if root {
-            let Some(password) = self.shared.password else {
-                return Err(StepFailure::Error(NO_PASSWORD.into()));
-            };
-            (format!("elevate -S {command}"), Some(format!("{password}\n")), "#")
-        } else {
-            (command.to_string(), None, "$")
-        };
-        let mut output = self
+        let (line, input, prompt) = self.as_root(command, root)?;
+        let output = self
             .driver
             .run_command(&line, input.as_deref(), deadline)
             .map_err(StepFailure::Error)?;
+        self.finish(command, output, prompt)
+    }
+
+    /// Runs `command` on the attacker, as root through elevate when `root`,
+    /// like [`Worker::execute`] but on the attacker rather than the machine
+    /// under test.
+    fn execute_attack(
+        &mut self,
+        command: &str,
+        root: bool,
+        deadline: Instant,
+    ) -> Result<(ssh::Output, String), StepFailure> {
+        let (line, input, prompt) = self.as_root(command, root)?;
+        let output =
+            self.driver.attack(&line, input.as_deref(), deadline).map_err(StepFailure::Error)?;
+        self.finish(command, output, prompt)
+    }
+
+    /// Wraps `command` to run as root when `root`: `elevate -S` reads the
+    /// lab's password from the command's input, so it is never on a command
+    /// line. Gives back the line to run, its input, and the prompt a log
+    /// shows it under (`#` as root, `$` otherwise).
+    fn as_root(
+        &self,
+        command: &str,
+        root: bool,
+    ) -> Result<(String, Option<String>, &'static str), StepFailure> {
+        if root {
+            let Some(password) = self.shared.password else {
+                return Err(StepFailure::Error(NO_PASSWORD.into()));
+            };
+            Ok((format!("elevate -S {command}"), Some(format!("{password}\n")), "#"))
+        } else {
+            Ok((command.to_string(), None, "$"))
+        }
+    }
+
+    /// Takes the password out of `output`, turns a stop into a skip, and
+    /// gives back the output with how a log shows the run.
+    fn finish(
+        &self,
+        command: &str,
+        mut output: ssh::Output,
+        prompt: &str,
+    ) -> Result<(ssh::Output, String), StepFailure> {
+        // The password is taken out of whatever comes back, so a log never
+        // shows it.
         if let Some(password) = self.shared.password {
             output.text = output.text.replace(password, "********");
         }

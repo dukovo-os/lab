@@ -42,6 +42,14 @@ const QEMU: &str = "qemu-system-x86_64";
 /// The network device's id, which `set_link` names.
 const NETDEV: &str = "lab0";
 
+/// The private-network device's id on the machine under test and on the
+/// attacker, joining the two over a QEMU socket link.
+const SEGMENT: &str = "seg0";
+
+/// Fixed MAC addresses on the private network, so each side is told apart.
+const TARGET_MAC: &str = "52:54:00:4c:a1:01";
+const ATTACKER_MAC: &str = "52:54:00:4c:a1:02";
+
 /// The most of where QEMU's pointing devices point, on each axis
 /// (INPUT_EVENT_ABS_MAX): the screen's right and bottom edges.
 const ABS_MAX: usize = 0x7fff;
@@ -84,6 +92,20 @@ pub struct Qemu {
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
     boot_stick: Option<(u32, PathBuf)>,
+    /// Whether the next fresh boot gives the machine a second network port
+    /// on a private network for an attacker, set by [`Driver::want_attacker`].
+    want_attacker: bool,
+    /// The port the machine's private-network port listens on this boot,
+    /// which the attacker connects to; set only on an armed boot.
+    segment_port: u16,
+    /// The attacker machine while it is running, with its SSH port.
+    attacker: Option<Attacker>,
+}
+
+/// The attacker machine: a second QEMU on the private network.
+struct Attacker {
+    running: Running,
+    ssh_port: u16,
 }
 
 /// A running QEMU and its QMP connection.
@@ -131,6 +153,9 @@ impl Qemu {
             sticks: 0,
             stick: None,
             boot_stick: None,
+            want_attacker: false,
+            segment_port: 0,
+            attacker: None,
         })
     }
 
@@ -232,6 +257,17 @@ impl Qemu {
         args.push(format!("user,id={NETDEV},hostfwd=tcp:127.0.0.1:{}-:22", self.ssh_port));
         args.push("-device".into());
         args.push(format!("{},netdev={NETDEV}", settings.nic));
+        // A second port on a private network of its own (net1), for an
+        // attacker to reach the machine on, when a test attacks. It
+        // listens; the attacker connects to it when it comes up. It is
+        // added only on an armed boot, so an idle one never shows up in a
+        // network test.
+        if self.want_attacker {
+            args.push("-netdev".into());
+            args.push(format!("socket,id={SEGMENT},listen=127.0.0.1:{}", self.segment_port));
+            args.push("-device".into());
+            args.push(format!("{},netdev={SEGMENT},mac={TARGET_MAC}", settings.nic));
+        }
         // USB sticks are plugged into this controller.
         args.push("-device".into());
         args.push("qemu-xhci,id=xhci".into());
@@ -421,7 +457,102 @@ impl Qemu {
         File::create(&self.serial)
             .map_err(|err| format!("making {}: {err}", self.serial.display()))?;
         self.ssh_port = free_port()?;
+        // The attacker is of the last boot; a new boot gets its own.
+        self.stop_attacker();
+        // An armed boot opens the private network's port for the attacker
+        // to connect to; the port is picked now so it is on the command line.
+        self.segment_port = if self.want_attacker { free_port()? } else { 0 };
         Ok(())
+    }
+
+    /// The attacker's disk overlay, serial log and QMP socket.
+    fn attacker_disk(&self) -> PathBuf {
+        self.setup.work.join(format!("attacker-disk-{}.qcow2", self.boot))
+    }
+
+    fn attacker_serial(&self) -> PathBuf {
+        self.setup.logs.join(format!("attacker-serial-{}.log", self.boot))
+    }
+
+    fn attacker_qmp_socket(&self) -> PathBuf {
+        self.setup.sockets.join("attacker-qmp.sock")
+    }
+
+    /// The attacker's QEMU arguments: like the machine under test, but
+    /// with no firmware, pointer or stick of its own, its own forwarded
+    /// SSH port, and its private-network port connecting to the machine's.
+    fn attacker_arguments(&self, ssh_port: u16) -> Vec<String> {
+        let (accel, cpu) = if self.kvm { ("kvm", "host") } else { ("tcg", "max") };
+        vec![
+            "-M".into(),
+            "q35".into(),
+            "-accel".into(),
+            accel.into(),
+            "-cpu".into(),
+            cpu.into(),
+            "-smp".into(),
+            self.settings.cpus.to_string(),
+            "-m".into(),
+            self.settings.memory.clone(),
+            "-display".into(),
+            "none".into(),
+            "-monitor".into(),
+            "none".into(),
+            "-chardev".into(),
+            format!("file,id=serial0,path={},append=on", option_value(&self.attacker_serial())),
+            "-serial".into(),
+            "chardev:serial0".into(),
+            "-qmp".into(),
+            format!("unix:{},server=on,wait=off", option_value(&self.attacker_qmp_socket())),
+            "-drive".into(),
+            format!("if=none,id=disk,format=qcow2,file={}", option_value(&self.attacker_disk())),
+            "-device".into(),
+            format!(
+                "{},drive=disk,bootindex=0",
+                match self.settings.disk {
+                    DiskBus::Sata => "ide-hd",
+                    DiskBus::Nvme => "nvme",
+                    DiskBus::Virtio => "virtio-blk-pci",
+                }
+            ),
+            // Its own way in, over user networking as the machine's is.
+            "-netdev".into(),
+            format!("user,id={NETDEV},hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+            "-device".into(),
+            format!("{},netdev={NETDEV}", self.settings.nic),
+            // The private network: it connects to the machine's open port.
+            "-netdev".into(),
+            format!("socket,id={SEGMENT},connect=127.0.0.1:{}", self.segment_port),
+            "-device".into(),
+            format!("{},netdev={SEGMENT},mac={ATTACKER_MAC}", self.settings.nic),
+        ]
+    }
+
+    /// How SSH reaches the attacker on `ssh_port`.
+    fn attacker_target(&self, ssh_port: u16, key: PathBuf) -> ssh::Target {
+        ssh::Target {
+            host: "127.0.0.1".into(),
+            port: ssh_port,
+            key,
+            known_hosts: self.setup.work.join(format!("attacker-known_hosts-{}", self.boot)),
+            scratch: self.setup.work.join("attacker-ssh-output"),
+        }
+    }
+
+    /// Turns the attacker off and lets go of it, if it is running.
+    fn stop_attacker(&mut self) {
+        if let Some(mut attacker) = self.attacker.take() {
+            let _ = attacker.running.qmp.execute("quit", &json!({}));
+            let deadline = Instant::now() + QUIT_TIME;
+            while Instant::now() < deadline {
+                if matches!(attacker.running.child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let _ = attacker.running.child.kill();
+            let _ = attacker.running.child.wait();
+        }
     }
 }
 
@@ -646,6 +777,118 @@ impl Driver for Qemu {
         target.run(command, input, deadline, &self.setup.stop)
     }
 
+    fn want_attacker(&mut self, yes: bool) {
+        self.want_attacker = yes;
+    }
+
+    fn start_attacker(&mut self, deadline: Instant) -> Result<(), String> {
+        if self.attacker.as_mut().is_some_and(|a| matches!(a.running.child.try_wait(), Ok(None))) {
+            return Ok(());
+        }
+        if self.segment_port == 0 {
+            return Err(
+                "the machine was not booted for an attack (its private network is off)".into()
+            );
+        }
+        let key = self
+            .setup
+            .key
+            .clone()
+            .ok_or("the lab has no key: run `dukovo-lab key`, then build the image again")?;
+        // A disk of the attacker's own over the same image.
+        let image = fs::canonicalize(&self.setup.image)
+            .map_err(|err| format!("the image {}: {err}", self.setup.image.display()))?;
+        let format =
+            if image.extension().is_some_and(|ext| ext == "qcow2") { "qcow2" } else { "raw" };
+        Self::qemu_img(
+            &[
+                "-f",
+                "qcow2",
+                "-F",
+                format,
+                "-b",
+                &image.to_string_lossy(),
+                &self.attacker_disk().to_string_lossy(),
+            ],
+            "the attacker's disk",
+        )?;
+        File::create(self.attacker_serial())
+            .map_err(|err| format!("making {}: {err}", self.attacker_serial().display()))?;
+        let socket = self.attacker_qmp_socket();
+        let _ = fs::remove_file(&socket);
+        let ssh_port = free_port()?;
+        let arguments = self.attacker_arguments(ssh_port);
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.qemu_log())
+            .map_err(|err| format!("opening {}: {err}", self.qemu_log().display()))?;
+        let _ = writeln!(log, "Starting the attacker: {QEMU} {}", arguments.join(" "));
+        let mut child = Command::new(QEMU)
+            .args(&arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .map_err(|err| format!("starting {QEMU} for the attacker: {err}"))?;
+        let qmp = match Qmp::connect(&socket, Duration::from_secs(10)) {
+            Ok(qmp) => qmp,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "the attacker's {err}; QEMU's messages are in {}",
+                    self.qemu_log().display()
+                ));
+            }
+        };
+        self.attacker = Some(Attacker { running: Running { child, qmp }, ssh_port });
+        // Wait until the attacker answers SSH, so commands can run on it.
+        let target = self.attacker_target(ssh_port, key);
+        loop {
+            if self.setup.stop.requested() {
+                return Err("the run was stopped before the attacker was ready".into());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the attacker did not answer SSH in time; its console is in {}",
+                    self.attacker_serial().display()
+                ));
+            }
+            let soon = (Instant::now() + Duration::from_secs(5)).min(deadline);
+            if let Ok(output) = target.run("true", None, soon, &self.setup.stop)
+                && output.status == Some(0)
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    fn attack(
+        &mut self,
+        command: &str,
+        input: Option<&str>,
+        deadline: Instant,
+    ) -> Result<ssh::Output, String> {
+        let key = self
+            .setup
+            .key
+            .clone()
+            .ok_or("the lab has no key: run `dukovo-lab key`, then build the image again")?;
+        let ssh_port = {
+            let Some(attacker) = &mut self.attacker else {
+                return Err("the attacker is not up; it is started on the first attack step".into());
+            };
+            if !matches!(attacker.running.child.try_wait(), Ok(None)) {
+                return Err("the attacker turned off".into());
+            }
+            attacker.ssh_port
+        };
+        let target = self.attacker_target(ssh_port, key);
+        target.run(command, input, deadline, &self.setup.stop)
+    }
+
     fn slowdown(&self) -> u32 {
         if self.kvm { 1 } else { self.settings.tcg_slowdown }
     }
@@ -672,6 +915,7 @@ impl Driver for Qemu {
     }
 
     fn shut_off(&mut self) {
+        self.stop_attacker();
         if self.is_on() {
             if let Some(running) = &mut self.running {
                 let _ = running.qmp.execute("quit", &json!({}));

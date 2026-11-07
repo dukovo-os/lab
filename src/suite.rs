@@ -156,6 +156,10 @@ pub enum Boot {
 /// never shows in a test file, a step's description or a log.
 pub const PASSWORD_TOKEN: &str = "{password}";
 
+/// What an `attack` step's command holds in place of this text: the
+/// machine under test's address on the private lab network.
+pub const TARGET_TOKEN: &str = "{target}";
+
 /// One step of a test.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Step {
@@ -197,6 +201,10 @@ pub enum Step {
     },
     /// Presses a pointer button and lets it go, where the pointer is.
     Click(Button),
+    /// Runs a command on the attacker machine, on a private lab network
+    /// with the machine under test, and checks what it did. `{target}`
+    /// in the command becomes the machine's address on that network.
+    Attack(Command),
 }
 
 /// A pointer button.
@@ -288,6 +296,7 @@ impl Step {
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
+            Step::Attack(_) => Some(Control::Attack),
             Step::Screenshot(_) | Step::Screen(_) | Step::ScreenGone(_) => Some(Control::Screen),
             Step::WaitReady | Step::Sleep(_) => None,
             // It also runs over SSH: see `Test::controls`.
@@ -321,6 +330,7 @@ impl Step {
             Step::Type(text) => format!("type \"{}\"", text.escape_debug()),
             Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
             Step::Click(button) => format!("click the {} button", button.name()),
+            Step::Attack(command) => format!("on the attacker, {}", describe_command(command)),
             Step::Screen(texts) => {
                 let texts: Vec<String> = texts.iter().map(|text| format!("\"{text}\"")).collect();
                 format!("wait until the screen shows {}", texts.join(", "))
@@ -364,6 +374,12 @@ impl Test {
         if self.steps.iter().any(|step| matches!(step, Step::Bench(_))) {
             controls.insert(Control::Ssh);
         }
+        // An attack runs commands on the attacker, but the harness also
+        // uses the machine's own SSH to give it its address on the
+        // private network.
+        if self.steps.iter().any(|step| matches!(step, Step::Attack(_))) {
+            controls.insert(Control::Ssh);
+        }
         // The install stick is plugged in as the machine powers on.
         if matches!(self.boot, Boot::Stick { .. }) {
             controls.insert(Control::Usb);
@@ -380,6 +396,9 @@ impl Test {
             Step::Run(command) => command.root,
             Step::Bench(bench) => bench.root,
             Step::Type(text) => text.contains(PASSWORD_TOKEN),
+            // The harness elevates on both machines to give them their
+            // addresses on the private network, so any attack needs it.
+            Step::Attack(_) => true,
             _ => false,
         })
     }
@@ -483,6 +502,7 @@ struct StepFile {
     typed: Option<String>,
     point: Option<Vec<u32>>,
     click: Option<Button>,
+    attack: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -632,12 +652,13 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("type", step.typed.is_some()),
         ("point", step.point.is_some()),
         ("click", step.click.is_some()),
+        ("attack", step.attack.is_some()),
     ];
     let given: Vec<&str> = actions.iter().filter(|(_, set)| *set).map(|(key, _)| *key).collect();
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, serial, power, link, usb, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, serial, power, link, usb, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -651,11 +672,19 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             Ok(())
         }
     };
-    only_with("exit", step.exit.is_some(), "run")?;
-    only_with("expect", step.expect.is_some(), "run")?;
-    only_with("expect_not", step.expect_not.is_some(), "run")?;
-    if step.root.is_some() && !matches!(given[0], "run" | "bench") {
-        return Err("root goes only with run or bench".into());
+    // A command's checks go with `run` or `attack`, which both run one.
+    let checks = |option: &str, set: bool| {
+        if set && !matches!(given[0], "run" | "attack") {
+            Err(format!("{option} goes only with run or attack"))
+        } else {
+            Ok(())
+        }
+    };
+    checks("exit", step.exit.is_some())?;
+    checks("expect", step.expect.is_some())?;
+    checks("expect_not", step.expect_not.is_some())?;
+    if step.root.is_some() && !matches!(given[0], "run" | "bench" | "attack") {
+        return Err("root goes only with run, bench or attack".into());
     }
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
@@ -667,6 +696,18 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             return Err("run needs a command".into());
         }
         return Ok(Step::Run(Command {
+            command,
+            exit: step.exit.unwrap_or(0),
+            expect: step.expect.map(OneOrMore::into_vec).unwrap_or_default(),
+            expect_not: step.expect_not.map(OneOrMore::into_vec).unwrap_or_default(),
+            root: step.root.unwrap_or(false),
+        }));
+    }
+    if let Some(command) = step.attack {
+        if command.trim().is_empty() {
+            return Err("attack needs a command to run on the attacker".into());
+        }
+        return Ok(Step::Attack(Command {
             command,
             exit: step.exit.unwrap_or(0),
             expect: step.expect.map(OneOrMore::into_vec).unwrap_or_default(),
@@ -1247,6 +1288,44 @@ expect = "1 received"
         );
         let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
         assert!(why.contains("root goes only with run"), "{why}");
+    }
+
+    #[test]
+    fn reads_an_attack_step() {
+        let dir = TempDir::new("suite-attack");
+        dir.write(
+            "security/scan.toml",
+            "about = \"x\"\ntime = \"1m\"\nfresh = true\n\
+             [[step]]\nattack = \"nmap {target}\"\nexpect = \"22/tcp open\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert_eq!(
+            test.steps[0],
+            Step::Attack(Command {
+                command: "nmap {target}".into(),
+                exit: 0,
+                expect: vec!["22/tcp open".into()],
+                expect_not: vec![],
+                root: false,
+            })
+        );
+        assert_eq!(
+            test.steps[0].describe(),
+            "on the attacker, run `nmap {target}`, exit status 0, output has \"22/tcp open\""
+        );
+        assert_eq!(test.steps[0].control(), Some(Control::Attack));
+        // An attack reaches the machine over SSH, so the test needs it.
+        let controls: Vec<Control> = test.controls().into_iter().collect();
+        assert!(
+            controls.contains(&Control::Attack) && controls.contains(&Control::Ssh),
+            "{controls:?}"
+        );
+        assert!(test.uses_password(), "an attack sets up addresses as root");
+
+        // An attack with no command says so.
+        dir.write("security/scan.toml", "about = \"x\"\ntime = \"1m\"\n[[step]]\nattack = \"\"\n");
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("attack needs a command"), "{why}");
     }
 
     #[test]
