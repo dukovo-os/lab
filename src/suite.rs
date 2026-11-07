@@ -1125,6 +1125,24 @@ expect = "1 received"
                 "two screenshots",
             ),
             ("boots/m.toml", &format!("{head}[[step]]\nwait = \"ready\"\n"), "not a test category"),
+            ("boot/n.toml", &format!("{head}[[step]]\ntype = \"café\"\n"), "no key for 'é'"),
+            (
+                "boot/o.toml",
+                &format!("{head}[[step]]\nscreen = \"two\\nrows\"\n"),
+                "each within one row",
+            ),
+            ("boot/p.toml", &format!("{head}[[step]]\npoint = [1]\n"), "point needs the pixel"),
+            ("boot/q.toml", &format!("{head}[[step]]\nclick = \"thumb\"\n"), "unknown variant"),
+            (
+                "boot/r.toml",
+                &format!("{head}disk = \"8G\"\n[[step]]\nwait = \"ready\"\n"),
+                "disk goes only with boot",
+            ),
+            (
+                "boot/s.toml",
+                &format!("{head}boot = \"stick\"\ndisk = \"4T\"\n[[step]]\nwait = \"ready\"\n"),
+                "disk",
+            ),
         ] {
             let dir = TempDir::new("suite-bad");
             dir.write(file, text);
@@ -1162,6 +1180,51 @@ expect = "1 received"
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{size} loaded") };
             assert!(why.contains("a size from 1M to 4G"), "{size}: {why}");
         }
+    }
+
+    #[test]
+    fn reads_the_screen_and_pointer_steps_and_the_stick() {
+        let dir = TempDir::new("suite-screen");
+        dir.write(
+            "console/screens.toml",
+            "about = \"x\"\ntime = \"1m\"\nboot = \"stick\"\ndisk = \"16G\"\n\
+             [[step]]\nscreen = [\"Step 1 of 5\", \"Welcome\"]\n\
+             [[step]]\nscreen_gone = \"Esc closes\"\n\
+             [[step]]\ntype = \"Ada {password}\\n\"\n\
+             [[step]]\npoint = [10, 20]\n[[step]]\nclick = \"right\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert_eq!(test.boot, Boot::Stick { disk: 16 << 30 });
+        assert!(test.uses_password());
+        let described: Vec<String> = test.steps.iter().map(Step::describe).collect();
+        assert_eq!(
+            described,
+            [
+                "wait until the screen shows \"Step 1 of 5\", \"Welcome\"",
+                "wait until the screen no longer shows \"Esc closes\"",
+                "type \"Ada {password}\\n\"",
+                "point at (10, 20) on the screen",
+                "click the right button",
+            ]
+        );
+        let controls: Vec<_> = test.steps.iter().map(Step::control).collect();
+        assert_eq!(
+            controls,
+            [
+                Some(Control::Screen),
+                Some(Control::Screen),
+                Some(Control::Keys),
+                Some(Control::Mouse),
+                Some(Control::Mouse),
+            ]
+        );
+        dir.write(
+            "console/screens.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert_eq!(test.boot, Boot::Image);
+        assert!(!test.uses_password());
     }
 
     #[test]

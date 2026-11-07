@@ -501,6 +501,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn reads_a_psf1_font_and_its_unicode_table() {
+        // 256 glyphs of 8x6, glyph 1 an A drawn as rows 1 to 6 and glyph 2
+        // a b; the table gives glyph 1 to A and to Greek capital Alpha,
+        // and glyph 2 to b and, in a sequence, to b and a combining mark.
+        let mut font = vec![0x36, 0x04, 0x02, 6];
+        for glyph in 0..256u32 {
+            font.extend((1..=6).map(|row| match glyph {
+                1 => row,
+                2 => 0x80 | row,
+                _ => 0,
+            }));
+        }
+        let unit = |font: &mut Vec<u8>, unit: u16| font.extend(unit.to_le_bytes());
+        for glyph in 0..256u16 {
+            match glyph {
+                1 => [0x0391, 0x41].into_iter().for_each(|u| unit(&mut font, u)),
+                2 => [0x62, 0xfffe, 0x62, 0x0301].into_iter().for_each(|u| unit(&mut font, u)),
+                _ => {}
+            }
+            unit(&mut font, 0xffff);
+        }
+        let font = Font::parse_psf(&font).unwrap();
+        assert_eq!((font.width, font.height), (8, 6));
+        // The lowest of a glyph's characters wins, and a sequence adds none.
+        assert_eq!(font.glyphs.get(&vec![1, 2, 3, 4, 5, 6]), Some(&'A'));
+        assert_eq!(font.glyphs.get(&vec![0x81, 0x82, 0x83, 0x84, 0x85, 0x86]), Some(&'b'));
+        assert!(Font::parse_psf(&[0x36, 0x04, 0x00, 6, 1, 2]).unwrap_err().contains("cut short"));
+        assert_eq!(Font::parse_psf(b"not a font").unwrap_err(), "not a PSF font");
+    }
+
+    #[test]
     fn reads_the_fonts_of_a_folder() {
         let dir = crate::testing::TempDir::new("fonts");
         assert!(Font::read_dir(dir.path()).unwrap_err().contains("no PSF fonts"));
