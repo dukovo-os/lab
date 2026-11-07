@@ -69,6 +69,14 @@ pub const NO_STICK: &str = "this test boots the install stick, and the run was g
 /// Why a `bench` step's numbers are kept but not held to Linux's.
 pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers (no KVM), so they are kept but not held to Linux's";
 
+/// The command that gives a machine the address `ip` on net1, the private
+/// network, and sets that port up. Both run in one shell, so that when it
+/// is run as root (through `elevate`, which elevates only its first
+/// command) the port is set up as root too.
+fn address_setup(ip: &str) -> String {
+    format!("sh -c 'ip address add {ip}/24 dev net1 && ip link set net1 up'")
+}
+
 /// Holds `output` of a `run` or `attack` command to what the command asked:
 /// its exit status, and the text its output must and must not hold. `shown`
 /// is how a log shows the command and what it printed, for a failure
@@ -834,18 +842,17 @@ impl<'a> Worker<'a> {
         }
         self.driver.start_attacker(deadline).map_err(StepFailure::Error)?;
         // Neither machine can reach the other until each has an address on
-        // net1, the port on their private network.
-        let target_up =
-            format!("ip address add {TARGET_ON_SEGMENT}/24 dev net1 && ip link set net1 up");
-        let (output, shown) = self.execute(&target_up, true, deadline)?;
+        // net1, the port on their private network, and that port is up.
+        // Both commands go to a shell run as root (`elevate` elevates only
+        // the first command it is given), so setting the port up is root's.
+        let (output, shown) = self.execute(&address_setup(TARGET_ON_SEGMENT), true, deadline)?;
         if output.status != Some(0) {
             return Err(StepFailure::Error(format!(
                 "could not give the machine its address on the private network\n{shown}"
             )));
         }
-        let attacker_up =
-            format!("ip address add {ATTACKER_ON_SEGMENT}/24 dev net1 && ip link set net1 up");
-        let (output, shown) = self.execute_attack(&attacker_up, true, deadline)?;
+        let (output, shown) =
+            self.execute_attack(&address_setup(ATTACKER_ON_SEGMENT), true, deadline)?;
         if output.status != Some(0) {
             return Err(StepFailure::Error(format!(
                 "could not give the attacker its address on the private network\n{shown}"
