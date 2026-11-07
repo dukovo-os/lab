@@ -942,3 +942,25 @@ fn a_needs_you_step_waits_for_a_person() {
     let why = results[0].reason.as_deref().unwrap();
     assert!(why.contains("no one said \"pull the network cable\" was done"), "{why}");
 }
+
+#[test]
+fn a_long_step_reports_it_is_still_running() {
+    // The hang step runs to its one-second limit. The beat is 100ms under
+    // test, so events.jsonl gains step-progress lines while it runs, naming
+    // the step and how long it has run.
+    let setting = setting_with(&[(
+        "stress/hang.toml",
+        "about = \"hangs\"\ntime = \"1s\"\n[[step]]\nrun = \"hang\"\n",
+    )]);
+    let (ended, _) = run_on(&setting, vec![&setting.qemu]);
+    let events = fs::read_to_string(ended.bundle.join("events.jsonl")).unwrap();
+    let beats: Vec<&str> =
+        events.lines().filter(|line| line.contains("\"event\":\"step-progress\"")).collect();
+    assert!(!beats.is_empty(), "a long step should report it is still running:\n{events}");
+    assert!(
+        beats.iter().all(|line| line.contains("\"test\":\"stress/hang\"")),
+        "every beat names the running test: {beats:?}"
+    );
+    assert!(beats[0].contains("run `hang`"), "the beat names the step: {}", beats[0]);
+    assert!(beats[0].contains("\"milliseconds\":"), "the beat says how long: {}", beats[0]);
+}

@@ -54,6 +54,16 @@ use crate::units::format_duration;
 /// What a stopped test's result says.
 const STOPPED_DURING: &str = "the run was stopped during this test";
 const STOPPED_BEFORE: &str = "the run was stopped before this test";
+
+/// How often a step that is still running reports it is alive (a
+/// `step-progress` event), so a long step — a soak, a slow boot — is not
+/// silent for minutes on end. Short under test, so the beat can be checked
+/// without a slow wait.
+const HEARTBEAT: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(30)
+};
 /// Why a `root` step cannot run.
 pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no password: run `dukovo-lab key`, then build the image again with `ob image --lab`";
 
@@ -579,7 +589,40 @@ impl<'a> Worker<'a> {
         action: impl FnOnce(&mut Self) -> Result<Option<String>, StepFailure>,
     ) -> (StepRecord, Result<(), StepFailure>) {
         let started = Instant::now();
-        let outcome = action(self);
+        // While the step runs, a background beat reports it is still alive,
+        // so a long step (a soak, a slow boot) is not silent for minutes.
+        // The reporter lives for the whole run ('a), so the beat borrows it
+        // beside the step's own `&mut self`; the step's name and the ids are
+        // copied in, as a thread cannot borrow them from `self`.
+        let reporter = self.shared.reporter;
+        let machine = self.machine.name.clone();
+        let test_id = test.id.clone();
+        let step = what.to_string();
+        let done = AtomicBool::new(false);
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut next = HEARTBEAT;
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let elapsed = started.elapsed();
+                    if elapsed >= next {
+                        reporter.report(&Event::StepProgress {
+                            machine: &machine,
+                            test: &test_id,
+                            step: &step,
+                            milliseconds: elapsed.as_millis() as u64,
+                        });
+                        next += HEARTBEAT;
+                    }
+                }
+            });
+            let outcome = action(self);
+            done.store(true, Ordering::Relaxed);
+            outcome
+        });
         let milliseconds = started.elapsed().as_millis() as u64;
         let (result, note, outcome) = match outcome {
             Ok(note) => (Outcome::Pass, note, Ok(())),
