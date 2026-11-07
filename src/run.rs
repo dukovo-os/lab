@@ -18,6 +18,7 @@
 //! boot's serial log.
 
 use std::fs;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -439,6 +440,14 @@ impl<'a> Worker<'a> {
         command: &Command,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
+        // The machine went off when the test needed it on: Dukovo's
+        // failure, as when it turns off before a serial step's text.
+        if !self.driver.is_on() {
+            return Err(StepFailure::Fail(format!(
+                "the machine was off, so `{}` could not run",
+                command.command
+            )));
+        }
         let output =
             self.driver.run_command(&command.command, deadline).map_err(StepFailure::Error)?;
         let shown = format!("$ {}\n{}", command.command, output.text.trim_end());
@@ -503,6 +512,11 @@ impl<'a> Worker<'a> {
         action: PowerAction,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
+        // A new boot starts: serial steps and `wait = "ready"` after this
+        // look only at what it prints, never at the boot before.
+        if matches!(action, PowerAction::On | PowerAction::Reset) {
+            self.serial.skip_to_end();
+        }
         match self.driver.power(action, deadline) {
             Ok(()) => Ok(None),
             // A machine that does not shut down when asked is Dukovo's
@@ -549,23 +563,64 @@ impl<'a> Worker<'a> {
 }
 
 /// Follows a serial log, finding text in order.
+///
+/// The log is read as it grows, only its new bytes each time, since a
+/// soak test's log grows for hours. Whole lines are cleaned once and kept;
+/// the line still being written is cleaned again each time, with any
+/// character or escape sequence cut short at its end left out until the
+/// rest arrives. So the text only ever grows, and a place found in it
+/// stays valid.
 struct SerialWatch {
     path: PathBuf,
-    /// The log read so far, with terminal escapes removed.
+    /// How many bytes of the log have been read.
+    read: u64,
+    /// The bytes read after the last newline.
+    partial: Vec<u8>,
+    /// The log's whole lines so far, cleaned as [`without_escapes`] cleans
+    /// them, then the line being written, cleaned the same way.
     text: String,
+    /// Where in `text` the line being written starts.
+    lines_end: usize,
     /// Where the next search starts: the end of the last text found.
     cursor: usize,
 }
 
 impl SerialWatch {
     fn new(path: PathBuf) -> SerialWatch {
-        SerialWatch { path, text: String::new(), cursor: 0 }
+        SerialWatch {
+            path,
+            read: 0,
+            partial: Vec::new(),
+            text: String::new(),
+            lines_end: 0,
+            cursor: 0,
+        }
     }
 
+    /// Reads what the log gained since the last time.
     fn refresh(&mut self) {
-        if let Ok(bytes) = fs::read(&self.path) {
-            self.text = without_escapes(&String::from_utf8_lossy(&bytes));
+        let Ok(mut file) = fs::File::open(&self.path) else { return };
+        let mut new = Vec::new();
+        if file.seek(SeekFrom::Start(self.read)).is_err() || file.read_to_end(&mut new).is_err() {
+            return;
         }
+        if new.is_empty() {
+            return;
+        }
+        self.read += new.len() as u64;
+        self.partial.extend_from_slice(&new);
+        // Whole lines are cleaned once. A newline is never inside a
+        // character, and it ends an escape sequence, so a line cleaned
+        // alone reads as it does in the whole log.
+        self.text.truncate(self.lines_end);
+        if let Some(last) = self.partial.iter().rposition(|&byte| byte == b'\n') {
+            let rest = self.partial.split_off(last + 1);
+            let lines = std::mem::replace(&mut self.partial, rest);
+            self.text.push_str(&without_escapes(&String::from_utf8_lossy(&lines)));
+            self.lines_end = self.text.len();
+        }
+        let partial = whole_characters(&self.partial);
+        self.text.push_str(&without_escapes(&String::from_utf8_lossy(partial)));
     }
 
     /// Searches from the end of the log as it is now: a test that shares a
@@ -583,6 +638,12 @@ impl SerialWatch {
     /// Whether `needle` has appeared since the last text found; moves past it.
     fn find(&mut self, needle: &str) -> bool {
         self.refresh();
+        // The text only grows, and the cursor sits at the end of text
+        // found or of the text there was, so it is a character's start;
+        // this keeps a search from stopping for good if it ever is not.
+        while !self.text.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
         let Some(at) = self.text.get(self.cursor..).and_then(|rest| rest.find(needle)) else {
             return false;
         };
@@ -594,22 +655,28 @@ impl SerialWatch {
 /// `text` without terminal escape sequences and carriage returns, as a
 /// person reading the console sees it. Removing a sequence cut short at
 /// the end keeps what came before unchanged as the log grows, so places
-/// found in it stay valid.
+/// found in it stay valid. A newline ends a sequence, even one not
+/// finished, so each line cleans the same alone as in the whole log.
 fn without_escapes(text: &str) -> String {
     let mut clean = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\u{1b}' => {
-                // CSI: ESC [ parameters, then a final byte from @ to ~.
                 if chars.peek() == Some(&'[') {
+                    // CSI: ESC [ parameters, then a final byte from @ to ~.
                     chars.next();
-                    for c in chars.by_ref() {
+                    while let Some(&c) = chars.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        chars.next();
                         if ('@'..='~').contains(&c) {
                             break;
                         }
                     }
-                } else {
+                } else if chars.peek().is_some_and(|&c| c != '\n') {
+                    // Any other escape: ESC and one character.
                     chars.next();
                 }
             }
@@ -620,6 +687,26 @@ fn without_escapes(text: &str) -> String {
     clean
 }
 
+/// `bytes` less a UTF-8 character cut short at its end, which the next
+/// read finishes.
+fn whole_characters(bytes: &[u8]) -> &[u8] {
+    // The last character starts within the last four bytes: find its
+    // first byte, which is not a continuation byte (10xxxxxx), and see
+    // whether all the bytes it says it has are there.
+    for back in 1..=bytes.len().min(4) {
+        let at = bytes.len() - back;
+        let length = match bytes[at] {
+            0x80..=0xbf => continue,
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if back < length { &bytes[..at] } else { bytes };
+    }
+    bytes
+}
+
 /// Lets tests run whole runs without QEMU.
 #[cfg(test)]
 mod fake;
@@ -627,6 +714,7 @@ mod fake;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn removes_escapes_the_same_way_as_the_log_grows() {
@@ -635,6 +723,36 @@ mod tests {
         // Cut inside an escape: the text before it is the same.
         assert_eq!(without_escapes(&log[..8]), "");
         assert_eq!(without_escapes(&log[..12]), "B");
+    }
+
+    #[test]
+    fn a_line_cleans_the_same_alone_as_in_the_whole_log() {
+        // An escape cut short by a newline ends there, and the newline stays.
+        assert_eq!(without_escapes("a\u{1b}[12\nb\u{1b}\nc"), "a\nb\nc");
+        assert_eq!(without_escapes("a\u{1b}[12\n") + &without_escapes("b"), "a\nb");
+    }
+
+    #[test]
+    fn waits_for_the_rest_of_a_character_cut_short() {
+        let check = "\u{2713}".as_bytes(); // ✓, three bytes
+        assert_eq!(whole_characters(&[b'a', check[0], check[1]]), b"a");
+        assert_eq!(whole_characters(&[b'a', check[0], check[1], check[2]]).len(), 4);
+        assert_eq!(whole_characters(b"plain"), b"plain");
+        assert_eq!(whole_characters(&[]), b"");
+
+        let dir = crate::testing::TempDir::new("serial-utf8");
+        let path = dir.write("serial.log", "");
+        let mut log = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut watch = SerialWatch::new(path);
+        log.write_all(&[b'o', b'k', b' ', check[0]]).unwrap();
+        // A test sharing the boot starts here, the ✓ half written.
+        watch.skip_to_end();
+        log.write_all(&check[1..]).unwrap();
+        log.write_all("\x1b[1mdone\x1b[0".as_bytes()).unwrap();
+        assert!(watch.find("\u{2713}done"), "the character finished after the place");
+        log.write_all("m\nlogin: ".as_bytes()).unwrap();
+        assert!(watch.find("login: "), "a prompt with no newline after it");
+        assert_eq!(watch.text, "ok \u{2713}done\nlogin: ");
     }
 
     #[test]

@@ -51,7 +51,7 @@ Each step has exactly one action key, and only the options that go with it.
 | Action | Options | Does | Control |
 | --- | --- | --- | --- |
 | `run = "<command>"` | `exit` (default 0), `expect`, `expect_not` | Runs the command over SSH as the `lab` account. Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. | ssh |
-| `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started. | serial |
+| `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started; after `power = "on"` or `"reset"`, only what the new boot printed. | serial |
 | `power = "on"` | | Powers the machine on. | power |
 | `power = "off"` | | Presses the power button and waits until the machine is off. Fails if it is still on at the time limit. | power |
 | `power = "button"` | | Presses the power button and goes on at once. | power |

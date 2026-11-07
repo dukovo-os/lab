@@ -346,7 +346,11 @@ impl Driver for Qemu {
         if let Some(stick) = self.stick {
             return Err(format!("USB stick {stick} is still plugged in; pull it first"));
         }
-        let number = self.sticks + 1;
+        self.qmp()?;
+        // Each stick gets a new number, even when plugging one in fails
+        // halfway, so its QMP names are never taken.
+        self.sticks += 1;
+        let number = self.sticks;
         // A copy, so the test's own file stays as it is whatever the guest writes.
         let copy = self.setup.work.join(format!("stick-{number}.img"));
         fs::copy(image, &copy).map_err(|err| format!("copying {}: {err}", image.display()))?;
@@ -360,7 +364,6 @@ impl Driver for Qemu {
             "device_add",
             &json!({ "driver": "usb-storage", "bus": "xhci.0", "drive": node, "id": format!("usb-{node}"), "removable": true }),
         )?;
-        self.sticks = number;
         self.stick = Some(number);
         Ok(())
     }

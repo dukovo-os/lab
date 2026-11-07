@@ -18,6 +18,9 @@ struct FakeMachine {
     serial: PathBuf,
     boot: u32,
     on: bool,
+    /// Whether it boots again after reset; the machine named `stuck`
+    /// does not.
+    restarts: bool,
 }
 
 impl FakeMachine {
@@ -42,7 +45,9 @@ impl Driver for FakeMachine {
         match action {
             PowerAction::On | PowerAction::Reset => {
                 self.on = true;
-                self.say("Boot complete.");
+                if self.restarts {
+                    self.say("Boot complete.");
+                }
             }
             PowerAction::Off | PowerAction::Button | PowerAction::Cut => self.on = false,
         }
@@ -106,7 +111,13 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
     if machine.name == "broken" {
         return Err("no such machine".into());
     }
-    Ok(Box::new(FakeMachine { logs: setup.logs, serial: PathBuf::new(), boot: 0, on: false }))
+    Ok(Box::new(FakeMachine {
+        logs: setup.logs,
+        serial: PathBuf::new(),
+        boot: 0,
+        on: false,
+        restarts: machine.name != "stuck",
+    }))
 }
 
 /// The tests every run here picks, in the order they run.
@@ -139,8 +150,12 @@ struct Setting {
 }
 
 fn setting() -> Setting {
+    setting_with(TESTS)
+}
+
+fn setting_with(tests: &[(&str, &str)]) -> Setting {
     let dir = TempDir::new("run");
-    for (file, text) in TESTS {
+    for (file, text) in tests {
         dir.write(&format!("tests/{file}"), text);
     }
     dir.write("lab_ed25519", "not a real key");
@@ -260,4 +275,36 @@ fn machines_run_side_by_side_and_skip_what_they_cannot_do() {
     assert!(results.iter().filter(|r| r.machine == "broken").all(|r| r.result == Outcome::Error
         && r.reason.as_deref() == Some("the broken machine did not start: no such machine")));
     assert_eq!(ended.summary, Summary { passed: 6, failed: 4, skipped: 2, errors: 6 });
+}
+
+#[test]
+fn a_new_boot_is_waited_for_and_an_off_machine_runs_nothing() {
+    let setting = setting_with(&[
+        (
+            "stress/reset.toml",
+            "about = \"reset\"\ntime = \"1s\"\nfresh = true\n[[step]]\npower = \"reset\"\n\
+             [[step]]\nwait = \"ready\"\n",
+        ),
+        (
+            "stress/off.toml",
+            "about = \"off\"\ntime = \"1m\"\nfresh = true\n[[step]]\npower = \"cut\"\n\
+             [[step]]\nrun = \"true\"\n",
+        ),
+    ]);
+    let mut stuck = setting.qemu.clone();
+    stuck.name = "stuck".into();
+    let (_, results) = run_on(&setting, vec![&setting.qemu, &stuck]);
+    let reason = |machine: &str, test: &str| {
+        let result = results.iter().find(|r| r.machine == machine && r.test == test).unwrap();
+        (result.result, result.reason.clone().unwrap_or_default())
+    };
+    assert_eq!(reason("qemu", "stress/reset").0, Outcome::Pass);
+    // The boot before's "Boot complete." does not count for the new one.
+    let (result, why) = reason("stuck", "stress/reset");
+    assert_eq!(result, Outcome::Fail);
+    assert!(why.starts_with("step 2: \"Boot complete.\" did not appear"), "{why}");
+    // A machine off when a command must run is Dukovo's failure.
+    let (result, why) = reason("qemu", "stress/off");
+    assert_eq!(result, Outcome::Fail);
+    assert_eq!(why, "step 2: the machine was off, so `true` could not run");
 }
