@@ -520,7 +520,8 @@ fn tick(arguments: &Arguments) -> Result<Value, Error> {
     let schedules = load(&config)?;
     let now = Utc::now();
     let timed = schedules.schedules.iter().any(|schedule| schedule.at.is_some());
-    let zone = if timed { Some(schedules.zone()?) } else { None };
+    // A zone that will not read stops only the timed schedules.
+    let zone = if timed { Some(schedules.zone()) } else { None };
     let mut started = Vec::new();
     let mut problems = Vec::new();
     for schedule in schedules.schedules.iter().filter(|schedule| !schedule.paused) {
@@ -529,6 +530,13 @@ fn tick(arguments: &Arguments) -> Result<Value, Error> {
         let start = if let Some(zone) = &zone
             && schedule.at.is_some()
         {
+            let zone = match zone {
+                Ok(zone) => zone,
+                Err(Error::Usage(why) | Error::Harness(why) | Error::Busy(why)) => {
+                    problems.push(format!("{name}: {why}"));
+                    continue;
+                }
+            };
             edit_state(&store, name, |state| {
                 let handled = state.handled.as_deref().and_then(Utc::parse_rfc3339);
                 // A schedule the tick has never seen starts from now, not
@@ -1036,8 +1044,15 @@ fn install(arguments: &Arguments) -> Result<Value, Error> {
             )))
         }
     };
-    systemctl(&["daemon-reload"])?;
-    systemctl(&["enable", "--now", TIMER])?;
+    let turned_on =
+        systemctl(&["daemon-reload"]).and_then(|()| systemctl(&["enable", "--now", TIMER]));
+    if let Err(err) = turned_on {
+        // Units left behind would say the timer is there when it is not.
+        for file in [SERVICE, TIMER] {
+            let _ = fs::remove_file(dir.join(file));
+        }
+        return Err(err);
+    }
     // Without lingering, systemd stops a person's timers when they sign
     // out; with it, schedules run whether anyone is signed in or not.
     let linger = linger();
@@ -1059,8 +1074,10 @@ fn linger() -> bool {
     if ask.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "yes") {
         return true;
     }
+    // Never a password prompt: a PC that needs one says so, and the
+    // person runs it.
     Command::new("loginctl")
-        .arg("enable-linger")
+        .args(["--no-ask-password", "enable-linger"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

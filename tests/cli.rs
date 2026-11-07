@@ -495,3 +495,51 @@ fn a_schedule_tests_main_on_the_lab_s_own_checkout() {
     assert!(setting.run(&["schedule"]).1["schedules"].as_array().unwrap().is_empty());
     assert_eq!(setting.run(&["schedule", "start", "quick"]).0, Some(2));
 }
+
+#[test]
+fn install_puts_the_timer_in_place_and_turns_it_on() {
+    let setting = Setting::new("install");
+    // A pretend systemctl and loginctl, which note what they were asked.
+    let asked = setting.dir.join("asked");
+    for (program, exit) in [("systemctl", 0), ("loginctl", 0)] {
+        let script = setting.dir.join("bin").join(program);
+        fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"{program} $*\" >> '{}'\nexit {exit}\n", asked.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let units = setting.dir.join("xdg/systemd/user");
+    let install = |setting: &Setting| {
+        let output = setting
+            .command()
+            .env("XDG_CONFIG_HOME", setting.dir.join("xdg"))
+            .args(["schedule", "install"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        (output.status.code(), serde_json::from_str::<Value>(text.trim()).unwrap_or(Value::Null))
+    };
+    let (code, answer) = install(&setting);
+    assert_eq!(code, Some(0), "{answer}");
+    assert_eq!(answer["changed"], true);
+    let service = fs::read_to_string(units.join("dukovo-lab-schedules.service")).unwrap();
+    assert!(service.contains("schedule tick"), "{service}");
+    assert!(service.contains(&format!("\"{}\"", setting.dir.join("store").display())));
+    assert!(units.join("dukovo-lab-schedules.timer").is_file());
+    let said = fs::read_to_string(&asked).unwrap();
+    assert!(said.contains("systemctl --user daemon-reload"), "{said}");
+    assert!(said.contains("systemctl --user enable --now dukovo-lab-schedules.timer"), "{said}");
+    // Again: nothing to change.
+    assert_eq!(install(&setting).1["changed"], false);
+
+    // A PC where systemd will not: an error, and no units left to say
+    // the timer is there.
+    let systemctl = setting.dir.join("bin/systemctl");
+    fs::write(&systemctl, "#!/bin/sh\necho 'Failed to connect to bus' >&2\nexit 1\n").unwrap();
+    let (code, answer) = install(&setting);
+    assert_eq!(code, Some(3), "{answer}");
+    assert!(answer["error"].as_str().unwrap().contains("Failed to connect to bus"), "{answer}");
+    assert!(!units.join("dukovo-lab-schedules.timer").exists());
+}
