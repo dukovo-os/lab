@@ -16,10 +16,37 @@ they test, in [dukovo-os/dukovo](https://github.com/dukovo-os/dukovo), so
 a feature and its lab test land together and the lab always runs the
 tests that match the build.
 
-**Status:** planned. Work starts after Dukovo's Phases 13 and 14 (item
-14f of the roadmap). Nothing here runs yet.
+**Status:** in progress (item 14f of Dukovo's roadmap). `dukovo-lab`
+runs tests on QEMU machines and writes results bundles; the runner page,
+findings, Send and real machines come in the next pull requests.
 
-## What it will do
+## Getting started
+
+On a Linux PC with Rust (through rustup), QEMU and OpenSSH:
+
+```sh
+sudo apt install qemu-system-x86 qemu-utils ovmf openssh-client   # Linux Mint, Ubuntu
+cargo install --locked --git https://github.com/dukovo-os/lab
+dukovo-lab key          # once: the lab's SSH key, which lab images trust
+```
+
+Then, in a Dukovo checkout:
+
+```sh
+./ob lab list                       # the tests, by category
+./ob lab run boot drivers           # build a lab image, run on QEMU
+./ob lab run --all --machine qemu,qemu-bios
+```
+
+Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
+
+- [Commands](docs/commands.md): every command, its JSON and exit statuses,
+  results bundles, and troubleshooting
+- [Test files](docs/test-files.md): writing a lab test
+- [Machine files](docs/machine-files.md): adding a machine
+- [Driving the lab from an agent](docs/agents.md)
+
+## What it does and will do
 
 - **Run tests singly, by category or on a schedule**, on one machine or
   several at once: boot and install, drivers, features, performance

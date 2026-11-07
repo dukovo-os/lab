@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# A stable toolchain: the harness runs on the lab PC, not in Dukovo, and
+# needs nothing nightly. rustup picks this up in the repository.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

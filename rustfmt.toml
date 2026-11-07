@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# As in dukovo-os/dukovo, so code moves between the two repositories as is.
+max_width = 100
+use_small_heuristics = "Max"
+use_field_init_shorthand = true

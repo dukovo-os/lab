@@ -12,6 +12,48 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: Format, lint and test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # QEMU and OVMF for the driver's tests, which start real machines
+      # with blank disks; OpenSSH's client for the SSH channel's.
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils ovmf openssh-client
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        env:
+          DUKOVO_LAB_QEMU_TESTS: "1"
+          DUKOVO_LAB_KEEP_BUNDLE: ${{ runner.temp }}/bundle
+        run: cargo test --locked
+      # A bundle from a whole run on pretend machines, against the schemas
+      # dukovo-os/lab-results and agents rely on. check-jsonschema is
+      # Apache-2.0 and only checks the files.
+      - name: Bundle schemas
+        run: |
+          python3 -m venv "$RUNNER_TEMP/schema"
+          "$RUNNER_TEMP/schema/bin/pip" install --quiet check-jsonschema==0.39.0
+          "$RUNNER_TEMP/schema/bin/check-jsonschema" --schemafile schema/run.schema.json "$RUNNER_TEMP/bundle/run.json"
+          "$RUNNER_TEMP/schema/bin/check-jsonschema" --schemafile schema/results.schema.json "$RUNNER_TEMP/bundle/results.json"
+
+  deny:
+    name: Licenses and advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny
+        run: cargo deny check
+
   reuse:
     name: REUSE compliance
     runs-on: ubuntu-24.04

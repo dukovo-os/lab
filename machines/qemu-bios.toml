@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# An example machine file: copy it to ~/.config/dukovo-lab/machines/ to
+# run tests through BIOS firmware as well as the built-in UEFI `qemu`.
+# docs/machine-files.md lists every key.
+
+about = "QEMU with BIOS firmware"
+driver = "qemu"
+
+[qemu]
+firmware = "bios"

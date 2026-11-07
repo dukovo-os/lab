@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dukovo-os/lab/blob/main/schema/run.schema.json",
+  "title": "Dukovo Lab run",
+  "description": "run.json in a results bundle: what ran. Version 1.",
+  "type": "object",
+  "required": ["schema", "id", "harness", "started", "ended", "build", "image", "machines", "tests", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": 1 },
+    "id": {
+      "description": "The run id: its start in UTC and four random hex digits.",
+      "type": "string",
+      "pattern": "^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$"
+    },
+    "harness": { "description": "The harness and its version.", "type": "string" },
+    "started": { "type": "string", "format": "date-time" },
+    "ended": { "description": "None while the run is going.", "type": ["string", "null"], "format": "date-time" },
+    "build": { "description": "The build under test, as ob lab names it.", "type": ["string", "null"] },
+    "image": { "description": "The image file, as given.", "type": "string" },
+    "machines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "about", "driver"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "about": { "type": "string" },
+          "driver": { "enum": ["qemu"] }
+        }
+      }
+    },
+    "tests": { "description": "Test ids, in the order they ran.", "type": "array", "items": { "type": "string" } },
+    "summary": {
+      "description": "Counts of results, once the run has ended.",
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["passed", "failed", "skipped", "errors"],
+          "additionalProperties": false,
+          "properties": {
+            "passed": { "type": "integer", "minimum": 0 },
+            "failed": { "type": "integer", "minimum": 0 },
+            "skipped": { "type": "integer", "minimum": 0 },
+            "errors": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    }
+  }
+}

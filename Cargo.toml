@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[package]
+name = "dukovo-lab"
+description = "The Dukovo Lab harness: runs Dukovo's lab tests on QEMU and real machines"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/dukovo-os/lab"
+publish = false
+
+[dependencies]
+# Results bundles and `--json` output.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Test and machine files.
+toml = "0.9"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+# The same pedantic lints Dukovo's own workspaces turn on
+# (dukovo-os/dukovo docs/coding-standard.md), less the ones that only
+# matter in kernel code.
+assigning_clones = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+format_collect = "warn"
+ignored_unit_patterns = "warn"
+implicit_clone = "warn"
+manual_let_else = "warn"
+manual_string_new = "warn"
+map_unwrap_or = "warn"
+match_bool = "warn"
+needless_continue = "warn"
+needless_pass_by_value = "warn"
+needless_raw_string_hashes = "warn"
+nonminimal_bool = "warn"
+redundant_closure_for_method_calls = "warn"
+semicolon_if_nothing_returned = "warn"
+trivially_copy_pass_by_ref = "warn"
+unnested_or_patterns = "warn"
+unused_self = "warn"
+used_underscore_binding = "warn"
