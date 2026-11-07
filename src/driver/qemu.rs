@@ -16,7 +16,8 @@
 //! Every control maps to one QMP command: power to `system_powerdown`,
 //! `system_reset` and `quit` (the cord), the network cable to `set_link`,
 //! a USB stick to `blockdev-add` and `device_add usb-storage` on an xhci
-//! controller, keys to `send-key`, the screen to `screendump`.
+//! controller, keys to `send-key`, the pointer (a USB tablet) to
+//! `input-send-event`, the screen to `screendump`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -31,14 +32,19 @@ use super::{Driver, Setup};
 use crate::bench::Kit;
 use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
+use crate::screen::Image;
 use crate::ssh;
-use crate::suite::{PowerAction, Stick};
+use crate::suite::{Button, PowerAction, Stick};
 
 /// The QEMU binary.
 const QEMU: &str = "qemu-system-x86_64";
 
 /// The network device's id, which `set_link` names.
 const NETDEV: &str = "lab0";
+
+/// The most of where QEMU's pointing devices point, on each axis
+/// (INPUT_EVENT_ABS_MAX): the screen's right and bottom edges.
+const ABS_MAX: usize = 0x7fff;
 
 /// Where distributions install OVMF, as (code, variables) pairs; the same
 /// list as `ob`'s.
@@ -74,6 +80,10 @@ pub struct Qemu {
     /// USB sticks plugged in so far, to name the next; and the one in now.
     sticks: u32,
     stick: Option<u32>,
+    /// The install stick this boot started from, while it is still in:
+    /// its number and the overlay over the image it holds. It stays in
+    /// across power cycles, as a real stick would, until it is pulled.
+    boot_stick: Option<(u32, PathBuf)>,
 }
 
 /// A running QEMU and its QMP connection.
@@ -120,6 +130,7 @@ impl Qemu {
             ssh_port: 0,
             sticks: 0,
             stick: None,
+            boot_stick: None,
         })
     }
 
@@ -139,6 +150,23 @@ impl Qemu {
         self.setup.sockets.join("qmp.sock")
     }
 
+    /// Runs `qemu-img create -q` with `arguments`, which make `what`.
+    fn qemu_img(arguments: &[&str], what: &str) -> Result<(), String> {
+        let output = Command::new("qemu-img")
+            .arg("create")
+            .arg("-q")
+            .args(arguments)
+            .output()
+            .map_err(|err| format!("qemu-img will not start ({err}); install QEMU's tools (Mint: apt install qemu-utils)"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "qemu-img could not make {what}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
     /// Makes this boot's disk: an overlay whose reads fall through to the
     /// image and whose writes stay in the overlay.
     fn make_disk(&self) -> Result<(), String> {
@@ -146,20 +174,11 @@ impl Qemu {
             .map_err(|err| format!("the image {}: {err}", self.setup.image.display()))?;
         let format =
             if image.extension().is_some_and(|ext| ext == "qcow2") { "qcow2" } else { "raw" };
-        let output = Command::new("qemu-img")
-            .args(["create", "-q", "-f", "qcow2", "-F", format, "-b"])
-            .arg(&image)
-            .arg(self.disk())
-            .output()
-            .map_err(|err| format!("qemu-img will not start ({err}); install QEMU's tools (Mint: apt install qemu-utils)"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "qemu-img could not make a disk over {}: {}",
-                image.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        Ok(())
+        let disk = self.disk();
+        Self::qemu_img(
+            &["-f", "qcow2", "-F", format, "-b", &image.to_string_lossy(), &disk.to_string_lossy()],
+            &format!("a disk over {}", image.display()),
+        )
     }
 
     /// QEMU's arguments for this boot.
@@ -200,11 +219,14 @@ impl Qemu {
         args.push("-drive".into());
         args.push(format!("if=none,id=disk,format=qcow2,file={}", option_value(&self.disk())));
         args.push("-device".into());
+        // While the install stick is in, the firmware starts it first, as
+        // a person picks it in the boot menu; the disk after.
+        let disk_index = if self.boot_stick.is_some() { 1 } else { 0 };
         args.push(match settings.disk {
             // q35's own SATA controller is AHCI, as the OptiPlex's in AHCI mode.
-            DiskBus::Sata => "ide-hd,drive=disk,bootindex=0".into(),
-            DiskBus::Nvme => "nvme,drive=disk,serial=lab-disk,bootindex=0".into(),
-            DiskBus::Virtio => "virtio-blk-pci,drive=disk,bootindex=0".into(),
+            DiskBus::Sata => format!("ide-hd,drive=disk,bootindex={disk_index}"),
+            DiskBus::Nvme => format!("nvme,drive=disk,serial=lab-disk,bootindex={disk_index}"),
+            DiskBus::Virtio => format!("virtio-blk-pci,drive=disk,bootindex={disk_index}"),
         });
         args.push("-netdev".into());
         args.push(format!("user,id={NETDEV},hostfwd=tcp:127.0.0.1:{}-:22", self.ssh_port));
@@ -213,6 +235,23 @@ impl Qemu {
         // USB sticks are plugged into this controller.
         args.push("-device".into());
         args.push("qemu-xhci,id=xhci".into());
+        // The pointer: a tablet, which says where it points, so that a
+        // test points at a pixel rather than moving by guesswork.
+        args.push("-device".into());
+        args.push("usb-tablet,bus=xhci.0,id=pointer".into());
+        // The install stick, named as a stick plugged in later is, so that
+        // pulling it works the same way.
+        if let Some((number, overlay)) = &self.boot_stick {
+            args.push("-blockdev".into());
+            args.push(format!(
+                "driver=qcow2,node-name=stick{number},file.driver=file,file.filename={}",
+                option_value(overlay)
+            ));
+            args.push("-device".into());
+            args.push(format!(
+                "usb-storage,bus=xhci.0,drive=stick{number},id=usb-stick{number},removable=on,bootindex=0"
+            ));
+        }
         args
     }
 
@@ -246,7 +285,9 @@ impl Qemu {
             }
         };
         self.running = Some(Running { child, qmp });
-        self.stick = None;
+        // A stick plugged in while it ran is gone with the old QEMU; the
+        // install stick, given on its command line, is still in.
+        self.stick = self.boot_stick.as_ref().map(|(number, _)| *number);
         Ok(())
     }
 
@@ -357,13 +398,20 @@ impl Qemu {
     }
 }
 
-impl Driver for Qemu {
-    fn boot_fresh(&mut self) -> Result<(), String> {
+impl Qemu {
+    /// Starts a new boot: the old boot's files go, and this boot's
+    /// firmware variables, serial log and SSH port are made; the disk is
+    /// the caller's to make.
+    fn next_boot(&mut self) -> Result<(), String> {
         self.shut_off();
-        // The last boot's disk is not needed again; images are large.
+        // The last boot's disk and stick are not needed again; images are
+        // large.
         let _ = fs::remove_file(self.disk());
+        if let Some((_, overlay)) = self.boot_stick.take() {
+            let _ = fs::remove_file(overlay);
+        }
+        self.stick = None;
         self.boot += 1;
-        self.make_disk()?;
         if let Some((_, template)) = &self.ovmf {
             fs::copy(template, self.variables()).map_err(|err| {
                 format!("copying OVMF's variables from {}: {err}", template.display())
@@ -373,6 +421,45 @@ impl Driver for Qemu {
         File::create(&self.serial)
             .map_err(|err| format!("making {}: {err}", self.serial.display()))?;
         self.ssh_port = free_port()?;
+        Ok(())
+    }
+}
+
+impl Driver for Qemu {
+    fn boot_fresh(&mut self) -> Result<(), String> {
+        self.next_boot()?;
+        self.make_disk()?;
+        self.power_on()
+    }
+
+    fn boot_stick(&mut self, stick: &Path, disk: u64) -> Result<(), String> {
+        self.next_boot()?;
+        // A blank disk for the installer, which takes room only as it is
+        // written, and the stick as an overlay over its image, so the
+        // image stays as it is whatever the live system writes to it.
+        let blank = self.disk();
+        Self::qemu_img(
+            &["-f", "qcow2", &blank.to_string_lossy(), &disk.to_string()],
+            "the installer's blank disk",
+        )?;
+        let image = fs::canonicalize(stick)
+            .map_err(|err| format!("the install stick {}: {err}", stick.display()))?;
+        self.sticks += 1;
+        let number = self.sticks;
+        let overlay = self.setup.work.join(format!("stick-{number}.qcow2"));
+        Self::qemu_img(
+            &[
+                "-f",
+                "qcow2",
+                "-F",
+                "raw",
+                "-b",
+                &image.to_string_lossy(),
+                &overlay.to_string_lossy(),
+            ],
+            "the install stick's overlay",
+        )?;
+        self.boot_stick = Some((number, overlay));
         self.power_on()
     }
 
@@ -469,6 +556,12 @@ impl Driver for Qemu {
         qmp.execute("blockdev-del", &json!({ "node-name": node }))?;
         self.stick = None;
         let _ = fs::remove_file(self.setup.work.join(format!("stick-{number}.img")));
+        // The install stick is out for good: QEMU starts again without it.
+        if self.boot_stick.as_ref().is_some_and(|(boot_stick, _)| *boot_stick == number)
+            && let Some((_, overlay)) = self.boot_stick.take()
+        {
+            let _ = fs::remove_file(overlay);
+        }
         Ok(())
     }
 
@@ -484,8 +577,49 @@ impl Driver for Qemu {
         Ok(())
     }
 
+    fn point(&mut self, x: u32, y: u32) -> Result<(), String> {
+        // QEMU takes where a tablet points as 0 to ABS_MAX on each axis,
+        // the whole screen whatever its size, so the pixel is scaled by
+        // the size the screen has now.
+        let dump = self.setup.work.join("pointer-screen.ppm");
+        self.screen_dump(&dump)?;
+        let bytes = fs::read(&dump).map_err(|err| format!("{}: {err}", dump.display()))?;
+        let _ = fs::remove_file(&dump);
+        let screen = Image::parse_ppm(&bytes)?;
+        let (x, y) = (x as usize, y as usize);
+        if x >= screen.width || y >= screen.height {
+            return Err(format!(
+                "({x}, {y}) is off the screen, which is {}x{} pixels",
+                screen.width, screen.height
+            ));
+        }
+        let scale = |at: usize, size: usize| (at * ABS_MAX / (size - 1).max(1)) as u64;
+        let events = json!({ "events": [
+            { "type": "abs", "data": { "axis": "x", "value": scale(x, screen.width) } },
+            { "type": "abs", "data": { "axis": "y", "value": scale(y, screen.height) } },
+        ] });
+        self.qmp()?.execute("input-send-event", &events).map(drop)
+    }
+
+    fn click(&mut self, button: Button) -> Result<(), String> {
+        for down in [true, false] {
+            let event = json!({ "type": "btn", "data": { "down": down, "button": button.name() } });
+            self.qmp()?.execute("input-send-event", &json!({ "events": [event] }))?;
+            // As long as a person holds a button: long enough for the
+            // pointer to report it down before it goes up.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    }
+
     fn screenshot(&mut self, to: &Path) -> Result<(), String> {
         self.qmp()?.execute("screendump", &json!({ "filename": to, "format": "png" })).map(drop)
+    }
+
+    fn screen_dump(&mut self, to: &Path) -> Result<(), String> {
+        // PPM, screendump's own format, which the lab reads without a PNG
+        // decoder.
+        self.qmp()?.execute("screendump", &json!({ "filename": to, "format": "ppm" })).map(drop)
     }
 
     fn run_command(
@@ -644,6 +778,18 @@ mod tests {
         let shot = dir.path().join("screen.png");
         qemu.screenshot(&shot).unwrap();
         assert_eq!(&fs::read(&shot).unwrap()[..4], b"\x89PNG");
+        let dump = dir.path().join("screen.ppm");
+        qemu.screen_dump(&dump).unwrap();
+        let screen = Image::parse_ppm(&fs::read(&dump).unwrap()).unwrap();
+        assert!(screen.width > 0 && screen.height > 0);
+
+        // The pointer: anywhere on the screen, never past its edge.
+        qemu.point(0, 0).unwrap();
+        qemu.point(screen.width as u32 - 1, screen.height as u32 - 1).unwrap();
+        let off = qemu.point(screen.width as u32, 0).unwrap_err();
+        assert!(off.contains("off the screen"), "{off}");
+        qemu.click(Button::Left).unwrap();
+        qemu.click(Button::Right).unwrap();
 
         let error = qemu.run_command("true", None, soon()).unwrap_err();
         assert!(error.contains("no key"), "{error}");
@@ -660,6 +806,16 @@ mod tests {
         assert!(qemu.power(PowerAction::On, soon()).unwrap_err().contains("already on"));
         qemu.boot_fresh().unwrap();
         assert!(!dir.path().join("work/disk-1.qcow2").exists(), "the old boot's disk is gone");
+
+        // The install stick, with a blank disk of the size asked for; the
+        // stick's own file is never written.
+        let install = dir.write("install.img", "");
+        File::options().write(true).open(&install).unwrap().set_len(1 << 20).unwrap();
+        qemu.boot_stick(&install, 1 << 30).unwrap();
+        assert!(qemu.is_on());
+        assert!(dir.path().join("work/disk-3.qcow2").is_file());
+        assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
+        assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
         qemu.shut_off();
         assert!(!qemu.is_on());
         let log = fs::read_to_string(dir.path().join("logs/qemu-1.log")).unwrap();

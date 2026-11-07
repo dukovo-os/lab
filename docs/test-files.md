@@ -35,6 +35,8 @@ expect_not = "NO-CARRIER"
 | `about` | yes | What the test checks, in one line. |
 | `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `24h`. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. |
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
+| `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk: see [Installer tests](#installer-tests). |
+| `disk` | no | With `boot = "stick"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
 | `[[step]]` | at least one | The steps, in order. |
 
 ## Categories
@@ -74,7 +76,12 @@ Each step has exactly one action key, and only the options that go with it.
 | `usb = "plug"` | `image` or `blank` | Plugs in a USB stick: a copy of `image`, a file in the test's folder, or with `blank = "64M"` an empty stick of that size, from `1M` to `4G` (`K`, `M` or `G`). | usb |
 | `usb = "unplug"` | | Pulls the stick out. | usb |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
-| `screenshot = "<name>"` | | Keeps the screen in the bundle as `screenshots/<machine>/<category>-<test>-<name>.png`. | screen |
+| `type = "<text>"` | | Types the text on a US keyboard: `\n` is Enter, and `{password}` types the lab password, which is never shown or kept. A character with no key on a US keyboard is an error when the suite loads. | keys |
+| `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. An error if the screen is smaller. | mouse |
+| `click = "left"` | | Presses a pointer button where the pointer is and lets it go: `left`, `right` or `middle`. | mouse |
+| `screen = "<text>"` | | Waits until the screen shows the text, a string or a list of strings that must all show, each within one row (see [Reading the screen](#reading-the-screen)). | screen |
+| `screen_gone = "<text>"` | | Waits until the screen no longer shows the text. | screen |
+| `screenshot = "<name>"` | | Keeps the screen in the bundle as `screenshots/<machine>/<category>-<test>-<name>.png`, and, when the run has the console's fonts, its text beside it as `.txt`. | screen |
 | `wait = "ready"` | | Waits until the machine has booted, its ready line anywhere in the boot going now (since the last `power = "on"` or `"reset"`, even if a `serial` step found it), and, when it has an SSH channel, SSH answers. Use it after `power = "on"` or `"reset"`, and after a restart from inside, as `reboot`, with a `serial` step for the new boot's ready line first. | |
 | `wait = "off"` | | Waits until the machine turns itself off, as after `poweroff`. Fails if it is still on at the time limit. | power |
 | `wait = "<time>"` | | Waits that long. | |
@@ -85,7 +92,7 @@ Every test also needs `power` and `serial`, for the boot it starts with.
 
 Root never signs in over SSH, and elevate always asks for a password, so
 a `run` or `bench` step with `root = true` runs its command as `elevate -S <command>` and
-gives elevate the lab password on its standard input (ADR 0406 in
+gives elevate the lab password on its standard input (ADR 0408 in
 Dukovo's repository). `dukovo-lab key` makes the password beside the lab
 key, `~/.config/dukovo-lab/lab_password`, and `ob image --lab` puts its
 hash in the image. The password never leaves the lab PC: anything a
@@ -102,6 +109,61 @@ them to a shell: `run = "sh -c 'mkfs-fat /devices/sdb && fsck-fat -n /devices/sd
 run = "service --status-all"
 root = true
 expect = "[ + ]  sshd"
+```
+
+## Reading the screen
+
+`screen` and `screen_gone` read the console's text from a screenshot,
+with no OCR: Dukovo's console says on the serial console where its cells
+are (`consoled: console of 160x50 cells with font 8x16 at (0, 0)`), and
+each cell's lit pixels are looked up in the console's own fonts, which
+`ob lab` passes with `--fonts`. A cell no font draws, such as the
+cursor, reads as `?`. A run without fonts skips tests that read the
+screen and says how to get them.
+
+A step polls the screen twice a second until the text shows, or is gone,
+or the test's time runs out. A failing step shows what the screen held
+then. Text stays on the screen as it scrolls up, so wait for something
+new: to wait for a command's output and not the command line that typed
+it, split a label in two in the command, as
+`type = "echo \"in\"\": $(whoami)\"\n"` then `screen = "in: lab"`.
+
+```toml
+[[step]]
+screen = "Name:"
+[[step]]
+type = "lab\n"
+[[step]]
+screen = "Password:"
+[[step]]
+type = "{password}\n"
+[[step]]
+screen = "lab@dukovo ~ $"
+```
+
+A test that types `{password}` needs the lab password, as a root step
+does (see [Running as root](#running-as-root)).
+
+## Installer tests
+
+A test with `boot = "stick"` starts from the install stick, which `ob
+lab` builds and passes with `--stick`: the machine boots with the stick
+plugged in and first in the boot order, and a blank disk of `disk`'s
+size. The runner waits for nothing, as an installer has no SSH; the
+test's steps drive the installer's screens and check them. `usb =
+"unplug"` pulls the stick, after which the machine boots from the disk.
+The test after it boots afresh from the image under test, as the disk no
+longer holds it. A run without a stick skips these tests and says why.
+
+```toml
+about = "The installer erases a blank disk and installs Dukovo"
+time = "30m"
+boot = "stick"
+
+[[step]]
+screen = ["Step 1 of 5", "How do you want to install?"]
+[[step]]
+keys = ["ret"]
 ```
 
 ## Performance tests
@@ -200,3 +262,5 @@ command, as a broken test file does.
 - Prefer sharing a boot. Use `fresh = true` only when the test changes
   the machine in a way later tests should not inherit, or checks the boot
   itself.
+- A test that signs in at the console signs out at its end, so the next
+  test finds the sign-in as a fresh boot leaves it.

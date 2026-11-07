@@ -77,7 +77,8 @@ Each machine, its file and who does each control. With `--json`:
 
 ```
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
-               [--machine <a,b>] [--build <text>] [--linux <dir>] [--with-person] [--detach]
+               [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
+               [--stick <file>] [--with-person] [--detach]
 ```
 
 Runs the tests on each machine (default `qemu`), the machines side by
@@ -109,6 +110,17 @@ initrd = "linux-bench.cpio"   # beside kit.toml; its first program runs the benc
 cmdline = "console=ttyS0 panic=-1 quiet mitigations=off"
 done = "linux-bench: done"    # what the serial console says once every benchmark has run
 ```
+
+`--fonts` names a folder of PSF fonts (`.psf`, `.psfu`): the console's
+own, which `screen` and `screen_gone` steps read the screen's text with
+(see [test files](test-files.md#reading-the-screen)). `ob lab` passes
+Dukovo's, `kernel/lib/fbcon/fonts`. Without it, tests that read the
+screen are skipped.
+
+`--stick` names the install stick's image, which tests with `boot =
+"stick"` boot from (see [test files](test-files.md#installer-tests)).
+`ob lab` builds it beside the lab image and passes it. Without it, those
+tests are skipped.
 
 Without `--json` it prints a line as each test starts and ends. With
 `--json` it prints one JSON object per line as things happen, each with
@@ -315,7 +327,8 @@ and with the runner page closed. See [Schedules](schedules.md).
 ## ui
 
 ```
-dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--port <n>] [--no-open]
+dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--fonts <dir>]
+              [--stick <file>] [--port <n>] [--no-open]
 ```
 
 Serves the runner page to a browser on this PC, at
@@ -324,8 +337,8 @@ when there is a desktop (not with `--no-open`). It prints the address to
 open, which carries a key made anew each time; without it the page does
 not open. Ctrl+C closes the page; runs started from it carry on. Without
 `--image` the page shows tests and runs but cannot start runs; `ob lab
-ui` gives the image. Runs started from the page get `--linux` when it
-was given. See [the runner page](runner-page.md).
+ui` gives the image. Runs started from the page get `--linux`,
+`--fonts` and `--stick` when they were given. See [the runner page](runner-page.md).
 
 ## key
 
@@ -364,7 +377,7 @@ run.json                  what ran: build, image, machines, tests, preset, start
 results.json              each test's result on each machine, step by step
 events.jsonl              what happened as it happened: run's JSON lines, every one
 logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.log
-screenshots/<machine>/    <category>-<test>-<name>.png
+screenshots/<machine>/    <category>-<test>-<name>.png, and .txt: the screen's text, with --fonts
 ```
 
 A run a schedule started names it in run.json (`schedule`). Once a run
@@ -392,6 +405,9 @@ JSON. Times are UTC, in RFC 3339.
 | Performance tests are skipped saying the run was given no Linux kit | `ob lab` builds the kit before the run and prints `note: performance tests will skip: ...` when it cannot, with the reason: usually no network to fetch the Linux kernel, or `dpkg-deb` or `depmod` missing. |
 | A bench step is skipped saying QEMU's emulator made the numbers | The machine has no KVM. The step still keeps both tables in its note; give the PC KVM (`/dev/kvm`) for numbers worth holding to Linux's. |
 | A bench step fails "slower than Linux" | A finding: the rows marked `over` take more than `limit` times Linux's time. The note has both tables; `logs/<machine>/linux-boot-<n>.log` has Linux's run. Run again to rule out a busy PC before sending it. |
+| Tests that read the screen are skipped saying the run was given no console fonts | Give `--fonts` with Dukovo's `kernel/lib/fbcon/fonts`; `ob lab` does. |
+| A `screen` step fails though the text is plainly on the screenshot | The step reads cells, each within one row: text that wraps past the row's end, or a word the cursor sits on, does not match. The `.txt` beside the screenshot shows what was read. A screen of `?` means the fonts are not the console's: rebuild with the same checkout as the image. |
+| Installer tests are skipped saying the run was given no stick | Give `--stick` with the install stick's image (`ob image` builds it as `out/dukovo-<version>-x86_64.img`); `ob lab` builds and passes it. |
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |
 | `status` says a run `died` | Its process ended part way (killed, crashed, or the PC went down). `results` has what it finished; a detached run's own last messages are in `status`'s `output`. |
 | `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |

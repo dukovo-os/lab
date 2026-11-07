@@ -42,10 +42,11 @@ use crate::driver::{Driver, Setup};
 use crate::findings;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
+use crate::screen::{self, Font};
 use crate::ssh;
 use crate::stop::Stop;
 use crate::store::Running;
-use crate::suite::{Bench, Command, Fit, PowerAction, Step, Test};
+use crate::suite::{Bench, Boot, Command, Fit, PASSWORD_TOKEN, PowerAction, Step, Test};
 use crate::units::format_duration;
 
 /// What a stopped test's result says.
@@ -56,6 +57,12 @@ pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no passwo
 
 /// Why a `bench` step cannot run.
 pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given no Linux kit: `ob lab` builds one and passes it with --linux";
+
+/// Why a step that reads the screen's text is skipped.
+pub const NO_FONTS: &str = "this step reads the screen, and the run was given no console fonts: `ob lab` passes Dukovo's with --fonts";
+
+/// Why a test that boots the install stick is skipped.
+pub const NO_STICK: &str = "this test boots the install stick, and the run was given none: `ob lab` builds one and passes it with --stick";
 
 /// Why a `bench` step's numbers are kept but not held to Linux's.
 pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers (no KVM), so they are kept but not held to Linux's";
@@ -79,6 +86,10 @@ pub struct Request<'a> {
     pub with_person: bool,
     /// The Linux that performance tests hold Dukovo to, when given.
     pub linux: Option<Kit>,
+    /// The console's fonts, for steps that read the screen, when given.
+    pub fonts: Option<Vec<Font>>,
+    /// The install stick's image, for tests that boot it, when given.
+    pub stick: Option<PathBuf>,
     /// The preset the tests came from, for run.json.
     pub preset: Option<String>,
     /// The schedule that started the run, for run.json.
@@ -106,6 +117,10 @@ struct Shared<'a> {
     /// Held while a machine measures performance, so that machines run
     /// side by side never time each other's load.
     measuring: &'a Mutex<()>,
+    fonts: Option<&'a [Font]>,
+    /// The install stick, given a second name in the work folder as the
+    /// image is.
+    stick: Option<&'a Path>,
 }
 
 /// Starts a machine's driver; [`crate::driver::start`] outside tests.
@@ -159,7 +174,8 @@ pub fn run(
     });
 
     let work = request.store.join("work").join(&id);
-    let image = pin_image(&request.image, &work);
+    let image = pin_image(&request.image, &work, "under-test");
+    let stick = request.stick.as_ref().map(|stick| pin_image(stick, &work, "install-stick"));
     let sockets = socket_folder(&id);
     let stop = Stop::default();
     let finished = AtomicBool::new(false);
@@ -174,6 +190,8 @@ pub fn run(
         password: request.password.as_deref(),
         linux: request.linux.as_ref(),
         measuring: &measuring,
+        fonts: request.fonts.as_deref(),
+        stick: stick.as_deref(),
     };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
         // Ends the watcher below however this ends, a worker's panic too,
@@ -251,8 +269,9 @@ impl Drop for SetOnDrop<'_> {
     }
 }
 
-/// Keeps the image under test the same for the whole run: a second name
-/// for it in the run's work folder, which every boot then uses.
+/// Keeps the image under test (or the install stick) the same for the
+/// whole run: a second name for it, `name` and its extension, in the run's
+/// work folder, which every boot then uses.
 ///
 /// `ob image` makes a new file where the image was rather than writing
 /// over it, so a build started while this run goes (another `ob lab run`,
@@ -260,12 +279,12 @@ impl Drop for SetOnDrop<'_> {
 /// one test's boot and the next. When the store is on another file system
 /// than the image, there can be no second name, and the run uses the
 /// image where it is.
-fn pin_image(image: &Path, work: &Path) -> PathBuf {
+fn pin_image(image: &Path, work: &Path, name: &str) -> PathBuf {
     let Ok(real) = fs::canonicalize(image) else { return image.to_path_buf() };
     // A dot, so no machine's folder beside it can have its name; the
     // extension stays, as it says the image's format.
     let qcow2 = real.extension().is_some_and(|ext| ext == "qcow2");
-    let pinned = work.join(if qcow2 { "under-test.qcow2" } else { "under-test.img" });
+    let pinned = work.join(format!("{name}.{}", if qcow2 { "qcow2" } else { "img" }));
     match fs::create_dir_all(work).and_then(|()| fs::hard_link(&real, &pinned)) {
         Ok(()) => pinned,
         Err(_) => image.to_path_buf(),
@@ -286,8 +305,9 @@ fn run_machine(
     start: &StartDriver,
 ) -> Vec<ResultRecord> {
     let has_key = setup.key.is_some();
+    let screen_file = setup.work.join("screen.ppm");
     let (mut worker, broken) = match start(machine, setup) {
-        Ok(driver) => (Some(Worker::new(machine, driver, has_key, shared)), None),
+        Ok(driver) => (Some(Worker::new(machine, driver, has_key, shared, screen_file)), None),
         Err(err) => (None, Some(format!("the {} machine did not start: {err}", machine.name))),
     };
     let mut results = Vec::new();
@@ -376,6 +396,8 @@ struct Worker<'a> {
     /// Linux's numbers, from the machine's Linux twin, once measured: once
     /// a run is enough, as nothing about Linux changes between tests.
     linux: Option<BTreeMap<String, f64>>,
+    /// Where the screen is saved to read its text, in the work folder.
+    screen_file: PathBuf,
 }
 
 impl<'a> Worker<'a> {
@@ -384,6 +406,7 @@ impl<'a> Worker<'a> {
         driver: Box<dyn Driver>,
         has_key: bool,
         shared: &'a Shared<'a>,
+        screen_file: PathBuf,
     ) -> Self {
         Worker {
             machine,
@@ -396,6 +419,7 @@ impl<'a> Worker<'a> {
             log: Vec::new(),
             screenshots: Vec::new(),
             linux: None,
+            screen_file,
         }
     }
 
@@ -411,7 +435,14 @@ impl<'a> Worker<'a> {
         let mut steps = Vec::new();
 
         let mut failure = None;
-        if test.fresh || !self.reusable || !self.driver.is_on() {
+        if let Boot::Stick { disk } = test.boot {
+            let (record, outcome) =
+                self.timed(test, "boot from the install stick, with a blank disk", |worker| {
+                    worker.boot_stick(disk)
+                });
+            steps.push(record);
+            failure = outcome.err();
+        } else if test.fresh || !self.reusable || !self.driver.is_on() {
             let (record, outcome) =
                 self.timed(test, "boot afresh and wait until booted", |worker| {
                     worker.boot_fresh(deadline)
@@ -455,7 +486,9 @@ impl<'a> Worker<'a> {
         if matches!(result, Outcome::Fail | Outcome::Error) {
             self.screenshot_after_failure(test);
         }
-        self.reusable = result == Outcome::Pass && self.driver.is_on();
+        // After the installer, the disk no longer holds the image under
+        // test, so the next test boots afresh.
+        self.reusable = result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image;
         let log = self.write_log(test, result, reason.as_deref());
         let milliseconds = started.elapsed().as_millis() as u64;
         let boot = (self.boot > 0).then_some(self.boot);
@@ -554,6 +587,23 @@ impl<'a> Worker<'a> {
         Ok(note)
     }
 
+    /// Boots the install stick with a blank disk, and waits for nothing:
+    /// the test's steps follow the stick's boot.
+    fn boot_stick(&mut self, disk: u64) -> Result<Option<String>, StepFailure> {
+        let Some(stick) = self.shared.stick else {
+            return Err(StepFailure::Skip(NO_STICK.into()));
+        };
+        self.driver.boot_stick(stick, disk).map_err(StepFailure::Error)?;
+        self.boot += 1;
+        self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
+        self.log.push(format!(
+            "Boot {}: from the install stick; serial log {}",
+            self.boot,
+            self.relative_serial()
+        ));
+        Ok(None)
+    }
+
     fn relative_serial(&self) -> String {
         self.shared.bundle.relative(self.driver.serial_log())
     }
@@ -614,6 +664,15 @@ impl<'a> Worker<'a> {
             Step::Keys(keys) => {
                 self.driver.press_keys(keys).map(|()| None).map_err(StepFailure::Error)
             }
+            Step::Type(text) => self.type_text(text),
+            Step::Point { x, y } => {
+                self.driver.point(*x, *y).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::Click(button) => {
+                self.driver.click(*button).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::Screen(texts) => self.wait_screen(texts, true, deadline),
+            Step::ScreenGone(text) => self.wait_screen(std::slice::from_ref(text), false, deadline),
             Step::Screenshot(name) => {
                 self.screenshot(test, name).map(|()| None).map_err(StepFailure::Error)
             }
@@ -918,7 +977,104 @@ impl<'a> Worker<'a> {
         let path = folder.join(format!("{}-{name}.png", test.id.replace('/', "-")));
         self.driver.screenshot(&path)?;
         self.screenshots.push(self.shared.bundle.relative(&path));
+        // Its text beside it, when it can be read, for findings and for
+        // agents, which read text better than pictures.
+        if self.shared.fonts.is_some()
+            && let Ok(screen) = self.read_screen()
+        {
+            let _ = fs::write(path.with_extension("txt"), screen::as_text(&screen));
+        }
         Ok(())
+    }
+
+    /// Types `text`, with the lab password where it says so.
+    fn type_text(&mut self, text: &str) -> Result<Option<String>, StepFailure> {
+        let text = if text.contains(PASSWORD_TOKEN) {
+            // The run refuses a test that types the password when there is
+            // none, before it starts.
+            let password =
+                self.shared.password.ok_or_else(|| StepFailure::Error(NO_PASSWORD.into()))?;
+            text.replace(PASSWORD_TOKEN, password)
+        } else {
+            text.to_string()
+        };
+        let combos = screen::key_combos(&text).map_err(StepFailure::Error)?;
+        self.driver.press_keys(&combos).map(|()| None).map_err(StepFailure::Error)
+    }
+
+    /// The text on the machine's screen now, a string a row.
+    fn read_screen(&mut self) -> Result<Vec<String>, String> {
+        let fonts = self.shared.fonts.ok_or(NO_FONTS)?;
+        // Where the cells are, as this boot said last; as the log said
+        // last, if this boot has not said yet.
+        let geometry = screen::Geometry::from_log(self.serial.this_boot())
+            .or_else(|| screen::Geometry::from_log(self.serial.whole()))
+            .ok_or("the serial console has not said where the console's cells are (\"console of ... cells with font ...\")")?;
+        if let Some(folder) = self.screen_file.parent() {
+            fs::create_dir_all(folder)
+                .map_err(|err| format!("making {}: {err}", folder.display()))?;
+        }
+        self.driver.screen_dump(&self.screen_file)?;
+        let bytes = fs::read(&self.screen_file)
+            .map_err(|err| format!("reading the screen {}: {err}", self.screen_file.display()))?;
+        screen::read_text(&screen::Image::parse_ppm(&bytes)?, geometry, fonts)
+    }
+
+    /// Waits until the screen shows every one of `texts` (`shown`), or no
+    /// longer shows the one text (not `shown`). The serial console is
+    /// faster than drawing, the more so under the emulator, so it looks
+    /// again until the time limit.
+    fn wait_screen(
+        &mut self,
+        texts: &[String],
+        shown: bool,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        if self.shared.fonts.is_none() {
+            return Err(StepFailure::Skip(NO_FONTS.into()));
+        }
+        let last = loop {
+            if !self.driver.is_on() {
+                return Err(StepFailure::Fail(
+                    "the machine turned off while the step watched its screen".into(),
+                ));
+            }
+            let read = self.read_screen();
+            if let Ok(screen) = &read
+                && screen::shows(screen, texts) == shown
+            {
+                return Ok(Some(screen::as_text(screen)));
+            }
+            if Instant::now() >= deadline {
+                break read;
+            }
+            if self.shared.stop.requested() {
+                return Err(StepFailure::Skip(STOPPED_DURING.into()));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        match last {
+            // The first line names only the text, so the same miss is one
+            // finding however the rest of the screen looked.
+            Ok(screen) if shown => {
+                let missing: Vec<String> = texts
+                    .iter()
+                    .filter(|text| !screen::shows(&screen, std::slice::from_ref(*text)))
+                    .map(|text| format!("\"{text}\""))
+                    .collect();
+                Err(StepFailure::Fail(format!(
+                    "the screen did not show {}; it showed:\n{}",
+                    missing.join(", "),
+                    screen::as_text(&screen)
+                )))
+            }
+            Ok(screen) => Err(StepFailure::Fail(format!(
+                "the screen still showed \"{}\":\n{}",
+                texts[0],
+                screen::as_text(&screen)
+            ))),
+            Err(why) => Err(StepFailure::Error(format!("could not read the screen: {why}"))),
+        }
     }
 
     /// Keeps the screen as a failure left it, when the machine can show it.
@@ -1039,6 +1195,18 @@ impl SerialWatch {
     fn rewind(&mut self) {
         self.cursor = 0;
         self.boot = 0;
+    }
+
+    /// The log's text from the start of the boot going now.
+    fn this_boot(&mut self) -> &str {
+        self.refresh();
+        self.text.get(self.boot..).unwrap_or_default()
+    }
+
+    /// The log's whole text, every boot of this log.
+    fn whole(&mut self) -> &str {
+        self.refresh();
+        &self.text
     }
 
     /// Whether `needle` has appeared anywhere in the boot going now. It
@@ -1206,7 +1374,7 @@ mod tests {
     fn a_new_build_does_not_change_a_run_s_image() {
         let dir = crate::testing::TempDir::new("pin-image");
         let image = dir.write("out/dukovo-lab.img", "build one");
-        let pinned = pin_image(&image, &dir.path().join("work/run"));
+        let pinned = pin_image(&image, &dir.path().join("work/run"), "under-test");
         assert_ne!(pinned, image);
         // `ob image` makes a new file where the old one was.
         fs::remove_file(&image).unwrap();
@@ -1216,6 +1384,6 @@ mod tests {
         // No image there: the run uses the path it was given, and fails
         // on it as before.
         let missing = dir.path().join("none.img");
-        assert_eq!(pin_image(&missing, &dir.path().join("work/other")), missing);
+        assert_eq!(pin_image(&missing, &dir.path().join("work/other"), "under-test"), missing);
     }
 }

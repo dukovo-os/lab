@@ -69,7 +69,8 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
 - **Run tests singly, by category or on a schedule**, on one machine or
   several at once: boot and install, drivers, features, performance
   against Linux on the same machine, stress and soak, security, and the
-  screen.
+  screen: keys typed, the pointer moved and clicked, and the console's
+  text read from screenshots, from sign-in to the installer's screens.
 - **Drive each machine through one interface**: QEMU first, then real
   machines through net boot and Intel AMT (power, boot choice,
   Serial-over-LAN and the remote screen). A test proven on QEMU runs

@@ -23,6 +23,7 @@ mod output;
 mod qmp;
 mod run;
 mod schedule;
+mod screen;
 mod send;
 mod ssh;
 mod status;
@@ -99,6 +100,10 @@ Options for run:
   --image <file>   The image under test (from `ob image --lab`)
   --linux <dir>    The Linux kit performance tests hold Dukovo to (`ob lab`
                    builds it in out/lab-linux)
+  --fonts <dir>    The console's PSF fonts, for steps that read the screen
+                   (`ob lab` gives Dukovo's)
+  --stick <file>   The install stick's image, for tests that boot it (`ob
+                   lab` builds it with `ob image`)
   --machine <a,b>  The machines to run on (default: qemu)
   --build <text>   The build's name for the bundle, such as \"0.13.0 fd2a9e8\"
   --all            Every test
@@ -164,6 +169,10 @@ struct Arguments {
     image: Option<PathBuf>,
     /// The Linux kit performance tests hold Dukovo to.
     linux: Option<PathBuf>,
+    /// The console's fonts, for reading the screen.
+    fonts: Option<PathBuf>,
+    /// The install stick's image.
+    stick: Option<PathBuf>,
     machine: Option<String>,
     build: Option<String>,
     preset: Option<String>,
@@ -236,6 +245,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--store" => arguments.store = Some(value("--store")?.into()),
             "--image" => arguments.image = Some(value("--image")?.into()),
             "--linux" => arguments.linux = Some(value("--linux")?.into()),
+            "--fonts" => arguments.fonts = Some(value("--fonts")?.into()),
+            "--stick" => arguments.stick = Some(value("--stick")?.into()),
             "--machine" => arguments.machine = Some(value("--machine")?),
             "--build" => arguments.build = Some(value("--build")?),
             "--preset" => arguments.preset = Some(value("--preset")?),
@@ -377,6 +388,10 @@ fn test_json(test: &Test, machines: &[&Machine]) -> Value {
         "about": test.about,
         "time": units::format_duration(test.time),
         "fresh": test.fresh,
+        "boot": match test.boot {
+            suite::Boot::Image => "image",
+            suite::Boot::Stick { .. } => "stick",
+        },
         "file": test.file,
         "controls": test.controls(),
         "machines": fits_json(test, machines),
@@ -558,13 +573,24 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     let password =
         ssh::read_password(&ssh::password_path(&arguments.config_dir()?)).map_err(Error::Usage)?;
     if password.is_none() {
-        refuse_root_without_password(&picked)?;
+        refuse_password_without_one(&picked)?;
     }
     // Without a kit, performance tests skip, saying how to get one.
     let linux = match &arguments.linux {
         Some(dir) => Some(bench::Kit::read(dir).map_err(Error::Usage)?),
         None => None,
     };
+    // Without fonts, steps that read the screen skip; without a stick,
+    // tests that boot it skip; each says how to get one.
+    let fonts = match &arguments.fonts {
+        Some(dir) => Some(screen::Font::read_dir(dir).map_err(Error::Usage)?),
+        None => None,
+    };
+    if let Some(stick) = &arguments.stick
+        && !stick.is_file()
+    {
+        return Err(Error::Usage(format!("the install stick {} does not exist", stick.display())));
+    }
     let store = arguments.store_dir()?;
     if arguments.detach {
         return detach(arguments, &store, &machines);
@@ -584,6 +610,8 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         password,
         with_person: arguments.with_person,
         linux,
+        fonts,
+        stick: arguments.stick.clone(),
         preset: arguments.preset.clone(),
         schedule: arguments.schedule.clone(),
         id: arguments.run_id.clone(),
@@ -621,15 +649,10 @@ fn refuse_commands_without_key(
     }
 }
 
-/// Stops a run before it starts when a test would run a command as root
-/// and the lab has no password for `elevate`.
-fn refuse_root_without_password(tests: &[&Test]) -> Result<(), Error> {
-    let root = |step: &Step| match step {
-        Step::Run(command) => command.root,
-        Step::Bench(bench) => bench.root,
-        _ => false,
-    };
-    match tests.iter().find(|test| test.steps.iter().any(root)) {
+/// Stops a run before it starts when a test would run a command as root,
+/// or type the lab password, and the lab has none.
+fn refuse_password_without_one(tests: &[&Test]) -> Result<(), Error> {
+    match tests.iter().find(|test| test.uses_password()) {
         Some(test) => Err(Error::Usage(format!("{}: {}", test.id, run::NO_PASSWORD))),
         None => Ok(()),
     }

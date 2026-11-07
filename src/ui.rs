@@ -85,6 +85,10 @@ struct Page {
     build: Option<String>,
     /// The Linux kit runs from the page hold Dukovo to, when given.
     linux: Option<PathBuf>,
+    /// The console's fonts and the install stick runs from the page use,
+    /// when given.
+    fonts: Option<PathBuf>,
+    stick: Option<PathBuf>,
     /// When the image was made, as the page opened: a later one is a new
     /// build, which `build` no longer names.
     image_made: Option<SystemTime>,
@@ -128,6 +132,23 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         }
         None => None,
     };
+    let fonts = match &arguments.fonts {
+        Some(dir) => {
+            crate::screen::Font::read_dir(dir).map_err(Error::Usage)?;
+            Some(absolute(dir.clone())?)
+        }
+        None => None,
+    };
+    let stick = match &arguments.stick {
+        Some(stick) if !stick.is_file() => {
+            return Err(Error::Usage(format!(
+                "the install stick {} does not exist",
+                stick.display()
+            )));
+        }
+        Some(stick) => Some(absolute(stick.clone())?),
+        None => None,
+    };
     let port = arguments.port.unwrap_or(DEFAULT_PORT);
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|err| {
         Error::Usage(format!(
@@ -147,6 +168,8 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         image,
         build: arguments.build.clone(),
         linux,
+        fonts,
+        stick,
     });
     let address = format!("http://127.0.0.1:{port}/?key={}", page.key);
     if arguments.json {
@@ -352,6 +375,12 @@ impl Page {
         args.extend(["--image".into(), image.display().to_string()]);
         if let Some(linux) = &self.linux {
             args.extend(["--linux".into(), linux.display().to_string()]);
+        }
+        if let Some(fonts) = &self.fonts {
+            args.extend(["--fonts".into(), fonts.display().to_string()]);
+        }
+        if let Some(stick) = &self.stick {
+            args.extend(["--stick".into(), stick.display().to_string()]);
         }
         if let Some(build) = &self.build {
             args.extend(["--build".into(), build.clone()]);
@@ -603,6 +632,8 @@ mod tests {
             image: None,
             build: None,
             linux: None,
+            fonts: None,
+            stick: None,
             image_made: None,
         }
     }
