@@ -232,7 +232,7 @@ impl Driver for FakeMachine {
             "false" => (Some(1), String::new()),
             // Giving the machine its address on the private network, as
             // root, when an attack test sets the attacker up.
-            cmd if cmd.starts_with("elevate -S ip address add") => match input {
+            cmd if cmd.contains("ip address add") => match input {
                 Some("sesame\n") => (Some(0), String::new()),
                 _ => (Some(1), "elevate: a password is needed\n".into()),
             },
@@ -270,7 +270,7 @@ impl Driver for FakeMachine {
         }
         let (status, text) = match command {
             // The attacker's own address on the private network, as root.
-            cmd if cmd.starts_with("elevate -S ip address add") => match input {
+            cmd if cmd.contains("ip address add") => match input {
                 Some("sesame\n") => (Some(0), String::new()),
                 _ => (Some(1), "elevate: a password is needed\n".into()),
             },
