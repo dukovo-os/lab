@@ -16,6 +16,7 @@ pub mod qemu;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::bench::Kit;
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
@@ -67,6 +68,19 @@ pub trait Driver: Send {
 
     /// How many times longer than on real hardware tests may take here.
     fn slowdown(&self) -> u32;
+
+    /// Boots Linux from `kit` on a machine set up as this one is, and
+    /// returns what it printed on its serial console, which is also kept
+    /// in `log`, once it printed the kit's done line. The machine under
+    /// test does nothing meanwhile, so the two never share the CPUs. Fails
+    /// when Linux ends without the done line, at `deadline`, or when the
+    /// run is stopped.
+    fn linux_twin(&mut self, kit: &Kit, log: &Path, deadline: Instant) -> Result<String, String>;
+
+    /// Whether numbers measured here measure an emulator rather than the
+    /// machine: QEMU without KVM. Performance tests are not held to
+    /// Linux's there.
+    fn emulated(&self) -> bool;
 
     /// Turns the machine off at once and lets go of what it holds. The
     /// runner calls it when the run ends, also on failure.

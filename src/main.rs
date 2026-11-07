@@ -12,6 +12,7 @@
 //! [`HELP`]), so scripts and agents drive it as a person does; the runner
 //! page itself works by running these commands. docs/ holds the manual.
 
+mod bench;
 mod bundle;
 mod clock;
 mod driver;
@@ -96,6 +97,8 @@ Options:
 
 Options for run:
   --image <file>   The image under test (from `ob image --lab`)
+  --linux <dir>    The Linux kit performance tests hold Dukovo to (`ob lab`
+                   builds it in out/lab-linux)
   --machine <a,b>  The machines to run on (default: qemu)
   --build <text>   The build's name for the bundle, such as \"0.13.0 fd2a9e8\"
   --all            Every test
@@ -159,6 +162,8 @@ struct Arguments {
     config: Option<PathBuf>,
     store: Option<PathBuf>,
     image: Option<PathBuf>,
+    /// The Linux kit performance tests hold Dukovo to.
+    linux: Option<PathBuf>,
     machine: Option<String>,
     build: Option<String>,
     preset: Option<String>,
@@ -230,6 +235,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--config" => arguments.config = Some(value("--config")?.into()),
             "--store" => arguments.store = Some(value("--store")?.into()),
             "--image" => arguments.image = Some(value("--image")?.into()),
+            "--linux" => arguments.linux = Some(value("--linux")?.into()),
             "--machine" => arguments.machine = Some(value("--machine")?),
             "--build" => arguments.build = Some(value("--build")?),
             "--preset" => arguments.preset = Some(value("--preset")?),
@@ -554,6 +560,11 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     if password.is_none() {
         refuse_root_without_password(&picked)?;
     }
+    // Without a kit, performance tests skip, saying how to get one.
+    let linux = match &arguments.linux {
+        Some(dir) => Some(bench::Kit::read(dir).map_err(Error::Usage)?),
+        None => None,
+    };
     let store = arguments.store_dir()?;
     if arguments.detach {
         return detach(arguments, &store, &machines);
@@ -572,6 +583,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         key,
         password,
         with_person: arguments.with_person,
+        linux,
         preset: arguments.preset.clone(),
         schedule: arguments.schedule.clone(),
         id: arguments.run_id.clone(),
@@ -593,7 +605,7 @@ fn refuse_commands_without_key(
     with_person: bool,
 ) -> Result<(), Error> {
     let needs_key = tests.iter().find(|test| {
-        test.steps.iter().any(|step| matches!(step, Step::Run(_)))
+        test.steps.iter().any(|step| matches!(step, Step::Run(_) | Step::Bench(_)))
             && machines.iter().any(|machine| match test.fit(machine) {
                 Fit::Runs => true,
                 Fit::NeedsPerson(_) => with_person,
@@ -612,7 +624,11 @@ fn refuse_commands_without_key(
 /// Stops a run before it starts when a test would run a command as root
 /// and the lab has no password for `elevate`.
 fn refuse_root_without_password(tests: &[&Test]) -> Result<(), Error> {
-    let root = |step: &Step| matches!(step, Step::Run(command) if command.root);
+    let root = |step: &Step| match step {
+        Step::Run(command) => command.root,
+        Step::Bench(bench) => bench.root,
+        _ => false,
+    };
     match tests.iter().find(|test| test.steps.iter().any(root)) {
         Some(test) => Err(Error::Usage(format!("{}: {}", test.id, run::NO_PASSWORD))),
         None => Ok(()),

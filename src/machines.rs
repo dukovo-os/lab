@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-/// A way the harness acts on a machine. Every test step uses at most one.
+/// A way the harness acts on a machine. A test step uses at most one,
+/// except a bench step, which runs its program over SSH and boots Linux.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Control {
@@ -42,11 +43,14 @@ pub enum Control {
     Screen,
     /// Running commands over SSH as the lab account.
     Ssh,
+    /// Booting Linux on the machine, or on one set up the same way, to
+    /// measure what performance tests hold Dukovo to.
+    Linux,
 }
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 8] = [
+    pub const ALL: [Control; 9] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -55,6 +59,7 @@ impl Control {
         Control::Keys,
         Control::Screen,
         Control::Ssh,
+        Control::Linux,
     ];
 
     /// Its name in machine files and output.
@@ -68,6 +73,7 @@ impl Control {
             Control::Keys => "keys",
             Control::Screen => "screen",
             Control::Ssh => "ssh",
+            Control::Linux => "linux",
         }
     }
 }
@@ -296,6 +302,13 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         if who == Who::Driver && controls.get(&control) != Some(&Who::Driver) {
             return Err(bad(format!("the {:?} driver cannot do {control}", file.driver)));
         }
+        // A person can pull a cord but cannot hand the runner Linux's
+        // numbers, so booting the Linux twin is the driver's or no one's.
+        if control == Control::Linux && who == Who::Person {
+            return Err(bad(
+                "linux is \"driver\" or \"none\": a person cannot measure Linux".into()
+            ));
+        }
         controls.insert(control, who);
     }
     let qemu = match file.driver {
@@ -408,6 +421,11 @@ mod tests {
                 "d.toml",
                 "about = \"x\"\ndriver = \"qemu\"\n[controls]\nsmell = \"driver\"\n",
                 "smell",
+            ),
+            (
+                "e.toml",
+                "about = \"x\"\ndriver = \"qemu\"\n[controls]\nlinux = \"person\"\n",
+                "a person cannot measure Linux",
             ),
         ] {
             let dir = TempDir::new("machines-bad");

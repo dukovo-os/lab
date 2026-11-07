@@ -122,7 +122,7 @@ pub fn load_categories(dir: &Path) -> Result<Vec<Category>, Error> {
 const LONGEST_TEST: Duration = Duration::from_secs(24 * 3600);
 
 /// One test.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Test {
     /// `<category>/<name>`.
     pub id: String,
@@ -138,7 +138,7 @@ pub struct Test {
 }
 
 /// One step of a test.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Step {
     /// Runs a command over SSH and checks what it did.
     Run(Command),
@@ -161,7 +161,26 @@ pub enum Step {
     WaitOff,
     /// Waits this long.
     Sleep(Duration),
+    /// Runs a benchmark program and holds its rows to Linux's.
+    Bench(Bench),
 }
+
+/// What a `bench` step measures, and the bar it holds it to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bench {
+    /// The benchmark program, run over SSH as a `run` step's command is.
+    pub command: String,
+    /// Run as root, through elevate with the lab password.
+    pub root: bool,
+    /// The rows of its output to hold to Linux's.
+    pub rows: Vec<String>,
+    /// The most each row may take, as a share of Linux's time.
+    pub limit: f64,
+}
+
+/// The bar a row is held to unless its step says: parity with Linux, as
+/// `ob bench` holds every row.
+pub const DEFAULT_LIMIT: f64 = 1.00;
 
 /// What a plugged-in USB stick holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +235,8 @@ impl Step {
             Step::Keys(_) => Some(Control::Keys),
             Step::Screenshot(_) => Some(Control::Screen),
             Step::WaitReady | Step::Sleep(_) => None,
+            // It also runs over SSH: see `Test::controls`.
+            Step::Bench(_) => Some(Control::Linux),
         }
     }
 
@@ -246,6 +267,15 @@ impl Step {
             Step::WaitReady => "wait until booted".into(),
             Step::WaitOff => "wait until it turns itself off".into(),
             Step::Sleep(time) => format!("wait {}", format_duration(*time)),
+            Step::Bench(bench) => {
+                let who = if bench.root { " as root" } else { "" };
+                format!(
+                    "measure `{}`{who} against Linux: {} at most {:.2} of Linux's time",
+                    bench.command,
+                    bench.rows.join(", "),
+                    bench.limit
+                )
+            }
         }
     }
 }
@@ -267,6 +297,10 @@ impl Test {
     /// the boot every test starts with.
     pub fn controls(&self) -> BTreeSet<Control> {
         let mut controls: BTreeSet<Control> = self.steps.iter().filter_map(Step::control).collect();
+        // A bench step runs its program over SSH as well as booting Linux.
+        if self.steps.iter().any(|step| matches!(step, Step::Bench(_))) {
+            controls.insert(Control::Ssh);
+        }
         controls.insert(Control::Power);
         controls.insert(Control::Serial);
         controls
@@ -345,6 +379,9 @@ struct StepFile {
     keys: Option<Vec<String>>,
     screenshot: Option<String>,
     wait: Option<String>,
+    bench: Option<String>,
+    rows: Option<Vec<String>>,
+    limit: Option<f64>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -472,12 +509,13 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("keys", step.keys.is_some()),
         ("screenshot", step.screenshot.is_some()),
         ("wait", step.wait.is_some()),
+        ("bench", step.bench.is_some()),
     ];
     let given: Vec<&str> = actions.iter().filter(|(_, set)| *set).map(|(key, _)| *key).collect();
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, serial, power, link, usb, keys, screenshot or wait"
+                "no action: give one of run, serial, power, link, usb, keys, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -494,7 +532,11 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     only_with("exit", step.exit.is_some(), "run")?;
     only_with("expect", step.expect.is_some(), "run")?;
     only_with("expect_not", step.expect_not.is_some(), "run")?;
-    only_with("root", step.root.is_some(), "run")?;
+    if step.root.is_some() && !matches!(given[0], "run" | "bench") {
+        return Err("root goes only with run or bench".into());
+    }
+    only_with("rows", step.rows.is_some(), "bench")?;
+    only_with("limit", step.limit.is_some(), "bench")?;
     only_with("image", step.image.is_some(), "usb")?;
     only_with("blank", step.blank.is_some(), "usb")?;
 
@@ -509,6 +551,9 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             expect_not: step.expect_not.map(OneOrMore::into_vec).unwrap_or_default(),
             root: step.root.unwrap_or(false),
         }));
+    }
+    if let Some(command) = step.bench {
+        return parse_bench(command, step.root, step.rows, step.limit);
     }
     if let Some(text) = step.serial {
         if text.is_empty() {
@@ -549,6 +594,40 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     parse_duration(&wait)
         .map(Step::Sleep)
         .map_err(|err| format!("wait is \"ready\", \"off\" or a time: {err}"))
+}
+
+/// The range a `limit` may take: a bar below a tenth of Linux's time, or
+/// above ten times it, is a typing slip rather than a bar.
+const LIMIT_RANGE: std::ops::RangeInclusive<f64> = 0.1..=10.0;
+
+fn parse_bench(
+    command: String,
+    root: Option<bool>,
+    rows: Option<Vec<String>>,
+    limit: Option<f64>,
+) -> Result<Step, String> {
+    if command.trim().is_empty() {
+        return Err("bench needs the benchmark program to run".into());
+    }
+    // The rows are named, so a row the program stops printing fails the
+    // test rather than leaving it.
+    let rows = rows.unwrap_or_default();
+    if rows.is_empty() {
+        return Err("bench needs rows: the names of the rows to hold to Linux's".into());
+    }
+    if let Some(bad) = rows.iter().find(|row| !is_row_name(row)) {
+        return Err(format!("{bad:?} is not a row's name: letters, digits and _"));
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    if !LIMIT_RANGE.contains(&limit) {
+        return Err(format!("limit is a share of Linux's time from 0.1 to 10, not {limit}"));
+    }
+    Ok(Step::Bench(Bench { command, root: root.unwrap_or(false), rows, limit }))
+}
+
+/// A benchmark row's name, as `BENCH name=` prints it.
+fn is_row_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The largest blank stick: enough for any filesystem's smallest size,

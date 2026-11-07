@@ -77,7 +77,7 @@ Each machine, its file and who does each control. With `--json`:
 
 ```
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
-               [--machine <a,b>] [--build <text>] [--with-person] [--detach]
+               [--machine <a,b>] [--build <text>] [--linux <dir>] [--with-person] [--detach]
 ```
 
 Runs the tests on each machine (default `qemu`), the machines side by
@@ -96,6 +96,19 @@ at the machines.
 
 A machine runs one run at a time. When a picked machine is busy with
 another run, `run` exits 4 and runs nothing.
+
+`--linux` names the folder of a Linux kit: `kit.toml` and the kernel and
+initramfs it names, which performance tests' `bench` steps measure
+Dukovo against (see [test files](test-files.md#performance-tests)).
+`ob lab` builds the kit and passes it. Without one, tests with bench
+steps are skipped. A kit's `kit.toml`:
+
+```toml
+kernel = "vmlinuz"            # beside kit.toml
+initrd = "linux-bench.cpio"   # beside kit.toml; its first program runs the benchmarks
+cmdline = "console=ttyS0 panic=-1 quiet mitigations=off"
+done = "linux-bench: done"    # what the serial console says once every benchmark has run
+```
 
 Without `--json` it prints a line as each test starts and ends. With
 `--json` it prints one JSON object per line as things happen, each with
@@ -302,7 +315,7 @@ and with the runner page closed. See [Schedules](schedules.md).
 ## ui
 
 ```
-dukovo-lab ui [--image <file>] [--build <text>] [--port <n>] [--no-open]
+dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--port <n>] [--no-open]
 ```
 
 Serves the runner page to a browser on this PC, at
@@ -311,7 +324,8 @@ when there is a desktop (not with `--no-open`). It prints the address to
 open, which carries a key made anew each time; without it the page does
 not open. Ctrl+C closes the page; runs started from it carry on. Without
 `--image` the page shows tests and runs but cannot start runs; `ob lab
-ui` gives the image. See [the runner page](runner-page.md).
+ui` gives the image. Runs started from the page get `--linux` when it
+was given. See [the runner page](runner-page.md).
 
 ## key
 
@@ -375,6 +389,9 @@ JSON. Times are UTC, in RFC 3339.
 | `run` exits 2 saying a test runs commands and the lab has no key | Run `dukovo-lab key`, then rebuild the image with `ob image --lab`. |
 | `run` exits 2 saying a step runs as root and the lab has no password | The lab key was made before the lab password existed. Run `dukovo-lab key`, which makes the password beside the key, then rebuild the image (`ob lab` does both). |
 | A root step fails with "Sorry, try again." | The image holds another password's hash: it was built before the current `lab_password`, or on another PC. Rebuild it. |
+| Performance tests are skipped saying the run was given no Linux kit | `ob lab` builds the kit before the run and prints `note: performance tests will skip: ...` when it cannot, with the reason: usually no network to fetch the Linux kernel, or `dpkg-deb` or `depmod` missing. |
+| A bench step is skipped saying QEMU's emulator made the numbers | The machine has no KVM. The step still keeps both tables in its note; give the PC KVM (`/dev/kvm`) for numbers worth holding to Linux's. |
+| A bench step fails "slower than Linux" | A finding: the rows marked `over` take more than `limit` times Linux's time. The note has both tables; `logs/<machine>/linux-boot-<n>.log` has Linux's run. Run again to rule out a busy PC before sending it. |
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |
 | `status` says a run `died` | Its process ended part way (killed, crashed, or the PC went down). `results` has what it finished; a detached run's own last messages are in `status`'s `output`. |
 | `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |

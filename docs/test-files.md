@@ -63,6 +63,7 @@ Each step has exactly one action key, and only the options that go with it.
 | Action | Options | Does | Control |
 | --- | --- | --- | --- |
 | `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. | ssh |
+| `bench = "<command>"` | `rows` (required), `limit` (default 1.00), `root` | Runs a benchmark program over SSH and holds each of its `rows` to the same row on the machine's Linux twin: passes when Dukovo takes at most `limit` times Linux's time per operation (see [Performance tests](#performance-tests)). | ssh, linux |
 | `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started; after `power = "on"` or `"reset"`, only what the new boot printed. | serial |
 | `power = "on"` | | Powers the machine on. | power |
 | `power = "off"` | | Presses the power button and waits until the machine is off. Fails if it is still on at the time limit. | power |
@@ -83,7 +84,7 @@ Every test also needs `power` and `serial`, for the boot it starts with.
 ## Running as root
 
 Root never signs in over SSH, and elevate always asks for a password, so
-a step with `root = true` runs its command as `elevate -S <command>` and
+a `run` or `bench` step with `root = true` runs its command as `elevate -S <command>` and
 gives elevate the lab password on its standard input (ADR 0406 in
 Dukovo's repository). `dukovo-lab key` makes the password beside the lab
 key, `~/.config/dukovo-lab/lab_password`, and `ob image --lab` puts its
@@ -102,6 +103,49 @@ run = "service --status-all"
 root = true
 expect = "[ + ]  sshd"
 ```
+
+## Performance tests
+
+A `bench` step measures Dukovo against Linux on the same machine. Its
+command is a benchmark program that prints lines in the format of
+Dukovo's benchmark programs and `ob bench`:
+
+```text
+BENCH name=<row> ns=<nanoseconds per operation> iterations=<count>
+```
+
+Linux's numbers come from the machine's Linux twin: a Linux kernel and
+an initramfs (the Linux kit) booted on a machine set up the same way,
+whose first program runs the same benchmarks built for Linux, prints the
+same lines on the serial console, and then says it is done. `ob lab`
+builds the kit from the Linux kernel `ob bench` holds Dukovo to (ADR
+0290 in Dukovo's repository) and passes `--linux`, so the lab and CI
+measure against the same Linux and the same benchmark code.
+
+```toml
+[[step]]
+bench = "/system/tests/posix/bench"
+rows = ["posix_fork_wait", "posix_fork_exec_wait"]
+```
+
+- Each row passes when Dukovo's time is at most `limit` times Linux's:
+  1.00 by default, parity, the bar every row of `ob bench` is held to.
+  `limit` goes from 0.1 to 10, for a row with a known gap that is being
+  worked on. A row printed more than once keeps its fastest.
+- The twin boots once a run on each machine, the first time a bench step
+  runs there, and its numbers serve every bench step after. The machine
+  under test is paused while the twin runs, so the two never share the
+  host.
+- One machine measures at a time, so machines running side by side do
+  not slow each other's numbers.
+- A failing step names the rows over their limit and shows the table of
+  both systems' times; the Linux boot's console is kept in the bundle as
+  `logs/<machine>/linux-boot-<n>.log`.
+- Numbers from an emulator mean little, so on QEMU without KVM a bench
+  step still runs and keeps both tables, then is skipped rather than
+  passed or failed.
+- A run without a kit (no `--linux`) skips tests with bench steps and
+  says why. Machines with no Linux twin (`linux = "none"`) skip them too.
 
 ## How a test runs
 
