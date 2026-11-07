@@ -17,10 +17,12 @@
 //!   `localhost:<port>`, so a web page elsewhere cannot reach it by
 //!   pointing a name of its own at 127.0.0.1 (DNS rebinding).
 //! - Each start makes a new random key. The address `ui` prints carries
-//!   it once; the page trades it for a cookie only this page receives
-//!   (SameSite=Strict, HttpOnly), and every request needs that cookie. So
-//!   another account on the PC, or a web page in the same browser, gets
-//!   nothing without the printed address.
+//!   it once; the page trades it for a cookie (SameSite=Strict,
+//!   HttpOnly), and every request needs that cookie. So a web page in the
+//!   same browser gets nothing without the printed address. (Opening the
+//!   browser passes it the address as an argument, which other accounts
+//!   on the PC can see while it runs: on a PC with other accounts, use
+//!   `--no-open`; docs/runner-page.md says so.)
 //! - Actions are POSTs that need a header a cross-site form cannot send.
 //! - It serves its own page, the commands' answers, and files inside
 //!   results bundles; nothing else on the PC. The lab key is never in a
@@ -33,6 +35,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{Value, json};
 
@@ -76,6 +79,9 @@ struct Page {
     /// The image under test and its build, which runs from the page use.
     image: Option<PathBuf>,
     build: Option<String>,
+    /// When the image was made, as the page opened: a later one is a new
+    /// build, which `build` no longer names.
+    image_made: Option<SystemTime>,
 }
 
 /// Serves the page until the process is stopped (Ctrl+C). Runs started
@@ -118,6 +124,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         program: std::env::current_exe()
             .map_err(|err| Error::Harness(format!("finding this program: {err}")))?,
         folders,
+        image_made: image.as_deref().and_then(modified),
         store,
         image,
         build: arguments.build.clone(),
@@ -278,6 +285,13 @@ impl Page {
         let Some(image) = &self.image else {
             return bad("the page has no image to test: open it with `ob lab ui`");
         };
+        // Runs say which build they tested; a page left open across a
+        // rebuild would name the old one.
+        if modified(image) != self.image_made {
+            return bad(
+                "the image was rebuilt after this page opened, so the page no longer knows its build: close the page (Ctrl+C) and open it again with `ob lab ui`",
+            );
+        }
         let strings = |field: &str| -> Option<Vec<String>> {
             body[field].as_array().map(|items| {
                 items.iter().filter_map(|item| item.as_str().map(String::from)).collect()
@@ -387,6 +401,11 @@ impl Page {
     }
 }
 
+/// When the file at `path` last changed.
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|metadata| metadata.modified()).ok()
+}
+
 fn bad(why: &str) -> Response {
     Response::json(400, &json!({ "error": why }))
 }
@@ -423,6 +442,7 @@ mod tests {
             store: store.to_path_buf(),
             image: None,
             build: None,
+            image_made: None,
         }
     }
 
@@ -494,6 +514,24 @@ mod tests {
                 .unwrap();
             assert_eq!(fetch(&format!("/files/{id}/logs/link.log")).status, 404);
         }
+    }
+
+    #[test]
+    fn a_rebuilt_image_is_not_run_under_the_old_build_s_name() {
+        let store = TempDir::new("ui-rebuilt");
+        let image = store.write("dukovo-lab.img", "build one");
+        let mut page = page(store.path());
+        page.image = Some(image.clone());
+        page.image_made = modified(&image);
+        let body = json!({ "tests": ["boot/ready"], "machines": ["qemu"] });
+        // As made when the page opened: the run starts (here /bin/false
+        // stands in for dukovo-lab, so the answer is its exit status).
+        assert_eq!(page.start_run(&body).status, 200);
+        // Rebuilt since: refused, with what to do.
+        page.image_made = Some(SystemTime::UNIX_EPOCH);
+        let refused = page.start_run(&body);
+        assert_eq!(refused.status, 400);
+        assert!(String::from_utf8_lossy(&refused.body).contains("open it again with `ob lab ui`"));
     }
 
     #[test]

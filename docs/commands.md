@@ -120,7 +120,13 @@ added, so skip the ones you do not know. The same lines go to
 With `--detach`, `run` checks everything, starts the run in a process of
 its own and returns at once, printing the run's id (with `--json`:
 `{"event":"run-detached","id":"...","bundle":"...","pid":1234}`). The run
-carries on after the terminal closes. Follow it with `status`.
+carries on after the terminal closes. Follow it with `status`. If the run
+fails to start (another run took a machine first, say), `run --detach`
+exits as the run did, with its message.
+
+A run tests one image from its first boot to its last: it gives the
+image a second name in its work folder and boots that, so rebuilding the
+image (another `ob lab run`, say) while it goes does not change it.
 
 ## status
 
@@ -147,8 +153,9 @@ answers. With `--json`:
 
 A test's `state` is `queued`, `running`, or its result. `left_seconds`
 is an estimate from how long the same tests took on the same machines
-before, and is null when any of them has not run there. `output` holds a
-dead detached run's last messages of its own.
+the last time they ran to their end, and is null when any of them has
+not run there. `output` holds a dead detached run's last messages of its
+own.
 
 `status` exits as the run did (0, 1 or 3, and 3 for a run that died),
 or 0 while it is running, so `run --detach` then `status --wait` exits

@@ -554,8 +554,12 @@ fn detach(arguments: &Arguments, store: &Path, machines: &[&Machine]) -> Result<
     }
     let id = bundle::new_run_id(clock::Utc::now());
     let output = store::open_output_log(store, &id)?;
+    let errors = output.try_clone().map_err(|err| Error::Harness(err.to_string()))?;
+    // The same run, named, in plain words: what it says goes to its
+    // output.log, where `status` finds it if the run dies, and where this
+    // process reads why if it fails to start.
     let mut args: Vec<OsString> =
-        std::env::args_os().skip(1).filter(|arg| arg != "--detach").collect();
+        std::env::args_os().skip(1).filter(|arg| arg != "--detach" && arg != "--json").collect();
     args.extend(["--run-id".into(), id.clone().into()]);
     let program = std::env::current_exe()
         .map_err(|err| Error::Harness(format!("finding this program to start the run: {err}")))?;
@@ -564,18 +568,24 @@ fn detach(arguments: &Arguments, store: &Path, machines: &[&Machine]) -> Result<
         Command::new(program)
             .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(output)
+            .stdout(output)
+            .stderr(errors)
             // A process group of its own, so the terminal's Ctrl+C and
             // hang-up do not reach it.
             .process_group(0)
             .spawn()
             .map_err(|err| Error::Harness(format!("starting the run: {err}")))?
     };
+    // The run writes run.json only once it holds its machines, so run.json
+    // means it got going, even if it has ended already (every test
+    // skipped). Its lock is not looked at: it may be gone by now.
     let bundle = store::bundle_dir(store, &id);
     let started = Instant::now();
-    while !(store::is_running(store, &id) && bundle.join("run.json").is_file()) {
+    while !bundle.join("run.json").is_file() {
         if let Ok(Some(status)) = child.try_wait() {
+            if bundle.join("run.json").is_file() {
+                break;
+            }
             // It ended before it got going: say why, as it would have.
             let said = std::fs::read_to_string(store::output_log(store, &id)).unwrap_or_default();
             let _ = std::fs::remove_dir_all(store.join("running").join(&id));
@@ -696,7 +706,12 @@ const STOP_WAIT: Duration = Duration::from_secs(120);
 fn stop_run(arguments: &Arguments) -> Result<u8, Error> {
     let store = arguments.store_dir()?;
     let id = going_run(&store, arguments.run_name()?)?;
-    store::request_stop(&store, &id)?;
+    // A run that ended just now took its folder with it: nothing to stop.
+    if let Err(err) = store::request_stop(&store, &id)
+        && store::is_running(&store, &id)
+    {
+        return Err(err);
+    }
     let asked = Instant::now();
     while store::is_running(&store, &id) {
         if asked.elapsed() > STOP_WAIT {

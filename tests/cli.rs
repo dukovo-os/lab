@@ -38,12 +38,20 @@ impl Setting {
             "tests/boot/ready.toml",
             "about = \"boots\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n",
         );
+        // A test that pulls the cable, and a machine with no cable to pull.
+        write(
+            "tests/drivers/cable.toml",
+            "about = \"pulls\"\ntime = \"1m\"\n[[step]]\nlink = \"down\"\n",
+        );
+        write(
+            "config/machines/no-cable.toml",
+            "about = \"QEMU with no cable\"\ndriver = \"qemu\"\n[controls]\nlink = \"none\"\n",
+        );
         write(
             "tests/presets.toml",
             "[[preset]]\nname = \"quick\"\ntitle = \"Quick check\"\ntests = [\"boot\"]\n",
         );
         write("image.img", "");
-        fs::create_dir_all(dir.join("config")).unwrap();
         // A QEMU that is there, and a qemu-img that always fails.
         let qemu =
             write("bin/qemu-system-x86_64", "#!/bin/sh\necho 'QEMU emulator version 9.2.0'\n");
@@ -124,6 +132,35 @@ fn a_detached_run_is_followed_to_its_end() {
     let (code, error) = setting.run(&["run", "boot/none", "--image", &image, "--detach"]);
     assert_eq!(code, Some(2));
     assert!(error["error"].as_str().unwrap().contains("boot/none"));
+}
+
+#[test]
+fn a_run_that_ends_at_once_is_still_detached() {
+    let setting = Setting::new("at-once");
+    let image = setting.image();
+    // Its one test is skipped, so the run may well end before `run
+    // --detach` first looks: that is a run that went, not one that failed.
+    let args = ["run", "drivers/cable", "--machine", "no-cable", "--image", &image, "--detach"];
+    let (code, started) = setting.run(&args);
+    assert_eq!(code, Some(0), "{started}");
+    let id = started["id"].as_str().unwrap().to_string();
+    let (code, status) = setting.run(&["status", &id, "--wait"]);
+    assert_eq!(code, Some(0), "{status}");
+    assert_eq!(status["counts"]["skipped"], 1);
+}
+
+#[test]
+fn a_detached_run_that_cannot_start_says_why() {
+    let setting = Setting::new("cannot-start");
+    let image = setting.image();
+    // Only the run itself finds this: it cannot make its bundle.
+    fs::create_dir_all(setting.dir.join("store")).unwrap();
+    fs::write(setting.dir.join("store/runs"), "not a folder").unwrap();
+    let (code, error) = setting.run(&["run", "boot/ready", "--image", &image, "--detach"]);
+    assert_eq!(code, Some(3), "{error}");
+    let message = error["error"].as_str().unwrap();
+    assert!(message.contains("making the bundle"), "{message}");
+    assert!(!setting.dir.join("store/running").read_dir().unwrap().any(|_| true), "nothing left");
 }
 
 /// One HTTP request to the page; answers the status line, headers and body.

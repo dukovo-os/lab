@@ -19,11 +19,13 @@
 //! drops when the process ends however it ends. So a run that crashed or
 //! was killed never looks busy: its lock is free, and `status` reports it
 //! as having died. The files in `running/<run id>/` are removed when the
-//! run ends; a dead run's are left for `status` to find.
+//! run ends; a run that died, or broke before its end, leaves its
+//! `output.log` there, for `status` and `run --detach` to show.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::Error;
 use crate::bundle::RunRecord;
@@ -73,6 +75,12 @@ fn held(path: &Path) -> bool {
     matches!(file.try_lock_shared(), Err(TryLockError::WouldBlock))
 }
 
+/// How many times [`take_lock`] tries a lock that is taken, and how long
+/// it waits between tries: [`held`] takes a lock for a moment to look,
+/// and that must not make a free machine look busy.
+const LOCK_TRIES: u32 = 20;
+const LOCK_PAUSE: Duration = Duration::from_millis(5);
+
 /// Opens `path` and takes its lock; `Ok(None)` when another process has it.
 fn take_lock(path: &Path) -> Result<Option<File>, Error> {
     if let Some(folder) = path.parent() {
@@ -88,11 +96,21 @@ fn take_lock(path: &Path) -> Result<Option<File>, Error> {
         .write(true)
         .open(path)
         .map_err(|err| Error::Harness(format!("opening {}: {err}", path.display())))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Error(err)) => {
-            return Err(Error::Harness(format!("locking {}: {err}", path.display())));
+    // A run holds its locks for as long as it goes; someone looking (a
+    // `status`, the runner page) holds one for microseconds. So a lock
+    // still taken after a tenth of a second is a run's.
+    let mut tries = 0;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if tries + 1 < LOCK_TRIES => {
+                tries += 1;
+                std::thread::sleep(LOCK_PAUSE);
+            }
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Error(err)) => {
+                return Err(Error::Harness(format!("locking {}: {err}", path.display())));
+            }
         }
     }
     // Ours now: clear the last holder's name, if any, for ours.
@@ -133,6 +151,8 @@ pub fn machine_user(store: &Path, name: &str) -> Option<String> {
 pub struct Running {
     store: PathBuf,
     id: String,
+    /// Whether the run reached its end; see [`Running::end`].
+    ended: bool,
     _lock: File,
     _machines: Vec<File>,
 }
@@ -149,9 +169,10 @@ impl Running {
             let path = store.join("machines").join(format!("{name}.lock"));
             let Some(mut file) = take_lock(&path)? else {
                 let user = machine_user(store, name).unwrap_or_else(|| "another run".into());
-                // Nothing ran, so nothing is left behind but the folder.
+                // Nothing ran, so nothing is left behind but what a
+                // detached run says, which `run --detach` shows.
+                clear(&dir);
                 drop(lock);
-                let _ = fs::remove_dir_all(&dir);
                 return Err(Error::Busy(format!(
                     "the {name} machine is busy with run {user}; wait for it (`dukovo-lab status --wait {user}`) or stop it (`dukovo-lab stop {user}`)"
                 )));
@@ -163,6 +184,7 @@ impl Running {
         Ok(Running {
             store: store.to_path_buf(),
             id: id.to_string(),
+            ended: false,
             _lock: lock,
             _machines: held_machines,
         })
@@ -186,11 +208,37 @@ impl Running {
     }
 }
 
+impl Running {
+    /// The run reached its end and run.json says so: its folder goes
+    /// whole, and its locks with it.
+    pub fn end(mut self) {
+        self.ended = true;
+    }
+}
+
 impl Drop for Running {
     fn drop(&mut self) {
-        // The locks go with the files; the folder held only requests.
-        let _ = fs::remove_dir_all(running_dir(&self.store, &self.id));
+        let dir = running_dir(&self.store, &self.id);
+        if self.ended {
+            let _ = fs::remove_dir_all(&dir);
+        } else {
+            // It broke on the way: keep what it said.
+            clear(&dir);
+        }
+        // The locks go as the files close, after this.
     }
+}
+
+/// Removes a run's folder in `running/` but for its `output.log`, which
+/// says why a detached run ended where it did; the folder goes too when
+/// there is none.
+fn clear(dir: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_name() != "output.log" {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let _ = fs::remove_dir(dir);
 }
 
 fn done_file(store: &Path, id: &str, machine: &str) -> PathBuf {
@@ -307,9 +355,37 @@ mod tests {
         assert!(running.take_done("qemu"));
         assert!(!running.take_done("qemu"), "a done counts once");
 
-        drop(running);
+        running.end();
         assert!(!is_running(store.path(), id));
         assert_eq!(machine_user(store.path(), "qemu"), None);
         assert!(!store.path().join("running").join(id).exists());
+
+        // A detached run that broke before its end keeps what it said.
+        let id = "20261107-153014-0000";
+        fs::create_dir_all(store.path().join("running").join(id)).unwrap();
+        fs::write(output_log(store.path(), id), "dukovo-lab: it broke\n").unwrap();
+        drop(Running::start(store.path(), id, &["qemu"]).unwrap());
+        assert!(!is_running(store.path(), id));
+        assert_eq!(
+            fs::read_to_string(output_log(store.path(), id)).unwrap(),
+            "dukovo-lab: it broke\n"
+        );
+    }
+
+    #[test]
+    fn someone_looking_does_not_make_a_machine_busy() {
+        let store = TempDir::new("store-look");
+        let path = store.path().join("machines/qemu.lock");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A `status` looking at the machine just as a run takes it.
+        let looking = File::create(&path).unwrap();
+        looking.lock_shared().unwrap();
+        let looked = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(looking);
+        });
+        let running = Running::start(store.path(), "20261107-153012-4f2a", &["qemu"]);
+        looked.join().unwrap();
+        assert!(running.is_ok(), "the run waited out the look");
     }
 }

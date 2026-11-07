@@ -300,10 +300,12 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
     })
 }
 
-/// How long each test took on each machine the last time it ran, from
-/// the newest earlier runs: `(machine, test)` to milliseconds.
+/// How long each test took on each machine the last time it ran to its
+/// end, from the newest earlier runs: `(machine, test)` to milliseconds.
 pub fn typical_durations(store: &Path, leave_out: Option<&str>) -> HashMap<(String, String), u64> {
-    let mut typical = HashMap::new();
+    // The time, and whether the test ran to its end (passed or failed)
+    // rather than being skipped, stopped or broken part way.
+    let mut typical: HashMap<(String, String), (u64, bool)> = HashMap::new();
     for (bundle, record) in store::recent_runs(store, HISTORY_RUNS + 1) {
         if Some(record.id.as_str()) == leave_out {
             continue;
@@ -311,11 +313,18 @@ pub fn typical_durations(store: &Path, leave_out: Option<&str>) -> HashMap<(Stri
         let Ok(text) = fs::read_to_string(bundle.join("results.json")) else { continue };
         let Ok(file) = serde_json::from_str::<ResultsFile>(&text) else { continue };
         for result in file.results {
-            // Runs come newest first, so the first time seen is the latest.
-            typical.entry((result.machine, result.test)).or_insert(result.milliseconds);
+            let whole = matches!(result.result, Outcome::Pass | Outcome::Fail);
+            // Runs come newest first: the newest whole time wins, else the
+            // newest time at all (a test this machine always skips).
+            let entry = typical
+                .entry((result.machine, result.test))
+                .or_insert((result.milliseconds, whole));
+            if whole && !entry.1 {
+                *entry = (result.milliseconds, true);
+            }
         }
     }
-    typical
+    typical.into_iter().map(|(key, (milliseconds, _))| (key, milliseconds)).collect()
 }
 
 /// About how long the tests not yet done will take: machines run side by
@@ -560,5 +569,41 @@ mod tests {
         assert_eq!(time_left(&tests, &typical), None);
         typical.insert(("qemu".to_string(), "boot/b".to_string()), 61_500);
         assert_eq!(time_left(&tests, &typical), Some(62));
+    }
+
+    #[test]
+    fn a_stopped_run_does_not_say_how_long_tests_take() {
+        let store = TempDir::new("status-typical");
+        let result = |test: &str, result: Outcome, milliseconds: u64| ResultRecord {
+            test: test.into(),
+            machine: "qemu".into(),
+            result,
+            reason: None,
+            milliseconds,
+            boot: None,
+            log: None,
+            steps: Vec::new(),
+            screenshots: Vec::new(),
+        };
+        // An older run that ran both tests, then a newer one stopped part
+        // way through boot/a, before boot/b.
+        let older = Bundle::create(store.path(), record("20261107-153012-0001")).unwrap();
+        older
+            .write_results(&[
+                result("boot/a", Outcome::Pass, 60_000),
+                result("boot/b", Outcome::Skip, 0),
+            ])
+            .unwrap();
+        let newer = Bundle::create(store.path(), record("20261107-163012-0002")).unwrap();
+        newer
+            .write_results(&[
+                result("boot/a", Outcome::Skip, 9_000),
+                result("boot/b", Outcome::Skip, 0),
+            ])
+            .unwrap();
+        let typical = typical_durations(store.path(), None);
+        let key = |test: &str| ("qemu".to_string(), test.to_string());
+        assert_eq!(typical[&key("boot/a")], 60_000, "the older whole run's time");
+        assert_eq!(typical[&key("boot/b")], 0, "never ran: skipped again, most likely");
     }
 }

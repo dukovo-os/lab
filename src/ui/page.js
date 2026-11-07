@@ -484,12 +484,15 @@ function renderRuns() {
 async function startRun(tests, machines) {
   notice("");
   const body = { machines: machines || [...state.picked] };
-  if (tests === null && state.preset) body.preset = state.preset;
+  const preset = tests === null ? state.presets.find((p) => p.name === state.preset) : null;
+  if (preset) body.preset = preset.name;
   else body.tests = tests || [...state.chosen];
-  body.with_person = body.tests ? body.tests.some((id) => {
+  // Needs you tests in the run, a preset's too, run with a person: they
+  // are ticked, and the page says ticked ones run.
+  body.with_person = (body.tests || preset.tests).some((id) => {
     const test = state.tests.find((t) => t.id === id);
     return test && needsPerson(test);
-  }) : false;
+  });
   const answer = await act("/api/run", body);
   if (answer.id) {
     state.viewing = answer.id;

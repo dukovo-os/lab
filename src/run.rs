@@ -25,7 +25,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -133,6 +133,7 @@ pub fn run(
     });
 
     let work = request.store.join("work").join(&id);
+    let image = pin_image(&request.image, &work);
     let sockets = socket_folder(&id);
     let stop = Stop::default();
     let finished = AtomicBool::new(false);
@@ -145,6 +146,9 @@ pub fn run(
         with_person: request.with_person,
     };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
+        // Ends the watcher below however this ends, a worker's panic too,
+        // or the scope would wait for it for ever.
+        let _finished = SetOnDrop(&finished);
         // Watches for `dukovo-lab stop` while the machines work.
         scope.spawn(|| {
             while !finished.load(Ordering::Relaxed) {
@@ -161,7 +165,7 @@ pub fn run(
             .enumerate()
             .map(|(index, &machine)| {
                 let setup = Setup {
-                    image: request.image.clone(),
+                    image: image.clone(),
                     logs: bundle.logs(&machine.name),
                     work: work.join(&machine.name),
                     // By number, not name: socket paths must stay short.
@@ -174,12 +178,10 @@ pub fn run(
                 scope.spawn(move || run_machine(machine, tests, setup, shared, start))
             })
             .collect();
-        let results = workers
+        workers
             .into_iter()
             .flat_map(|worker| worker.join().expect("a machine's worker panicked"))
-            .collect();
-        finished.store(true, Ordering::Relaxed);
-        results
+            .collect()
     });
     let _ = fs::remove_dir_all(&work);
     let _ = fs::remove_dir_all(&sockets);
@@ -194,12 +196,42 @@ pub fn run(
     reporter.report(&Event::RunEnded { id: &id, bundle: bundle.dir(), summary, stopped });
     // The run's locks go only now, once run.json says it ended, so a
     // reader never sees a run that is neither going nor ended.
-    drop(running);
+    running.end();
     Ok(Ended { summary })
 }
 
 /// A short folder for the run's sockets: the user's runtime folder when
 /// there is one, else the system's temporary folder.
+/// Sets its flag when dropped.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Keeps the image under test the same for the whole run: a second name
+/// for it in the run's work folder, which every boot then uses.
+///
+/// `ob image` makes a new file where the image was rather than writing
+/// over it, so a build started while this run goes (another `ob lab run`,
+/// say) leaves this run's image as it was, instead of changing it between
+/// one test's boot and the next. When the store is on another file system
+/// than the image, there can be no second name, and the run uses the
+/// image where it is.
+fn pin_image(image: &Path, work: &Path) -> PathBuf {
+    let Ok(real) = fs::canonicalize(image) else { return image.to_path_buf() };
+    // A dot, so no machine's folder beside it can have its name; the
+    // extension stays, as it says the image's format.
+    let qcow2 = real.extension().is_some_and(|ext| ext == "qcow2");
+    let pinned = work.join(if qcow2 { "under-test.qcow2" } else { "under-test.img" });
+    match fs::create_dir_all(work).and_then(|()| fs::hard_link(&real, &pinned)) {
+        Ok(()) => pinned,
+        Err(_) => image.to_path_buf(),
+    }
+}
+
 fn socket_folder(id: &str) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
     base.join("dukovo-lab").join(id)
@@ -934,5 +966,22 @@ mod tests {
         assert!(watch.find("two"));
         watch.skip_to_end();
         assert!(!watch.find("one"));
+    }
+
+    #[test]
+    fn a_new_build_does_not_change_a_run_s_image() {
+        let dir = crate::testing::TempDir::new("pin-image");
+        let image = dir.write("out/dukovo-lab.img", "build one");
+        let pinned = pin_image(&image, &dir.path().join("work/run"));
+        assert_ne!(pinned, image);
+        // `ob image` makes a new file where the old one was.
+        fs::remove_file(&image).unwrap();
+        fs::write(&image, "build two").unwrap();
+        assert_eq!(fs::read_to_string(&pinned).unwrap(), "build one");
+        assert_eq!(pinned.extension().unwrap(), "img");
+        // No image there: the run uses the path it was given, and fails
+        // on it as before.
+        let missing = dir.path().join("none.img");
+        assert_eq!(pin_image(&missing, &dir.path().join("work/other")), missing);
     }
 }

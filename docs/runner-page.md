@@ -20,6 +20,11 @@ an old address stops working; open the one printed last. Ctrl+C closes
 the page. Runs started from it carry on, and the page shows them again
 when it is opened next.
 
+The page runs the image it was opened with, under that build's name. If
+the image is rebuilt while the page is open, the page will not start
+runs until it is opened again (`./ob lab ui`), so no run names the
+wrong build.
+
 ## What is on it
 
 - **Machines.** Tick the machines to run on; each runs the same tests at
@@ -65,7 +70,12 @@ started with `dukovo-lab run` shows on the page too.
 ## Safety
 
 The page listens on 127.0.0.1 only, answers only to that address and
-`localhost`, needs the printed key (which it keeps in a cookie only it
-receives), and takes actions only from its own script. It serves its own
-files, the commands' answers and files inside results bundles; never
-anything else on the PC, and never the lab key.
+`localhost`, needs the printed key (which it keeps in a cookie), and
+takes actions only from its own script. It serves its own files, the
+commands' answers and files inside results bundles; never anything else
+on the PC, and never the lab key.
+
+The lab PC is meant to have one account. If it has others, know that
+opening the browser hands it the address, key and all, and other
+accounts can see a program's arguments while it runs; give `--no-open`
+and paste the printed address into the browser yourself.
