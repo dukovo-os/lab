@@ -134,8 +134,27 @@ pub struct Test {
     pub time: Duration,
     /// Whether it needs a boot of its own instead of sharing one.
     pub fresh: bool,
+    /// What the machine boots from when the test boots it.
+    pub boot: Boot,
     pub steps: Vec<Step>,
 }
+
+/// What a test's machine boots from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Boot {
+    /// A clean disk holding the image under test, and the runner waits
+    /// until it is ready: every test but the installer's.
+    Image,
+    /// The install stick the run was given, with a blank disk of this
+    /// many bytes for the installer, and the runner waits for nothing:
+    /// the test's own steps follow the stick's boot. The machine boots
+    /// afresh for the test after, as its disk no longer holds the image.
+    Stick { disk: u64 },
+}
+
+/// What a `type` step types in place of this text: the lab password, which
+/// never shows in a test file, a step's description or a log.
+pub const PASSWORD_TOKEN: &str = "{password}";
 
 /// One step of a test.
 #[derive(Clone, Debug, PartialEq)]
@@ -163,6 +182,41 @@ pub enum Step {
     Sleep(Duration),
     /// Runs a benchmark program and holds its rows to Linux's.
     Bench(Bench),
+    /// Waits until the screen shows every one of these texts.
+    Screen(Vec<String>),
+    /// Waits until the screen no longer shows this text.
+    ScreenGone(String),
+    /// Types this text on the keyboard: `\n` is Enter, and
+    /// [`PASSWORD_TOKEN`] types the lab password.
+    Type(String),
+    /// Moves the pointer to this pixel of the screen, counted from its
+    /// top left corner.
+    Point {
+        x: u32,
+        y: u32,
+    },
+    /// Presses a pointer button and lets it go, where the pointer is.
+    Click(Button),
+}
+
+/// A pointer button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+}
+
+impl Button {
+    /// Its name in test files, and QEMU's.
+    pub fn name(self) -> &'static str {
+        match self {
+            Button::Left => "left",
+            Button::Right => "right",
+            Button::Middle => "middle",
+        }
+    }
 }
 
 /// What a `bench` step measures, and the bar it holds it to.
@@ -232,8 +286,9 @@ impl Step {
             Step::Power(_) | Step::WaitOff => Some(Control::Power),
             Step::Link(_) => Some(Control::Link),
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
-            Step::Keys(_) => Some(Control::Keys),
-            Step::Screenshot(_) => Some(Control::Screen),
+            Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
+            Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
+            Step::Screenshot(_) | Step::Screen(_) | Step::ScreenGone(_) => Some(Control::Screen),
             Step::WaitReady | Step::Sleep(_) => None,
             // It also runs over SSH: see `Test::controls`.
             Step::Bench(_) => Some(Control::Linux),
@@ -263,6 +318,14 @@ impl Step {
             }
             Step::UnplugUsb => "pull the USB stick".into(),
             Step::Keys(keys) => format!("press {}", keys.join(", ")),
+            Step::Type(text) => format!("type \"{}\"", text.escape_debug()),
+            Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
+            Step::Click(button) => format!("click the {} button", button.name()),
+            Step::Screen(texts) => {
+                let texts: Vec<String> = texts.iter().map(|text| format!("\"{text}\"")).collect();
+                format!("wait until the screen shows {}", texts.join(", "))
+            }
+            Step::ScreenGone(text) => format!("wait until the screen no longer shows \"{text}\""),
             Step::Screenshot(name) => format!("take screenshot \"{name}\""),
             Step::WaitReady => "wait until booted".into(),
             Step::WaitOff => "wait until it turns itself off".into(),
@@ -301,9 +364,24 @@ impl Test {
         if self.steps.iter().any(|step| matches!(step, Step::Bench(_))) {
             controls.insert(Control::Ssh);
         }
+        // The install stick is plugged in as the machine powers on.
+        if matches!(self.boot, Boot::Stick { .. }) {
+            controls.insert(Control::Usb);
+        }
         controls.insert(Control::Power);
         controls.insert(Control::Serial);
         controls
+    }
+
+    /// Whether a step needs the lab password: one run as root, or one that
+    /// types it.
+    pub fn uses_password(&self) -> bool {
+        self.steps.iter().any(|step| match step {
+            Step::Run(command) => command.root,
+            Step::Bench(bench) => bench.root,
+            Step::Type(text) => text.contains(PASSWORD_TOKEN),
+            _ => false,
+        })
     }
 
     /// Whether, and how, the test runs on `machine`.
@@ -357,9 +435,26 @@ struct TestFile {
     time: String,
     #[serde(default)]
     fresh: bool,
+    boot: Option<BootFrom>,
+    disk: Option<String>,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum BootFrom {
+    Image,
+    Stick,
+}
+
+/// The installer's disk unless a test says: room for an installed system,
+/// as Dukovo's own install tests give it.
+const DEFAULT_INSTALL_DISK: u64 = 8 << 30;
+
+/// The largest blank disk a test may ask for. QEMU's disks take room only
+/// as they are written, so this is a bar against typing slips.
+const DISK_MAX: u64 = 2 << 40;
 
 /// A step as written: exactly one action key, and the options that go with it.
 #[derive(Deserialize)]
@@ -382,6 +477,12 @@ struct StepFile {
     bench: Option<String>,
     rows: Option<Vec<String>>,
     limit: Option<f64>,
+    screen: Option<OneOrMore>,
+    screen_gone: Option<String>,
+    #[serde(rename = "type")]
+    typed: Option<String>,
+    point: Option<Vec<u32>>,
+    click: Option<Button>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -471,6 +572,21 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
     if file.steps.is_empty() {
         return Err(bad("a test needs at least one [[step]]".into()));
     }
+    let boot = match (file.boot, file.disk) {
+        (None | Some(BootFrom::Image), None) => Boot::Image,
+        (None | Some(BootFrom::Image), Some(_)) => {
+            return Err(bad("disk goes only with boot = \"stick\"".into()));
+        }
+        (Some(BootFrom::Stick), None) => Boot::Stick { disk: DEFAULT_INSTALL_DISK },
+        (Some(BootFrom::Stick), Some(size)) => match parse_size(&size) {
+            Some(disk) if (1 << 30..=DISK_MAX).contains(&disk) => Boot::Stick { disk },
+            _ => {
+                return Err(bad(format!(
+                    "disk = \"{size}\": a size from 1G to 2048G, as a number and M or G, such as \"8G\""
+                )));
+            }
+        },
+    };
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut steps = Vec::new();
     for (index, step) in file.steps.into_iter().enumerate() {
@@ -493,6 +609,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         about: file.about,
         time,
         fresh: file.fresh,
+        boot,
         steps,
     })
 }
@@ -510,12 +627,17 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("screenshot", step.screenshot.is_some()),
         ("wait", step.wait.is_some()),
         ("bench", step.bench.is_some()),
+        ("screen", step.screen.is_some()),
+        ("screen_gone", step.screen_gone.is_some()),
+        ("type", step.typed.is_some()),
+        ("point", step.point.is_some()),
+        ("click", step.click.is_some()),
     ];
     let given: Vec<&str> = actions.iter().filter(|(_, set)| *set).map(|(key, _)| *key).collect();
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, serial, power, link, usb, keys, screenshot, wait or bench"
+                "no action: give one of run, serial, power, link, usb, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -578,6 +700,41 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             );
         }
         return Ok(Step::Keys(keys));
+    }
+    if let Some(texts) = step.screen {
+        let texts = texts.into_vec();
+        if texts.is_empty()
+            || texts.iter().any(|text| text.trim().is_empty() || text.contains('\n'))
+        {
+            return Err(
+                "screen needs the text to wait for, each within one row of the screen".into()
+            );
+        }
+        return Ok(Step::Screen(texts));
+    }
+    if let Some(text) = step.screen_gone {
+        if text.trim().is_empty() || text.contains('\n') {
+            return Err("screen_gone needs the text to wait to go, within one row".into());
+        }
+        return Ok(Step::ScreenGone(text));
+    }
+    if let Some(text) = step.typed {
+        if text.is_empty() {
+            return Err("type needs the text to type".into());
+        }
+        // The password is letters and digits; everything else must have a
+        // key, which is checked now rather than halfway through a test.
+        crate::screen::key_combos(&text.replace(PASSWORD_TOKEN, ""))?;
+        return Ok(Step::Type(text));
+    }
+    if let Some(at) = step.point {
+        let [x, y] = at[..] else {
+            return Err("point needs the pixel to point at: [x, y], from the top left".into());
+        };
+        return Ok(Step::Point { x, y });
+    }
+    if let Some(button) = step.click {
+        return Ok(Step::Click(button));
     }
     if let Some(name) = step.screenshot {
         if !is_plain_name(&name) {

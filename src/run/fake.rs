@@ -25,6 +25,23 @@ struct FakeMachine {
     /// Whether its numbers are an emulator's; the machine named
     /// `emulated`'s are.
     emulated: bool,
+    /// What its console shows, a row a string, and what has been typed
+    /// on the row being written.
+    screen: Vec<String>,
+    typing: String,
+    /// Where the pointer points, which a click shows on the console.
+    pointer: (u32, u32),
+}
+
+/// The characters the fake console draws, in the test font.
+const FAKE_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789().:$#?-/";
+
+/// The fake console: 24 by 6 cells of the 4x6 test font, from (2, 2), on a
+/// screen of 100 by 40 pixels.
+const FAKE_GEOMETRY: &str = "consoled: console of 24x6 cells with font 4x6 at (2, 2)";
+
+fn fake_font() -> Vec<u8> {
+    crate::screen::tests::test_font(FAKE_CHARS)
 }
 
 impl FakeMachine {
@@ -32,16 +49,80 @@ impl FakeMachine {
         let mut log = OpenOptions::new().create(true).append(true).open(&self.serial).unwrap();
         writeln!(log, "{line}").unwrap();
     }
-}
 
-impl Driver for FakeMachine {
-    fn boot_fresh(&mut self) -> Result<(), String> {
+    /// A new boot's serial log, which says where the console's cells are.
+    fn new_serial(&mut self) {
         self.boot += 1;
         fs::create_dir_all(&self.logs).unwrap();
         self.serial = self.logs.join(format!("serial-{}.log", self.boot));
         self.on = true;
+        self.say(FAKE_GEOMETRY);
+    }
+
+    /// Shows `row` at the bottom of the console, the rows above scrolling up.
+    fn show(&mut self, row: &str) {
+        self.screen.push(row.to_string());
+        let rows = self.screen.len();
+        self.screen.drain(..rows.saturating_sub(6));
+    }
+
+    /// A key pressed at the console: a sign-in that answers Name:, then
+    /// Password: (sesame), then runs whoami; or the install stick's
+    /// installer, which starts installing at Enter.
+    fn key(&mut self, combo: &str) {
+        let c = match combo {
+            "ret" => '\n',
+            "spc" => ' ',
+            "slash" => '/',
+            key if key.len() == 1 => key.chars().next().unwrap(),
+            key if key.starts_with("shift-") && key.len() == 7 => {
+                key.chars().last().unwrap().to_ascii_uppercase()
+            }
+            _ => return,
+        };
+        if c != '\n' {
+            self.typing.push(c);
+            return;
+        }
+        let typed = std::mem::take(&mut self.typing);
+        let prompt = self.screen.last().cloned().unwrap_or_default();
+        if prompt == "Install Dukovo" {
+            self.show("Installing");
+        } else if prompt == "Name:" {
+            self.show(&typed);
+            self.show("Password:");
+        } else if prompt == "Password:" {
+            // A password is never shown.
+            if typed == "sesame" {
+                self.show("$");
+            } else {
+                self.show("Sorry");
+                self.show("Name:");
+            }
+        } else if prompt == "$" {
+            self.show(&format!("$ {typed}"));
+            if typed == "whoami" {
+                self.show("lab");
+            }
+            self.show("$");
+        }
+    }
+}
+
+impl Driver for FakeMachine {
+    fn boot_fresh(&mut self) -> Result<(), String> {
+        self.new_serial();
+        self.screen = vec!["Dukovo 0.13.0 (tty1)".into(), "Name:".into()];
         self.say("\u{1b}[1mRadix 0.13.0\u{1b}[0m\r");
         self.say("Boot complete.");
+        Ok(())
+    }
+
+    fn boot_stick(&mut self, stick: &Path, disk: u64) -> Result<(), String> {
+        assert!(stick.is_file(), "the stick is given a second name, not lost");
+        self.new_serial();
+        self.say(&format!("live: a blank disk of {disk} bytes"));
+        self.screen = vec!["Install Dukovo".into()];
         Ok(())
     }
 
@@ -79,12 +160,36 @@ impl Driver for FakeMachine {
         Ok(())
     }
 
-    fn press_keys(&mut self, _combos: &[String]) -> Result<(), String> {
+    fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
+        for combo in combos {
+            self.key(combo);
+        }
+        Ok(())
+    }
+
+    fn point(&mut self, x: u32, y: u32) -> Result<(), String> {
+        // The fake screen is 100 by 40 pixels, as `screen_dump` draws it.
+        if x >= 100 || y >= 40 {
+            return Err(format!("({x}, {y}) is off the screen, which is 100x40 pixels"));
+        }
+        self.pointer = (x, y);
+        Ok(())
+    }
+
+    fn click(&mut self, button: crate::suite::Button) -> Result<(), String> {
+        let (x, y) = self.pointer;
+        self.show(&format!("{} click at {x} {y}", button.name()));
         Ok(())
     }
 
     fn screenshot(&mut self, to: &Path) -> Result<(), String> {
         fs::write(to, b"\x89PNG").map_err(|err| err.to_string())
+    }
+
+    fn screen_dump(&mut self, to: &Path) -> Result<(), String> {
+        let rows: Vec<&str> = self.screen.iter().map(String::as_str).collect();
+        let ppm = crate::screen::tests::draw(&fake_font(), &rows, (100, 40), (2, 2));
+        fs::write(to, ppm).map_err(|err| err.to_string())
     }
 
     fn run_command(
@@ -170,6 +275,9 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         stop: setup.stop,
         restarts: machine.name != "stuck",
         emulated: machine.name == "emulated",
+        screen: Vec::new(),
+        typing: String::new(),
+        pointer: (0, 0),
     }))
 }
 
@@ -244,6 +352,8 @@ fn run_with(
         password: None,
         with_person,
         linux: None,
+        fonts: None,
+        stick: None,
         preset: None,
         schedule: None,
         id: Some(
@@ -388,6 +498,8 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
         password: None,
         with_person: false,
         linux,
+        fonts: None,
+        stick: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -464,6 +576,8 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         password: Some("sesame".into()),
         with_person: false,
         linux: None,
+        fonts: None,
+        stick: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -490,6 +604,120 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         }
     }
     assert!(files > 3, "the bundle has its files");
+}
+
+#[test]
+fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
+    let setting = setting_with(&[
+        (
+            "console/sign-in.toml",
+            "about = \"sign in\"\ntime = \"1m\"\n\
+             [[step]]\nscreen = [\"(tty1)\", \"Name:\"]\n\
+             [[step]]\ntype = \"lab\\n\"\n[[step]]\nscreen = \"Password:\"\n\
+             [[step]]\ntype = \"{password}\\n\"\n\
+             [[step]]\ntype = \"whoami\\n\"\n[[step]]\nscreen = \"$ whoami\"\n\
+             [[step]]\nscreen_gone = \"Name:\"\n[[step]]\nscreenshot = \"signed-in\"\n\
+             [[step]]\npoint = [10, 20]\n[[step]]\nclick = \"left\"\n\
+             [[step]]\nscreen = \"left click at 10 20\"\n",
+        ),
+        (
+            "console/off-screen.toml",
+            "about = \"points past the edge\"\ntime = \"1s\"\n[[step]]\npoint = [100, 0]\n",
+        ),
+        (
+            "console/missing.toml",
+            "about = \"misses\"\ntime = \"1s\"\n[[step]]\nscreen = [\"Name:\", \"Nothing like this\"]\n",
+        ),
+        (
+            "console/stays.toml",
+            "about = \"stays\"\ntime = \"1s\"\n[[step]]\nscreen_gone = \"lab\"\n",
+        ),
+        (
+            "boot/install.toml",
+            "about = \"install\"\ntime = \"1m\"\nboot = \"stick\"\ndisk = \"4G\"\n\
+             [[step]]\nserial = \"a blank disk of 4294967296 bytes\"\n\
+             [[step]]\nscreen = \"Install Dukovo\"\n[[step]]\ntype = \"\\n\"\n\
+             [[step]]\nscreen = \"Installing\"\n[[step]]\nusb = \"unplug\"\n",
+        ),
+        (
+            "features/uname.toml",
+            "about = \"after the install\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+        ),
+    ]);
+    let fonts = setting.dir.path().join("fonts");
+    fs::create_dir_all(&fonts).unwrap();
+    fs::write(fonts.join("test-4x6.psfu"), fake_font()).unwrap();
+    let stick = setting.dir.write("dukovo.img", "the install stick");
+    let request = |fonts: Option<Vec<crate::screen::Font>>, stick: Option<PathBuf>| Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        with_person: false,
+        linux: None,
+        fonts,
+        stick,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let with_both =
+        request(Some(crate::screen::Font::read_dir(&fonts).unwrap()), Some(stick.clone()));
+    let ended = run(&with_both, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&with_both.store, with_both.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let by_test = |test: &str| results.results.iter().find(|r| r.test == test).unwrap().clone();
+
+    // Signed in by keys, the password typed but never shown.
+    let sign_in = by_test("console/sign-in");
+    assert_eq!(sign_in.result, Outcome::Pass, "{:?}", sign_in.reason);
+    assert!(
+        sign_in.steps.iter().any(|step| step.step == "type \"{password}\\n\""),
+        "{:?}",
+        sign_in.steps
+    );
+    let text =
+        fs::read_to_string(bundle.join("screenshots/qemu/console-sign-in-signed-in.txt")).unwrap();
+    assert!(text.contains("$ whoami\nlab\n$\n"), "{text}");
+    assert!(!fs::read_to_string(bundle.join("results.json")).unwrap().contains("sesame"));
+
+    // A miss names only the missing text first, then shows the screen.
+    let missing = by_test("console/missing");
+    assert_eq!(missing.result, Outcome::Fail);
+    let why = missing.reason.unwrap();
+    assert!(
+        why.starts_with("step 1: the screen did not show \"Nothing like this\"; it showed:\n"),
+        "{why}"
+    );
+    assert!(why.contains("\nName:\n"), "{why}");
+    let stays = by_test("console/stays");
+    assert_eq!(stays.result, Outcome::Fail);
+    assert!(stays.reason.unwrap().starts_with("step 1: the screen still showed \"lab\":"));
+    let off_screen = by_test("console/off-screen");
+    assert_eq!(off_screen.result, Outcome::Error);
+    assert_eq!(
+        off_screen.reason.as_deref(),
+        Some("step 1: (100, 0) is off the screen, which is 100x40 pixels")
+    );
+
+    // The install stick boots with a blank disk; the test after boots
+    // afresh, as the disk no longer holds the image under test.
+    let install = by_test("boot/install");
+    assert_eq!(install.result, Outcome::Pass, "{:?}", install.reason);
+    assert_eq!(install.steps[0].step, "boot from the install stick, with a blank disk");
+    let after = by_test("features/uname");
+    assert_eq!(after.result, Outcome::Pass);
+    assert_eq!(after.steps[0].step, "boot afresh and wait until booted");
+    assert_eq!(ended.summary, Summary { passed: 3, failed: 2, skipped: 0, errors: 1 });
+
+    // Without fonts the screen steps skip, and without a stick the
+    // installer's test does, each saying how to get one.
+    let ended = run(&request(None, None), &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 4, errors: 1 });
 }
 
 #[test]

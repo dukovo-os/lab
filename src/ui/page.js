@@ -334,7 +334,7 @@ function testDetail(test) {
   const last = Object.entries(test.last_milliseconds).map(([m, ms]) => m + " " + duration(ms / 1000));
   return el("li", { class: "tdetail" }, el("div", { class: "td" },
     el("div", {}, el("strong", {}, "What " + test.id + " does"),
-      el("div", { class: "note" }, test.file + " · time limit " + test.time + (test.fresh ? " · boots afresh" : ""))),
+      el("div", { class: "note" }, test.file + " · time limit " + test.time + (test.boot === "stick" ? " · boots the install stick" : test.fresh ? " · boots afresh" : ""))),
     el("ol", { class: "steps" }, el("li", {}, "Boot the image, or share the boot the test before left."), test.steps.map((s) => el("li", {}, s.step))),
     el("div", { class: "note" }, "Passes when every step does. Machines: " + fits.join(", ") + "." + (last.length ? " Last time: " + last.join(", ") + "." : "")),
   ));

@@ -20,7 +20,7 @@ use crate::bench::Kit;
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
-use crate::suite::{PowerAction, Stick};
+use crate::suite::{Button, PowerAction, Stick};
 
 /// A machine the runner is driving.
 pub trait Driver: Send {
@@ -28,6 +28,12 @@ pub trait Driver: Send {
     /// holding the image under test, with a new serial log. Returns once
     /// it is powering on; the runner waits for it to be ready.
     fn boot_fresh(&mut self) -> Result<(), String>;
+
+    /// Turns the machine off if it is on, then boots it from the install
+    /// stick `stick` (an image the driver never writes to) with a blank
+    /// disk of `disk` bytes, for the installer, and a new serial log. The
+    /// stick stays in until [`Driver::unplug_usb`] pulls it.
+    fn boot_stick(&mut self, stick: &Path, disk: u64) -> Result<(), String>;
 
     /// Does a power action. [`PowerAction::Off`] returns once the machine
     /// is off, or fails at `deadline` or when the run is stopped.
@@ -51,8 +57,17 @@ pub trait Driver: Send {
     /// Presses each key combination in turn.
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String>;
 
+    /// Moves the pointer to pixel (`x`, `y`) of the screen.
+    fn point(&mut self, x: u32, y: u32) -> Result<(), String>;
+
+    /// Presses `button` and lets it go.
+    fn click(&mut self, button: Button) -> Result<(), String>;
+
     /// Saves the screen as a PNG file at `to`.
     fn screenshot(&mut self, to: &Path) -> Result<(), String>;
+
+    /// Saves the screen as a binary PPM file at `to`, for reading its text.
+    fn screen_dump(&mut self, to: &Path) -> Result<(), String>;
 
     /// Runs `command` on the machine as the lab account, with `input` as
     /// its standard input (none: empty), stopping it at `deadline`, or

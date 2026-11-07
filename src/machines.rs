@@ -39,6 +39,8 @@ pub enum Control {
     Usb,
     /// Pressing keys on the machine's keyboard.
     Keys,
+    /// Moving the pointer and pressing its buttons.
+    Mouse,
     /// Taking screenshots of the machine's screen.
     Screen,
     /// Running commands over SSH as the lab account.
@@ -50,13 +52,14 @@ pub enum Control {
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 9] = [
+    pub const ALL: [Control; 10] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
         Control::Link,
         Control::Usb,
         Control::Keys,
+        Control::Mouse,
         Control::Screen,
         Control::Ssh,
         Control::Linux,
@@ -71,6 +74,7 @@ impl Control {
             Control::Link => "link",
             Control::Usb => "usb",
             Control::Keys => "keys",
+            Control::Mouse => "mouse",
             Control::Screen => "screen",
             Control::Ssh => "ssh",
             Control::Linux => "linux",
