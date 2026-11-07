@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dukovo-os/lab/blob/main/schema/finding.schema.json",
+  "title": "Dukovo Lab finding",
+  "description": "findings/<id>.json, in the lab PC's store and in the lab-results repository: one way a test fails, with every run it failed in. Version 1.",
+  "type": "object",
+  "required": ["schema", "id", "test", "signature", "state", "note", "first_seen", "last_seen", "count", "machines", "builds", "runs", "sent"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": 1 },
+    "id": {
+      "description": "f- and 12 hex digits of the FNV-1a 64-bit hash of \"<test>\\n<signature>\", shifted right 16 bits: the same on any PC.",
+      "type": "string",
+      "pattern": "^f-[0-9a-f]{12}$"
+    },
+    "test": { "description": "<category>/<name>", "type": "string", "pattern": "^[a-z]+/[a-z0-9][a-z0-9-]*$" },
+    "signature": {
+      "description": "How it fails: the first line of its results' reason, less the serial log's path, the time limit and what SSH last answered, spaces collapsed.",
+      "type": "string"
+    },
+    "state": {
+      "description": "new: nobody has looked at it. not-a-bug: a person on the lab PC said so (with note); never sent again unless asked. fix-proposed, approved, fixed: set in lab-results by the thread fixing it and the maintainer. A fixed finding that fails again is new.",
+      "enum": ["new", "not-a-bug", "fix-proposed", "approved", "fixed"]
+    },
+    "note": { "description": "Why a person said it is not a bug.", "type": ["string", "null"] },
+    "first_seen": { "description": "When the first run it failed in started (RFC 3339 UTC).", "type": "string" },
+    "last_seen": { "description": "When the last run it failed in started (RFC 3339 UTC).", "type": "string" },
+    "count": { "description": "How many times it failed: one per run and machine.", "type": "integer", "minimum": 1 },
+    "machines": { "description": "The machines it failed on, in the order first seen.", "type": "array", "items": { "type": "string" } },
+    "builds": { "description": "The builds it failed on, in the order first seen.", "type": "array", "items": { "type": "string" } },
+    "runs": {
+      "description": "Every time it failed, oldest first.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["run", "machine", "build", "at", "reason", "sent"],
+        "additionalProperties": false,
+        "properties": {
+          "run": { "description": "The run id: its bundle is runs/<date>/<run>/.", "type": "string" },
+          "machine": { "type": "string" },
+          "build": { "type": ["string", "null"] },
+          "at": { "description": "When the run started (RFC 3339 UTC).", "type": "string" },
+          "reason": { "description": "The result's whole reason.", "type": "string" },
+          "sent": { "description": "Whether the run's bundle is in lab-results.", "type": "boolean" }
+        }
+      }
+    },
+    "passing": {
+      "description": "Machines where its test passed again since it last failed there, with the first run it passed in.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["run", "at"],
+        "additionalProperties": false,
+        "properties": { "run": { "type": "string" }, "at": { "type": "string" } }
+      }
+    },
+    "fix": { "description": "The pull request that fixes it, set in lab-results.", "type": ["string", "null"] },
+    "sent": { "description": "When the lab PC last sent it (RFC 3339 UTC); null in lab-results.", "type": ["string", "null"] }
+  }
+}

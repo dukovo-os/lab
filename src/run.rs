@@ -36,6 +36,7 @@ use crate::bundle::{
 };
 use crate::clock::Utc;
 use crate::driver::{Driver, Setup};
+use crate::findings;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
 use crate::stop::Stop;
@@ -189,11 +190,21 @@ pub fn run(
     let summary = Summary::of(&results);
     let stopped = stop.requested();
     bundle.write_results(&results).map_err(Error::Harness)?;
+    // Its failures join the findings they repeat, or make new ones, before
+    // run.json says it ended: whoever sees it ended sees its findings too.
+    let findings = findings::record(&request.store, &bundle.record, &results);
     bundle.record.ended = Some(Utc::now().rfc3339());
     bundle.record.summary = Some(summary);
     bundle.record.stopped = stopped;
     bundle.write_run().map_err(Error::Harness)?;
-    reporter.report(&Event::RunEnded { id: &id, bundle: bundle.dir(), summary, stopped });
+    let findings = findings?;
+    reporter.report(&Event::RunEnded {
+        id: &id,
+        bundle: bundle.dir(),
+        summary,
+        stopped,
+        findings: &findings,
+    });
     // The run's locks go only now, once run.json says it ended, so a
     // reader never sees a run that is neither going nor ended.
     running.end();

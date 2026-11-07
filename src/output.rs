@@ -80,6 +80,8 @@ pub enum Event<'a> {
         summary: Summary,
         /// Whether `dukovo-lab stop` cut the run short.
         stopped: bool,
+        /// The findings its failures belong to (see findings.rs).
+        findings: &'a [String],
     },
 }
 
@@ -175,15 +177,24 @@ fn human(event: &Event<'_>) -> Option<String> {
                 None => format!("[{machine}] {test}: {word}{time}"),
             }
         }
-        Event::RunEnded { id, bundle, summary, stopped } => format!(
-            "Run {id} {}: {} passed, {} failed, {} skipped, {} errors\nBundle: {}",
-            if *stopped { "stopped" } else { "done" },
-            summary.passed,
-            summary.failed,
-            summary.skipped,
-            summary.errors,
-            bundle.display()
-        ),
+        Event::RunEnded { id, bundle, summary, stopped, findings } => {
+            let mut text = format!(
+                "Run {id} {}: {} passed, {} failed, {} skipped, {} errors\nBundle: {}",
+                if *stopped { "stopped" } else { "done" },
+                summary.passed,
+                summary.failed,
+                summary.skipped,
+                summary.errors,
+                bundle.display()
+            );
+            if !findings.is_empty() {
+                text.push_str(&format!(
+                    "\nFindings: {} (`dukovo-lab findings --run {id}`)",
+                    findings.join(", ")
+                ));
+            }
+            text
+        }
     })
 }
 

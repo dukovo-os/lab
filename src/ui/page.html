@@ -52,16 +52,23 @@ in by running dukovo-lab commands through the server (see ui.rs).
         <pre class="log" id="log" hidden></pre>
       </section>
 
-      <section class="panel" aria-label="Failures" id="failures-panel" hidden>
-        <div class="ph"><h2>Failures <span class="note" id="failure-count"></span></h2></div>
-        <div id="failures"></div>
+      <section class="panel" aria-label="Findings" id="findings-panel" hidden>
+        <div class="ph">
+          <h2>Findings <span class="note" id="finding-count"></span></h2>
+          <div class="tools"><button class="btn" type="button" id="send-all" hidden>Send all new</button></div>
+        </div>
+        <div id="findings"></div>
+        <div class="send" id="send-bar" hidden>
+          <span class="note" id="send-note"></span>
+          <button class="btn primary" type="button" id="send-run" hidden>Send</button>
+        </div>
       </section>
 
       <section class="panel" aria-label="Past runs">
         <div class="ph"><h2>Past runs</h2></div>
         <div class="histwrap">
           <table class="hist">
-            <thead><tr><th>When</th><th>Run</th><th>Machines</th><th>Build</th><th>Result</th></tr></thead>
+            <thead><tr><th>When</th><th>Run</th><th>Machines</th><th>Build</th><th>Result</th><th>Findings</th></tr></thead>
             <tbody id="runs"></tbody>
           </table>
         </div>

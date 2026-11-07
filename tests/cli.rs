@@ -262,3 +262,94 @@ fn the_runner_page_runs_the_same_commands() {
     assert!(status.contains("200"), "{status}");
     assert!(Path::new(&setting.dir).join("store/runs").is_dir());
 }
+
+/// Runs git in `dir` for a test, which must work.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn findings_are_marked_and_sent_as_an_agent_would() {
+    let setting = Setting::new("findings");
+    let store = setting.dir.join("store");
+    // A run that ended with one failure, and the finding it made, as a
+    // run leaves them (a real failure needs QEMU; findings.rs tests that).
+    let run = "20261107-080000-0001";
+    let bundle = store.join("runs/2026-11-07").join(run);
+    fs::create_dir_all(bundle.join("logs/qemu")).unwrap();
+    let reason = "step 1: the link did not go down";
+    let record = serde_json::json!({
+        "schema": 1, "id": run, "harness": "dukovo-lab 0.1.0",
+        "started": "2026-11-07T08:00:00Z", "ended": "2026-11-07T08:01:00Z",
+        "build": "0.13.0 fd2a9e8", "image": "lab.img", "machines": [],
+        "tests": ["drivers/cable"],
+        "summary": { "passed": 0, "failed": 1, "skipped": 0, "errors": 0 }, "stopped": false,
+    });
+    let results = serde_json::json!({ "schema": 1, "run": run, "results": [{
+        "test": "drivers/cable", "machine": "qemu", "result": "fail", "reason": reason,
+        "milliseconds": 900, "boot": 1, "log": "logs/qemu/drivers-cable.log",
+        "steps": [], "screenshots": [],
+    }]});
+    fs::write(bundle.join("run.json"), record.to_string()).unwrap();
+    fs::write(bundle.join("results.json"), results.to_string()).unwrap();
+    fs::write(bundle.join("logs/qemu/drivers-cable.log"), "step 1 FAILED\n").unwrap();
+    let id = "f-0123456789ab";
+    let finding = serde_json::json!({
+        "schema": 1, "id": id, "test": "drivers/cable", "signature": reason, "state": "new",
+        "note": null, "first_seen": "2026-11-07T08:00:00Z", "last_seen": "2026-11-07T08:00:00Z",
+        "count": 1, "machines": ["qemu"], "builds": ["0.13.0 fd2a9e8"],
+        "runs": [{ "run": run, "machine": "qemu", "build": "0.13.0 fd2a9e8",
+                   "at": "2026-11-07T08:00:00Z", "reason": reason, "sent": false }],
+        "passing": {}, "sent": null,
+    });
+    fs::create_dir_all(store.join("findings")).unwrap();
+    fs::write(store.join("findings").join(format!("{id}.json")), finding.to_string()).unwrap();
+
+    let (code, list) = setting.run(&["findings"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(list["findings"][0]["id"], id);
+    let (_, of_run) = setting.run(&["findings", "--run", run]);
+    assert_eq!(of_run["findings"].as_array().unwrap().len(), 1);
+
+    // Not a bug, with why; it leaves the open list; reopen takes it back.
+    let (code, marked) = setting.run(&["findings", id, "--not-a-bug", "--note", "test is wrong"]);
+    assert_eq!(code, Some(0), "{marked}");
+    assert_eq!(marked["state"], "not-a-bug");
+    assert_eq!(marked["note"], "test is wrong");
+    assert!(setting.run(&["findings"]).1["findings"].as_array().unwrap().is_empty());
+    assert_eq!(setting.run(&["findings", id, "--reopen"]).1["state"], "new");
+    assert_eq!(setting.run(&["findings", "f-nothere"]).0, Some(2));
+    assert_eq!(setting.run(&["findings", id, "--note", "why"]).0, Some(2));
+
+    // No clone yet: Send says how to make one.
+    let (code, error) = setting.run(&["send", "--all"]);
+    assert_eq!(code, Some(2));
+    assert!(error["error"].as_str().unwrap().contains("git clone"), "{error}");
+
+    // lab-results, bare as on GitHub, and a clone of it elsewhere.
+    let origin = setting.dir.join("origin.git");
+    fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+    let clone = setting.dir.join("clone");
+    git(&setting.dir, &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()]);
+    git(&clone, &["config", "user.name", "Lab"]);
+    git(&clone, &["config", "user.email", "lab@example.org"]);
+    git(&clone, &["commit", "-q", "--allow-empty", "-m", "Start"]);
+    git(&clone, &["push", "-q", "origin", "main"]);
+
+    let results_dir = clone.to_str().unwrap();
+    let (code, sent) = setting.run(&["send", "--all", "--results", results_dir]);
+    assert_eq!(code, Some(0), "{sent}");
+    assert_eq!(sent["findings"][0], id);
+    assert_eq!(sent["runs"][0], run);
+    let pushed = git(&origin, &["ls-tree", "-r", "--name-only", "main"]);
+    assert!(pushed.contains(&format!("findings/{id}.json")), "{pushed}");
+    assert!(pushed.contains("logs/qemu/drivers-cable.log.gz"), "{pushed}");
+    // The run says it went, and there is nothing left to send.
+    assert_eq!(setting.run(&["runs"]).1["runs"][0]["sent"], true);
+    let (code, again) = setting.run(&["send", "--all", "--results", results_dir]);
+    assert_eq!(code, Some(0), "{again}");
+    assert!(again["findings"].as_array().unwrap().is_empty());
+}

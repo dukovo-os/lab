@@ -22,6 +22,9 @@ The lab's rules apply to agents as to people:
 - Needs you tests are for when a person is at the machines. Do not ask
   for them unless a person has said they are there.
 - Only the maintainer approves a fix for a finding.
+- Send findings only with `dukovo-lab send`, which puts them in the
+  private lab-results repository and nowhere else
+  ([Sending findings](sending.md)).
 
 ## Start, follow, report
 
@@ -48,6 +51,19 @@ The lab's rules apply to agents as to people:
    (from `run.json`), the failing step and the lines that show it. A
    `fail` is a finding about Dukovo; an `error` is a problem with the lab
    itself and says nothing about Dukovo.
+
+5. Look at the run's findings, and send the new ones to lab-results,
+   where a thread works on each:
+
+   ```sh
+   ./ob lab findings --run <run> --json     # each failure, and the runs it came back in
+   ./ob lab send --run <run> --json         # the run and its findings
+   ```
+
+   A finding seen before has the same id, more runs and a higher count:
+   say so rather than reporting it as new. Mark one not a bug only when
+   a person has said it is (`findings <finding> --not-a-bug --note
+   "<why>"`).
 
 The exit status tells the outcome without parsing anything: 0 passed, 1
 a test failed, 2 a bad request, 3 the lab broke, 4 a machine was busy

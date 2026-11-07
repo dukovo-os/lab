@@ -435,6 +435,8 @@ pub struct RunSummary {
     pub tests: usize,
     pub summary: Option<crate::bundle::Summary>,
     pub bundle: PathBuf,
+    /// Whether its bundle went to lab-results (`dukovo-lab send`).
+    pub sent: bool,
 }
 
 /// The newest runs, newest first.
@@ -461,6 +463,7 @@ pub fn runs(store: &Path, limit: usize) -> Vec<RunSummary> {
                 tests: record.tests.len(),
                 summary: record.summary,
                 id: record.id,
+                sent: crate::send::was_sent(&bundle),
                 bundle,
             }
         })

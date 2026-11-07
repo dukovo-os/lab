@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2026 The Dukovo contributors
 SPDX-License-Identifier: Apache-2.0 OR MIT
 
 The runner page's look, as approved in the mock: an operator's console.
-Machines on top, the tests on the left, the run and its failures on the
+Machines on top, the tests on the left, the run and its findings on the
 right. Fonts are the PC's own: the page loads nothing from elsewhere.
 */
 :root {
@@ -83,6 +83,17 @@ pre.log { margin: 0; padding: 12px 16px; font-family: var(--mono); font-size: 12
 .log .t { color: var(--muted); } .log .k { color: var(--steel); } .log .e { color: var(--bad); }
 details.finding { padding: 12px 16px; border-bottom: 1px solid var(--line); border-left: 3px solid var(--bad); }
 details.finding:last-child { border-bottom: 0; }
+details.finding.lab { border-left-color: var(--steel); }
+details.finding.closed { border-left-color: var(--line); }
+.new { background: var(--bad-soft); color: var(--bad); }
+.not-a-bug { background: var(--bg); color: var(--muted); }
+.fix-proposed, .approved { background: var(--run-soft); color: var(--run); }
+.fixed { background: var(--ok-soft); color: var(--ok); }
+.lab-problem { background: var(--bg); color: var(--steel); border: 1px solid var(--line); }
+.nab { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.nab input { font: inherit; flex: 1 1 220px; min-width: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--fg); }
+.send { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: space-between; }
+.send .note { flex: 1 1 260px; }
 details.finding > summary { list-style: none; cursor: pointer; display: grid; gap: 4px; }
 details.finding > summary::-webkit-details-marker { display: none; }
 .top { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
@@ -102,7 +113,7 @@ details.finding > summary::-webkit-details-marker { display: none; }
 table.hist { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
 .histwrap { overflow-x: auto; }
 table.hist th, table.hist td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
-table.hist td:first-child, table.hist td:last-child, table.hist td.mono { white-space: nowrap; }
+table.hist td:first-child, table.hist td.res, table.hist td.mono { white-space: nowrap; }
 table.hist th { font-weight: 500; color: var(--muted); font-size: 12px; }
 table.hist tbody tr { cursor: pointer; }
 table.hist tbody tr:hover, table.hist tbody tr.sel { background: var(--bg); }

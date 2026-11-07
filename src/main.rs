@@ -15,11 +15,13 @@
 mod bundle;
 mod clock;
 mod driver;
+mod findings;
 mod http;
 mod machines;
 mod output;
 mod qmp;
 mod run;
+mod send;
 mod ssh;
 mod status;
 mod stop;
@@ -62,6 +64,12 @@ Commands:
                    Says a person did the step a run waits for on a machine
   results [<run>]  A run's results: each test on each machine, and why
   runs             The runs so far, newest first
+  findings [<finding>]
+                   What failed, each failure with the runs it came back
+                   in (default: those still open); or one finding
+  send <finding>... | --all | --run <run>
+                   Sends findings, and the runs they failed in, to the
+                   lab-results repository, where they are worked on
   ui               Serves the runner page on this PC, for a browser here
   key              Makes the lab key, once, and prints its public key's path
   help             This text
@@ -89,6 +97,15 @@ Options for other commands:
   --limit <n>      runs: how many (default 20)
   --port <n>       ui: the port on 127.0.0.1 (default 7420)
   --no-open        ui: do not open a browser
+  --run <run>      findings: those of a run; send: a run and its findings
+  --all            findings: every finding, closed ones too;
+                   send: every finding not sent yet, and its runs
+  --not-a-bug      findings <finding>: says it is not a bug; it stays so
+                   and is not offered to send again
+  --note <text>    with --not-a-bug: why
+  --reopen         findings <finding>: takes back --not-a-bug
+  --results <dir>  send: the lab-results clone (default: lab-results in
+                   the store)
 
 Exit status:
   0  every test that ran passed (tests may be skipped)
@@ -134,6 +151,13 @@ struct Arguments {
     with_person: bool,
     failed: bool,
     no_open: bool,
+    /// findings and send: a run.
+    run: Option<String>,
+    /// send: the lab-results clone.
+    results: Option<PathBuf>,
+    note: Option<String>,
+    not_a_bug: bool,
+    reopen: bool,
 }
 
 fn main() -> ExitCode {
@@ -181,6 +205,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--run-id" => arguments.run_id = Some(value("--run-id")?),
             "--port" => arguments.port = Some(number(&value("--port")?, "--port")?),
             "--limit" => arguments.limit = Some(number(&value("--limit")?, "--limit")?),
+            "--run" => arguments.run = Some(value("--run")?),
+            "--results" => arguments.results = Some(value("--results")?.into()),
+            "--note" => arguments.note = Some(value("--note")?),
+            "--not-a-bug" => arguments.not_a_bug = true,
+            "--reopen" => arguments.reopen = true,
             "--all" => arguments.all = true,
             "--json" => arguments.json = true,
             "--detach" => arguments.detach = true,
@@ -225,6 +254,8 @@ fn dispatch(arguments: &Arguments) -> Result<u8, Error> {
         Some("done") => say_done(arguments),
         Some("results") => show_results(arguments),
         Some("runs") => list_runs(arguments),
+        Some("findings") => show_findings(arguments),
+        Some("send") => send_findings(arguments),
         Some("ui") => ui::serve(arguments),
         Some("key") => make_key(arguments),
         Some(other) => Err(Error::Usage(format!("no command \"{other}\"; see `dukovo-lab help`"))),
@@ -822,6 +853,172 @@ fn list_runs(arguments: &Arguments) -> Result<u8, Error> {
             run.machines.join(","),
             run.build.as_deref().unwrap_or("")
         );
+    }
+    Ok(0)
+}
+
+/// `findings`: the findings, one finding, or a change to one.
+fn show_findings(arguments: &Arguments) -> Result<u8, Error> {
+    let store = arguments.store_dir()?;
+    if arguments.not_a_bug && arguments.reopen {
+        return Err(Error::Usage("give --not-a-bug or --reopen, not both".into()));
+    }
+    if arguments.note.is_some() && !arguments.not_a_bug {
+        return Err(Error::Usage("--note goes with --not-a-bug".into()));
+    }
+    match arguments.names.as_slice() {
+        [] if arguments.not_a_bug || arguments.reopen => Err(Error::Usage(
+            "say which finding: `dukovo-lab findings <finding> --not-a-bug`".into(),
+        )),
+        [] => list_findings(arguments, &store),
+        [id] => {
+            let finding = if arguments.not_a_bug {
+                findings::set_not_a_bug(&store, id, Some(arguments.note.clone()))?
+            } else if arguments.reopen {
+                findings::set_not_a_bug(&store, id, None)?
+            } else {
+                findings::find(&store, id)?
+            };
+            if arguments.json {
+                println!("{}", serde_json::to_string(&finding).expect("findings always serialize"));
+            } else {
+                print_finding(&finding, &store);
+            }
+            Ok(0)
+        }
+        _ => Err(Error::Usage("findings takes one finding at a time".into())),
+    }
+}
+
+/// `findings` with no finding named: the open ones, a run's, or every one.
+fn list_findings(arguments: &Arguments, store: &Path) -> Result<u8, Error> {
+    let list = match &arguments.run {
+        Some(run) => findings::of_run(store, &store::pick_run(store, Some(run))?),
+        None if arguments.all => findings::load_all(store),
+        None => findings::load_all(store)
+            .into_iter()
+            .filter(|finding| {
+                !matches!(finding.state, findings::State::NotABug | findings::State::Fixed)
+            })
+            .collect(),
+    };
+    if arguments.json {
+        println!("{}", json!({ "findings": list }));
+        return Ok(0);
+    }
+    if list.is_empty() {
+        println!("No findings{}.", if arguments.run.is_some() { " in that run" } else { "" });
+    }
+    for finding in &list {
+        let unsent = if finding.unsent() && finding.state != findings::State::NotABug {
+            ", not sent"
+        } else {
+            ""
+        };
+        println!(
+            "{}  {:<12} {}x{unsent}  {}: {}",
+            finding.id,
+            finding.state.word(),
+            finding.count,
+            finding.test,
+            finding.signature
+        );
+    }
+    Ok(0)
+}
+
+fn print_finding(finding: &findings::Finding, store: &Path) {
+    println!("{} {}: {}", finding.id, finding.test, finding.signature);
+    let note = finding.note.as_deref().map(|note| format!(" ({note})")).unwrap_or_default();
+    println!("  state: {}{note}", finding.state.word());
+    println!(
+        "  failed {} time{} on {}, first {}, last {}",
+        finding.count,
+        if finding.count == 1 { "" } else { "s" },
+        finding.machines.join(", "),
+        finding.first_seen,
+        finding.last_seen
+    );
+    if !finding.builds.is_empty() {
+        println!("  builds: {}", finding.builds.join(", "));
+    }
+    for (machine, passing) in &finding.passing {
+        println!("  passed again on {machine} in run {} ({})", passing.run, passing.at);
+    }
+    for seen in finding.runs.iter().rev() {
+        let sent = if seen.sent { ", sent" } else { "" };
+        println!(
+            "  run {} on {}{sent}: {}",
+            seen.run,
+            seen.machine,
+            store::bundle_dir(store, &seen.run).display()
+        );
+    }
+    if let Some(last) = finding.runs.last() {
+        println!("  last time it said:");
+        for line in last.reason.lines() {
+            println!("    {line}");
+        }
+    }
+}
+
+/// `send`: findings and runs to lab-results.
+fn send_findings(arguments: &Arguments) -> Result<u8, Error> {
+    let store = arguments.store_dir()?;
+    let mut finding_ids = arguments.names.clone();
+    let mut run_ids = Vec::new();
+    if arguments.all {
+        // Every finding with something lab-results lacks, and each one it
+        // already holds that a person here has since said is not a bug
+        // (sending it again changes nothing when nothing changed).
+        finding_ids.extend(
+            findings::load_all(&store)
+                .into_iter()
+                .filter(|finding| match finding.state {
+                    findings::State::NotABug => finding.sent.is_some(),
+                    _ => finding.unsent(),
+                })
+                .map(|finding| finding.id),
+        );
+    }
+    if let Some(run) = &arguments.run {
+        let run = store::pick_run(&store, Some(run))?;
+        finding_ids.extend(
+            findings::of_run(&store, &run)
+                .into_iter()
+                .filter(|finding| finding.state != findings::State::NotABug)
+                .map(|finding| finding.id),
+        );
+        run_ids.push(run);
+    }
+    if finding_ids.is_empty() && run_ids.is_empty() {
+        if arguments.all {
+            if arguments.json {
+                println!("{}", json!({ "commit": null, "runs": [], "findings": [] }));
+            } else {
+                println!("Nothing to send: lab-results has every finding.");
+            }
+            return Ok(0);
+        }
+        return Err(Error::Usage(
+            "say what to send: finding ids, --all or --run <run>; see `dukovo-lab help`".into(),
+        ));
+    }
+    let clone = send::clone_dir(&store, arguments.results.as_deref());
+    let sent = send::send(&store, &clone, &finding_ids, &run_ids)?;
+    if arguments.json {
+        println!("{}", serde_json::to_string(&sent).expect("sends always serialize"));
+    } else if let Some(commit) = &sent.commit {
+        println!(
+            "Sent {} finding{} and {} run{} to lab-results (commit {}).",
+            sent.findings.len(),
+            if sent.findings.len() == 1 { "" } else { "s" },
+            sent.runs.len(),
+            if sent.runs.len() == 1 { "" } else { "s" },
+            &commit[..commit.len().min(12)]
+        );
+    } else {
+        println!("lab-results already had all of that; nothing new went.");
     }
     Ok(0)
 }

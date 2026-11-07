@@ -107,7 +107,7 @@ its time in `at`:
 {"event":"step-ended","machine":"qemu","test":"boot/reaches-ready","step":"run `whoami`, exit status 0, output has \"lab\"","result":"pass","milliseconds":800,"note":"$ whoami\nlab","at":"..."}
 {"event":"person-needed","machine":"optiplex","test":"drivers/cable-pull","step":"pull the network cable","done":"dukovo-lab done 20261107-153012-4f2a --machine optiplex","at":"..."}
 {"event":"test-ended","machine":"qemu","test":"boot/reaches-ready","result":"pass","reason":null,"milliseconds":41000,"boot":1,"log":"logs/qemu/boot-reaches-ready.log","screenshots":[],"at":"..."}
-{"event":"run-ended","id":"20261107-153012-4f2a","bundle":"...","summary":{"passed":1,"failed":0,"skipped":0,"errors":0},"stopped":false,"at":"..."}
+{"event":"run-ended","id":"20261107-153012-4f2a","bundle":"...","summary":{"passed":1,"failed":0,"skipped":0,"errors":0},"stopped":false,"findings":[],"at":"..."}
 ```
 
 `result` is `pass`, `fail` (a check failed or the time limit passed: a
@@ -203,8 +203,63 @@ dukovo-lab runs [--limit <n>]
 ```
 
 The newest runs (20 unless `--limit` says), newest first, each with its
-state, start, build, preset, machines, test count and summary. With
-`--json`: `{"runs": [...]}`.
+state, start, build, preset, machines, test count, summary and whether
+it was sent to lab-results (`sent`). With `--json`: `{"runs": [...]}`.
+
+## findings
+
+```
+dukovo-lab findings [--run <run>] [--all]
+dukovo-lab findings <finding> [--not-a-bug [--note <text>] | --reopen]
+```
+
+What failed, grouped: each failure belongs to a *finding*, the same test
+failing the same way, so a failure that comes back joins the finding it
+made before (with one more run, machine or build) instead of making a
+new one. Only `fail` results make findings; an `error` is the lab's
+problem, not Dukovo's. A run adds its findings as it ends, and its
+`run-ended` line names them.
+
+With no finding named, it lists the open findings (not those marked not
+a bug or fixed), most recently seen first; `--all` lists every one and
+`--run <run>` those a run failed in. With `--json`: `{"findings":
+[...]}`, each as [schema/finding.schema.json](../schema/finding.schema.json)
+says. Each id is `f-` and 12 hex digits, the same on any PC.
+
+`findings <finding>` shows one: its state, every run it failed in and
+what it said last time. With `--json`, the finding itself.
+
+- `--not-a-bug` says it is not a bug (the test is wrong, a cable was
+  out), with why in `--note`. It stays so however often it comes back
+  and is not offered to Send, unless asked for by id.
+- `--reopen` takes that back: it is new again.
+
+A finding's other states (fix proposed, approved, fixed) are set in
+lab-results by the thread that fixes it and the maintainer; each Send
+brings them back. A fixed finding that fails again is new.
+
+## send
+
+```
+dukovo-lab send <finding>... | --all | --run <run> [--results <dir>]
+```
+
+Sends findings, and the runs they failed in that lab-results does not
+have yet, to the private dukovo-os/lab-results repository, where a
+thread proposes a fix for each. `--all` sends every finding with
+something new (and any already there that a person has since marked not
+a bug); `--run <run>` sends a run and its findings. It uses a clone of
+lab-results on the lab PC, `lab-results` in the store unless
+`--results` names another, and the PC's own git and GitHub sign-in: it
+starts the clone afresh from lab-results, copies each run's bundle in
+(logs compressed), merges each finding with the copy there, commits and
+pushes. See [Sending findings](sending.md).
+
+With `--json`: `{"commit": "<sha>" or null, "runs": [...], "findings":
+[...]}`; `commit` is null when lab-results already had all of it. It
+exits 2 when there is no clone or nothing named exists, and 3 when git
+or the network fails; nothing is then marked sent, so the next Send
+tries again.
 
 ## ui
 
@@ -256,8 +311,13 @@ logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.
 screenshots/<machine>/    <category>-<test>-<name>.png
 ```
 
-[schema/run.schema.json](../schema/run.schema.json) and
-[schema/results.schema.json](../schema/results.schema.json) describe the
+Once a run is sent, its bundle also holds `sent.json` (when, the commit,
+and which findings), which stays on the lab PC. Findings live beside the
+runs, in `findings/<id>.json` in the store.
+
+[schema/run.schema.json](../schema/run.schema.json),
+[schema/results.schema.json](../schema/results.schema.json) and
+[schema/finding.schema.json](../schema/finding.schema.json) describe the
 JSON. Times are UTC, in RFC 3339.
 
 ## Troubleshooting
@@ -272,4 +332,7 @@ JSON. Times are UTC, in RFC 3339.
 | `run` exits 2 saying a test runs commands and the lab has no key | Run `dukovo-lab key`, then rebuild the image with `ob image --lab`. |
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |
 | `status` says a run `died` | Its process ended part way (killed, crashed, or the PC went down). `results` has what it finished; a detached run's own last messages are in `status`'s `output`. |
+| `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |
+| `send` exits 3 saying the clone has changes not committed | Someone edited the clone outside `runs/` and `findings/`. `git -C <clone> status` shows what; commit and push it, or drop it, then send again. |
+| `send` exits 3 saying it could not push | Nothing was marked sent; the next send tries again. Check the network, and that `git -C <clone> push` works as the PC's GitHub account (`gh auth status`). |
 | The runner page says its key has changed | `dukovo-lab ui` was started again: open the address it printed this time. |
