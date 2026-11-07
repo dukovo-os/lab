@@ -50,4 +50,21 @@ The lab's rules apply to agents as to people:
    itself and says nothing about Dukovo.
 
 The exit status tells the outcome without parsing anything: 0 passed, 1
-a test failed, 2 a bad request, 3 the lab broke.
+a test failed, 2 a bad request, 3 the lab broke, 4 a machine was busy
+with another run.
+
+## Long runs
+
+A full run can take hours. Start it detached, then come back to it:
+
+```sh
+./ob lab run --all --detach --json        # {"event":"run-detached","id":"<run>",...}
+./ob lab status <run> --json              # progress, what is running, time left
+./ob lab status <run> --wait --json       # blocks until it ends; exits as run would
+./ob lab results <run> --failed --json    # what failed, and the logs to read
+./ob lab stop <run>                       # if it must end early
+./ob lab runs --json                      # every run so far
+```
+
+A person may be watching the same run on the runner page; it shows the
+commands it runs, so either of you can pick up where the other is.

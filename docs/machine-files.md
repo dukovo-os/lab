@@ -45,7 +45,7 @@ stick), `keys`, `screen` and `ssh`. Each is done by one of:
 | Value | Meaning |
 | --- | --- |
 | `driver` | The machine's driver does it, with no one at the machine. |
-| `person` | A person at the machine does it when the runner asks: tests that need it are Needs you tests on this machine. |
+| `person` | A person at the machine does it when the runner asks: tests that need it are Needs you tests on this machine, run only with `--with-person` (or ticked on the runner page), and each such step waits for `dukovo-lab done` or the page's Done button. |
 | `none` | It cannot be done here: tests that need it are skipped. |
 
 A machine starts with every control its driver can do (QEMU can do all

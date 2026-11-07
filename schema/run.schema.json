@@ -32,6 +32,8 @@
       }
     },
     "tests": { "description": "Test ids, in the order they ran.", "type": "array", "items": { "type": "string" } },
+    "preset": { "description": "The preset the tests came from, if they did.", "type": ["string", "null"] },
+    "stopped": { "description": "Whether dukovo-lab stop cut the run short.", "type": "boolean" },
     "summary": {
       "description": "Counts of results, once the run has ended.",
       "oneOf": [

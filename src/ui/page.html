@@ -1,0 +1,76 @@
+<!doctype html>
+<!--
+SPDX-FileCopyrightText: 2026 The Dukovo contributors
+SPDX-License-Identifier: Apache-2.0 OR MIT
+
+The runner page. dukovo-lab ui serves it on 127.0.0.1; page.js fills it
+in by running dukovo-lab commands through the server (see ui.rs).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dukovo Lab</title>
+<link rel="stylesheet" href="/page.css">
+<script src="/page.js" defer></script>
+</head>
+<body>
+<div class="wrap">
+  <header class="bar">
+    <div class="brand">Dukovo <b>Lab</b></div>
+    <div class="facts">
+      <div><span>Build</span> <strong id="build">…</strong></div>
+      <div><span>Run on</span> <strong id="picked-count">…</strong></div>
+    </div>
+  </header>
+  <p class="notice" id="notice" hidden></p>
+
+  <section class="panel" aria-label="Machines">
+    <div class="ph"><h2>Machines</h2><span class="note">Pick one or more. Each picked machine runs the same tests at the same time.</span></div>
+    <div class="machines" id="machines"></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel" aria-label="Tests">
+      <div class="ph">
+        <h2>Tests <span class="note" id="test-count"></span></h2>
+        <div class="tools">
+          <input type="search" id="find" placeholder="Find a test" aria-label="Find a test">
+          <select id="preset" aria-label="Preset"></select>
+          <button class="btn primary" type="button" id="run-picked">Run</button>
+        </div>
+      </div>
+      <div id="categories"></div>
+    </section>
+
+    <div class="right">
+      <section class="panel" aria-label="This run">
+        <div class="ph"><h2 id="run-title">This run</h2><div class="tools"><button class="btn" type="button" id="stop" hidden>Stop</button></div></div>
+        <div id="waiting"></div>
+        <p class="note pad" id="no-run">No run yet. Pick tests and machines, then Run.</p>
+        <div class="progress" id="progress" hidden></div>
+        <pre class="log" id="log" hidden></pre>
+      </section>
+
+      <section class="panel" aria-label="Failures" id="failures-panel" hidden>
+        <div class="ph"><h2>Failures <span class="note" id="failure-count"></span></h2></div>
+        <div id="failures"></div>
+      </section>
+
+      <section class="panel" aria-label="Past runs">
+        <div class="ph"><h2>Past runs</h2></div>
+        <div class="histwrap">
+          <table class="hist">
+            <thead><tr><th>When</th><th>Run</th><th>Machines</th><th>Build</th><th>Result</th></tr></thead>
+            <tbody id="runs"></tbody>
+          </table>
+        </div>
+        <p class="note pad" id="no-runs" hidden>No runs yet.</p>
+      </section>
+
+      <p class="note" id="last-command"></p>
+    </div>
+  </div>
+</div>
+</body>
+</html>

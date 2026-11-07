@@ -81,8 +81,27 @@ Every test also needs `power` and `serial`, for the boot it starts with.
 
 A test that needs a control the machine does not have is skipped there.
 A test whose controls include one a person does on that machine is a
-Needs you test there; runs skip those until the runner page can ask a
-person to act (lab PR 2). See [machine files](machine-files.md).
+Needs you test there. Runs skip those unless they are given
+`--with-person`, or the test is ticked in the runner page's Needs you
+group; then each step a person does waits for them to say it is done.
+See [machine files](machine-files.md).
+
+## Presets
+
+`presets.toml` beside the category folders names sets of tests to run
+together. The runner page offers them, with how long each took last time;
+`dukovo-lab run --preset <name>` runs one.
+
+```toml
+[[preset]]
+name = "quick"                 # what --preset takes: letters, digits, dashes
+title = "Quick check"          # what the page shows
+about = "A few minutes: boots, runs commands, pulls the cable"
+tests = ["boot", "features/ssh-command", "drivers/link-pull"]   # tests and categories
+```
+
+A preset naming a test or category that does not exist stops every
+command, as a broken test file does.
 
 ## Writing a good lab test
 

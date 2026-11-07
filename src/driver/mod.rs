@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
+use crate::stop::Stop;
 use crate::suite::PowerAction;
 
 /// A machine the runner is driving.
@@ -28,7 +29,7 @@ pub trait Driver: Send {
     fn boot_fresh(&mut self) -> Result<(), String>;
 
     /// Does a power action. [`PowerAction::Off`] returns once the machine
-    /// is off, or fails at `deadline`.
+    /// is off, or fails at `deadline` or when the run is stopped.
     fn power(&mut self, action: PowerAction, deadline: Instant) -> Result<(), String>;
 
     /// Whether the machine is on.
@@ -53,8 +54,9 @@ pub trait Driver: Send {
     fn screenshot(&mut self, to: &Path) -> Result<(), String>;
 
     /// Runs `command` on the machine as the lab account, stopping it at
-    /// `deadline`. Fails when there is no way to run it: the machine is
-    /// off, or the lab has no key.
+    /// `deadline`, or sooner when the run is stopped (the output's status
+    /// is then none). Fails when there is no way to run it: the machine
+    /// is off, or the lab has no key.
     fn run_command(&mut self, command: &str, deadline: Instant) -> Result<ssh::Output, String>;
 
     /// How many times longer than on real hardware tests may take here.
@@ -77,6 +79,8 @@ pub struct Setup {
     pub sockets: PathBuf,
     /// The lab key, for machines with an SSH channel.
     pub key: Option<PathBuf>,
+    /// Set when the run is stopped: long waits end early.
+    pub stop: Stop,
 }
 
 /// Starts the driver for `machine`. The machine stays off until

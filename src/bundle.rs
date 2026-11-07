@@ -10,6 +10,7 @@
 //! ```text
 //! run.json                  what ran: build, image, machines, tests, times
 //! results.json              each test's result on each machine, step by step
+//! events.jsonl              what happened, as it happened (see output.rs)
 //! logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, one log per test
 //! screenshots/<machine>/    <category>-<test>-<name>.png
 //! ```
@@ -47,8 +48,15 @@ pub struct RunRecord {
     pub machines: Vec<MachineRecord>,
     /// The tests picked, by id, in the order they ran.
     pub tests: Vec<String>,
+    /// The preset the tests came from, if they did.
+    #[serde(default)]
+    pub preset: Option<String>,
     /// Counts of results, once the run has ended.
     pub summary: Option<Summary>,
+    /// Whether `dukovo-lab stop` cut the run short; the tests it did not
+    /// finish are skipped, with the reason.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// A machine in run.json.
@@ -144,10 +152,10 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    /// Makes a new bundle in `store` for a run starting now, and writes its
-    /// run.json.
-    pub fn create(store: &Path, record: RunRecord, started: Utc) -> Result<Bundle, String> {
-        let dir = store.join("runs").join(started.date()).join(&record.id);
+    /// Makes a new bundle in `store` for the run `record` describes, in the
+    /// date folder its id names, and writes its run.json.
+    pub fn create(store: &Path, record: RunRecord) -> Result<Bundle, String> {
+        let dir = crate::store::bundle_dir(store, &record.id);
         fs::create_dir_all(&dir)
             .map_err(|err| format!("making the bundle {}: {err}", dir.display()))?;
         let bundle = Bundle { dir, record };
@@ -224,9 +232,11 @@ mod tests {
             image: "out/lab/dukovo.img".into(),
             machines: vec![],
             tests: vec!["boot/reaches-ready".into()],
+            preset: None,
             summary: None,
+            stopped: false,
         };
-        let bundle = Bundle::create(store.path(), record.clone(), started).unwrap();
+        let bundle = Bundle::create(store.path(), record.clone()).unwrap();
         let path = store.path().join("runs/2026-11-07").join(&id).join("run.json");
         assert_eq!(bundle.dir(), path.parent().unwrap());
         let read: RunRecord = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
