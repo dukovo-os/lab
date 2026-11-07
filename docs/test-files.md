@@ -12,19 +12,20 @@ test `drivers/link-pull`. A new file shows up in `dukovo-lab list` and
 the runner page with no other change.
 
 ```toml
-about = "The network link drops and comes back, and SSH answers again"
+about = "The network cable comes out and goes back in, and the network comes back"
 time = "3m"          # the longest the test may take, boot included
 fresh = false        # true: boot afresh for this test alone
 
 [[step]]
 link = "down"
 [[step]]
-serial = "link down"
+wait = "10s"
 [[step]]
 link = "up"
 [[step]]
-run = "ping -c 1 10.0.2.2"
-expect = "1 received"
+run = "ip link"
+expect = "LOWER_UP"
+expect_not = "NO-CARRIER"
 ```
 
 ## Keys
