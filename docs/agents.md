@@ -18,7 +18,9 @@ The lab's rules apply to agents as to people:
 - Never run anything against a machine outside the lab network, and
   never point an attack at anything but a lab machine.
 - Never copy the lab key, a bundle's security findings or the lab PC's
-  files anywhere but the private results repository.
+  files anywhere but the private results repository. Never read, print
+  or copy the lab password (`lab_password`): steps that need root get it
+  from the harness, which keeps it out of every output.
 - Needs you tests are for when a person is at the machines. Do not ask
   for them unless a person has said they are there.
 - Only the maintainer approves a fix for a finding.

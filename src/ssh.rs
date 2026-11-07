@@ -53,17 +53,30 @@ pub struct Output {
 impl Target {
     /// Runs `command` on the machine, stopping it at `deadline` or when
     /// the run is stopped.
-    pub fn run(&self, command: &str, deadline: Instant, stop: &Stop) -> Result<Output, String> {
+    pub fn run(
+        &self,
+        command: &str,
+        input: Option<&str>,
+        deadline: Instant,
+        stop: &Stop,
+    ) -> Result<Output, String> {
         let output_file = File::create(&self.scratch)
             .map_err(|err| format!("making {}: {err}", self.scratch.display()))?;
         let errors_file = output_file.try_clone().map_err(|err| err.to_string())?;
         let mut child = self
             .command(command)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(output_file)
             .stderr(errors_file)
             .spawn()
             .map_err(|err| format!("starting ssh: {err}; is OpenSSH's client installed?"))?;
+        // The input is short (a password's line): it fits in the pipe, so
+        // writing it all before reading never waits on the command.
+        // Dropping the pipe ends the input.
+        if let (Some(input), Some(mut pipe)) = (input, child.stdin.take()) {
+            use std::io::Write as _;
+            let _ = pipe.write_all(input.as_bytes());
+        }
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
                 break status.code();
@@ -108,9 +121,76 @@ impl Target {
     }
 }
 
+/// The lab account's password's file name in the configuration folder.
+/// `ob image --lab` gives the account this password; `root` steps give it
+/// to `elevate`. Like the key, it never leaves the lab PC.
+pub const PASSWORD_FILE: &str = "lab_password";
+
+/// How many characters the password has: letters and digits, so about
+/// 190 bits, past any guessing.
+const PASSWORD_LENGTH: usize = 32;
+
 /// The lab key's path in the configuration folder `config`.
 pub fn key_path(config: &Path) -> PathBuf {
     config.join(KEY_FILE)
+}
+
+/// The lab password's path in the configuration folder `config`.
+pub fn password_path(config: &Path) -> PathBuf {
+    config.join(PASSWORD_FILE)
+}
+
+/// Makes the lab password at `path` unless it is there; says whether it
+/// made it. The file is the lab PC user's alone (mode 0600) from the
+/// moment it exists.
+pub fn make_password(path: &Path) -> Result<bool, String> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(folder) = path.parent() {
+        fs::create_dir_all(folder).map_err(|err| format!("making {}: {err}", folder.display()))?;
+    }
+    const LETTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut random = File::open("/dev/urandom").map_err(|err| format!("/dev/urandom: {err}"))?;
+    let mut password = String::with_capacity(PASSWORD_LENGTH);
+    let mut byte = [0u8; 1];
+    while password.len() < PASSWORD_LENGTH {
+        random.read_exact(&mut byte).map_err(|err| format!("/dev/urandom: {err}"))?;
+        // 248 is the largest multiple of 62 a byte holds: bytes past it
+        // are skipped, so every character is as likely as the next.
+        if usize::from(byte[0]) < LETTERS.len() * 4 {
+            password.push(char::from(LETTERS[usize::from(byte[0]) % LETTERS.len()]));
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| format!("making {}: {err}", path.display()))?;
+    file.write_all(format!("{password}\n").as_bytes())
+        .map_err(|err| format!("writing {}: {err}", path.display()))?;
+    Ok(true)
+}
+
+/// Reads the lab password, if the lab has one.
+pub fn read_password(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let password = text.lines().next().unwrap_or_default().trim_end_matches('\r');
+            if password.is_empty() {
+                return Err(format!(
+                    "{} is empty; remove it and run `dukovo-lab key`",
+                    path.display()
+                ));
+            }
+            Ok(Some(password.to_string()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("reading {}: {err}", path.display())),
+    }
 }
 
 /// Makes the lab key at `path` unless it is there; says whether it made it.

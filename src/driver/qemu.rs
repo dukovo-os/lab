@@ -31,7 +31,7 @@ use super::{Driver, Setup};
 use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
 use crate::ssh;
-use crate::suite::PowerAction;
+use crate::suite::{PowerAction, Stick};
 
 /// The QEMU binary.
 const QEMU: &str = "qemu-system-x86_64";
@@ -345,7 +345,7 @@ impl Driver for Qemu {
         self.qmp()?.execute("set_link", &json!({ "name": NETDEV, "up": up })).map(drop)
     }
 
-    fn plug_usb(&mut self, image: &Path) -> Result<(), String> {
+    fn plug_usb(&mut self, stick: &Stick) -> Result<(), String> {
         if let Some(stick) = self.stick {
             return Err(format!("USB stick {stick} is still plugged in; pull it first"));
         }
@@ -354,9 +354,17 @@ impl Driver for Qemu {
         // halfway, so its QMP names are never taken.
         self.sticks += 1;
         let number = self.sticks;
-        // A copy, so the test's own file stays as it is whatever the guest writes.
+        // A copy, so the test's own file stays as it is whatever the guest
+        // writes; or zeros, as a stick fresh from the shop holds.
         let copy = self.setup.work.join(format!("stick-{number}.img"));
-        fs::copy(image, &copy).map_err(|err| format!("copying {}: {err}", image.display()))?;
+        match stick {
+            Stick::Image(image) => fs::copy(image, &copy)
+                .map(drop)
+                .map_err(|err| format!("copying {}: {err}", image.display()))?,
+            Stick::Blank(bytes) => File::create(&copy)
+                .and_then(|file| file.set_len(*bytes))
+                .map_err(|err| format!("making {}: {err}", copy.display()))?,
+        }
         let node = format!("stick{number}");
         let qmp = self.qmp()?;
         qmp.execute(
@@ -401,7 +409,12 @@ impl Driver for Qemu {
         self.qmp()?.execute("screendump", &json!({ "filename": to, "format": "png" })).map(drop)
     }
 
-    fn run_command(&mut self, command: &str, deadline: Instant) -> Result<ssh::Output, String> {
+    fn run_command(
+        &mut self,
+        command: &str,
+        input: Option<&str>,
+        deadline: Instant,
+    ) -> Result<ssh::Output, String> {
         let key = self
             .setup
             .key
@@ -417,7 +430,7 @@ impl Driver for Qemu {
             known_hosts: self.setup.work.join(format!("known_hosts-{}", self.boot)),
             scratch: self.setup.work.join("ssh-output"),
         };
-        target.run(command, deadline, &self.setup.stop)
+        target.run(command, input, deadline, &self.setup.stop)
     }
 
     fn slowdown(&self) -> u32 {
@@ -513,11 +526,18 @@ mod tests {
         qemu.set_link(false).unwrap();
         qemu.set_link(true).unwrap();
 
-        let stick = dir.write("stick.img", "");
-        File::options().write(true).open(&stick).unwrap().set_len(1 << 20).unwrap();
+        let image = dir.write("stick.img", "");
+        File::options().write(true).open(&image).unwrap().set_len(1 << 20).unwrap();
+        let stick = Stick::Image(image);
         qemu.plug_usb(&stick).unwrap();
         assert!(qemu.plug_usb(&stick).unwrap_err().contains("still plugged in"));
         qemu.unplug_usb().unwrap();
+        // A blank one: zeros of its size, made where the copies go.
+        qemu.plug_usb(&Stick::Blank(2 << 20)).unwrap();
+        let blank = dir.path().join("work/stick-2.img");
+        assert_eq!(fs::metadata(&blank).unwrap().len(), 2 << 20);
+        qemu.unplug_usb().unwrap();
+        assert!(!blank.exists(), "a pulled stick's file goes");
         qemu.plug_usb(&stick).unwrap();
 
         qemu.press_keys(&["shift-a".into(), "ret".into()]).unwrap();
@@ -525,7 +545,7 @@ mod tests {
         qemu.screenshot(&shot).unwrap();
         assert_eq!(&fs::read(&shot).unwrap()[..4], b"\x89PNG");
 
-        let error = qemu.run_command("true", soon()).unwrap_err();
+        let error = qemu.run_command("true", None, soon()).unwrap_err();
         assert!(error.contains("no key"), "{error}");
 
         qemu.power(PowerAction::Reset, soon()).unwrap();

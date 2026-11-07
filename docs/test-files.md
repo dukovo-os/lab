@@ -7,8 +7,8 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 
 Each lab test is one TOML file in Dukovo's repository, at
 `lab/tests/<category>/<name>.toml`. The folder is the category and the
-file name is the test's name, so `lab/tests/drivers/link-pull.toml` is the
-test `drivers/link-pull`. A new file shows up in `dukovo-lab list` and
+file name is the test's name, so `lab/tests/network/link-pull.toml` is the
+test `network/link-pull`. A new file shows up in `dukovo-lab list` and
 the runner page with no other change.
 
 ```toml
@@ -39,10 +39,22 @@ expect_not = "NO-CARRIER"
 
 ## Categories
 
-The folders, in the order lists show them: `boot` (boot and install),
-`drivers` (drivers and hardware), `features`, `performance`, `stress`
-(stress and soak), `security`, `console` (console UI), `web` (web console)
-and `desktop`. Any other folder under `lab/tests/` is an error.
+`categories.toml` beside the category folders names the categories, in
+the order lists and the runner page show them, and the title the page
+gives each. A category is a folder; a folder it does not name is an
+error, so a test can't hide in a folder no list shows.
+
+```toml
+[[category]]
+name = "network"                 # the folder: letters, digits, dashes
+title = "Network"                # what lists and the page show, 40 characters at most
+about = "Addresses, routes, names, ports, the firewall and the cable"
+```
+
+A suite with no `categories.toml` gets the built-in list: `boot`,
+`drivers`, `features`, `performance`, `stress`, `security`, `console`,
+`web` and `desktop`. Dukovo's suite names its own; add a category there
+when a new kind of test needs one.
 
 ## Steps
 
@@ -50,7 +62,7 @@ Each step has exactly one action key, and only the options that go with it.
 
 | Action | Options | Does | Control |
 | --- | --- | --- | --- |
-| `run = "<command>"` | `exit` (default 0), `expect`, `expect_not` | Runs the command over SSH as the `lab` account. Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. | ssh |
+| `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. | ssh |
 | `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started; after `power = "on"` or `"reset"`, only what the new boot printed. | serial |
 | `power = "on"` | | Powers the machine on. | power |
 | `power = "off"` | | Presses the power button and waits until the machine is off. Fails if it is still on at the time limit. | power |
@@ -58,14 +70,38 @@ Each step has exactly one action key, and only the options that go with it.
 | `power = "reset"` | | Presses reset. | power |
 | `power = "cut"` | | Pulls the power cord: the system gets no warning. | cord |
 | `link = "down"` or `"up"` | | Pulls or plugs in the network cable. | link |
-| `usb = "plug"` | `image` | Plugs in a USB stick holding a copy of `image`, a file in the test's folder. | usb |
+| `usb = "plug"` | `image` or `blank` | Plugs in a USB stick: a copy of `image`, a file in the test's folder, or with `blank = "64M"` an empty stick of that size, from `1M` to `4G` (`K`, `M` or `G`). | usb |
 | `usb = "unplug"` | | Pulls the stick out. | usb |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
 | `screenshot = "<name>"` | | Keeps the screen in the bundle as `screenshots/<machine>/<category>-<test>-<name>.png`. | screen |
-| `wait = "ready"` | | Waits until the machine has booted and, when it has an SSH channel, SSH answers. Use it after `power = "on"` or `"reset"`. | |
+| `wait = "ready"` | | Waits until the machine has booted, its ready line anywhere in the boot going now (since the last `power = "on"` or `"reset"`, even if a `serial` step found it), and, when it has an SSH channel, SSH answers. Use it after `power = "on"` or `"reset"`, and after a restart from inside, as `reboot`, with a `serial` step for the new boot's ready line first. | |
+| `wait = "off"` | | Waits until the machine turns itself off, as after `poweroff`. Fails if it is still on at the time limit. | power |
 | `wait = "<time>"` | | Waits that long. | |
 
 Every test also needs `power` and `serial`, for the boot it starts with.
+
+## Running as root
+
+Root never signs in over SSH, and elevate always asks for a password, so
+a step with `root = true` runs its command as `elevate -S <command>` and
+gives elevate the lab password on its standard input (ADR 0406 in
+Dukovo's repository). `dukovo-lab key` makes the password beside the lab
+key, `~/.config/dukovo-lab/lab_password`, and `ob image --lab` puts its
+hash in the image. The password never leaves the lab PC: anything a
+command prints has it replaced by `********` before it is shown or kept.
+Without the file, a run that picks a root step stops before it starts
+and says how to make one.
+
+Only the first command is elevated: in `run = "a | b"` only `a` runs as
+root. To run a pipeline, redirection or several commands as root, hand
+them to a shell: `run = "sh -c 'mkfs-fat /devices/sdb && fsck-fat -n /devices/sdb'"`.
+
+```toml
+[[step]]
+run = "service --status-all"
+root = true
+expect = "[ + ]  sshd"
+```
 
 ## How a test runs
 
@@ -97,7 +133,7 @@ together. The runner page offers them, with how long each took last time;
 name = "quick"                 # what --preset takes: letters, digits, dashes
 title = "Quick check"          # what the page shows
 about = "A few minutes: boots, runs commands, pulls the cable"
-tests = ["boot", "features/ssh-command", "drivers/link-pull"]   # tests and categories
+tests = ["boot/reaches-ready", "ssh/commands", "network/link-pull"]   # tests and categories
 ```
 
 A preset naming a test or category that does not exist stops every
@@ -109,6 +145,14 @@ command, as a broken test file does.
   console, a screen.
 - Keep each test to one thing, so its name says what broke.
 - Give `time` some room: it is a limit for a hang, not a benchmark.
+- Run as root only the steps that need it, so the rest check what an
+  ordinary account sees.
+- Find a USB stick by its size (`lsblk -dn`), never by a fixed device
+  name, before formatting it: the system disk's name differs from
+  machine to machine.
+- To hand something from a `lab` step to a root step, put it in the lab
+  account's home, `/users/lab`: each account on Dukovo has a `/tmp` of
+  its own.
 - Prefer sharing a boot. Use `fresh = true` only when the test changes
   the machine in a way later tests should not inherit, or checks the boot
   itself.

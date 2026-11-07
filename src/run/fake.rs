@@ -68,7 +68,7 @@ impl Driver for FakeMachine {
         Ok(())
     }
 
-    fn plug_usb(&mut self, _image: &Path) -> Result<(), String> {
+    fn plug_usb(&mut self, _stick: &crate::suite::Stick) -> Result<(), String> {
         Ok(())
     }
 
@@ -84,8 +84,23 @@ impl Driver for FakeMachine {
         fs::write(to, b"\x89PNG").map_err(|err| err.to_string())
     }
 
-    fn run_command(&mut self, command: &str, deadline: Instant) -> Result<Output, String> {
+    fn run_command(
+        &mut self,
+        command: &str,
+        input: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Output, String> {
         let (status, text) = match command {
+            // As Dukovo's elevate -S: the password is a line of the input.
+            // This one says it back, as a careless command might.
+            "elevate -S id" => match input {
+                Some("sesame\n") => (Some(0), "uid=0(root) heard sesame\n".into()),
+                _ => (Some(1), "elevate: a password is needed\n".into()),
+            },
+            "elevate -S poweroff" => {
+                self.on = false;
+                (Some(0), String::new())
+            }
             "true" => (Some(0), String::new()),
             "uname" => (Some(0), "Dukovo\n".into()),
             "false" => (Some(1), String::new()),
@@ -192,6 +207,7 @@ fn run_with(
         build: Some("0.13.0 test".into()),
         store: setting.dir.path().join("store"),
         key: Some(setting.dir.path().join("lab_ed25519")),
+        password: None,
         with_person,
         preset: None,
         schedule: None,
@@ -288,6 +304,55 @@ fn runs_tests_shares_boots_and_writes_the_bundle() {
         !setting.dir.path().join("store/work").join(&run.id).exists(),
         "work files are removed"
     );
+}
+
+#[test]
+fn root_steps_give_elevate_the_password_and_never_show_it() {
+    let setting = setting_with(&[
+        (
+            "features/root.toml",
+            "about = \"root\"\ntime = \"1m\"\n[[step]]\nrun = \"id\"\nroot = true\nexpect = \"uid=0\"\n",
+        ),
+        (
+            "boot/off.toml",
+            "about = \"off\"\ntime = \"1m\"\n[[step]]\nrun = \"poweroff\"\nroot = true\n[[step]]\nwait = \"off\"\n",
+        ),
+    ]);
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        with_person: false,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
+    // Nothing the run kept holds the password, though the command said it.
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let mut folders = vec![bundle];
+    let mut files = 0;
+    while let Some(folder) = folders.pop() {
+        for entry in fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+                continue;
+            }
+            files += 1;
+            let text = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+            assert!(!text.contains("sesame"), "{} holds the password", path.display());
+            if text.contains("uid=0(root)") {
+                assert!(text.contains("heard ********"), "{text}");
+            }
+        }
+    }
+    assert!(files > 3, "the bundle has its files");
 }
 
 #[test]

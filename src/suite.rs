@@ -23,9 +23,9 @@ use crate::Error;
 use crate::machines::{Control, Machine, Who, is_plain_name};
 use crate::units::{format_duration, parse_duration};
 
-/// The categories as (folder, title), in the order lists show them: the
-/// runner page's order.
-pub const CATEGORIES: &[(&str, &str)] = &[
+/// The categories when a tests folder has no `categories.toml`: those
+/// the first suites had, so an older Dukovo checkout still loads.
+const BUILT_IN_CATEGORIES: &[(&str, &str)] = &[
     ("boot", "Boot and install"),
     ("drivers", "Drivers and hardware"),
     ("features", "Features"),
@@ -36,6 +36,87 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("web", "Web console"),
     ("desktop", "Desktop"),
 ];
+
+/// The longest a category's title may be: the runner page's left side
+/// shows it on one line.
+const TITLE_MAX: usize = 40;
+
+/// A group of tests: a folder of the tests folder, with the title lists
+/// and the runner page show it under. The suite names its categories, and
+/// their order, in `categories.toml`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Category {
+    /// The folder, and what `run` takes for every test in it.
+    pub id: String,
+    pub title: String,
+    /// What its tests check, in a sentence; may be empty.
+    pub about: String,
+}
+
+/// categories.toml as written.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CategoriesFile {
+    #[serde(rename = "category", default)]
+    categories: Vec<CategoryFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CategoryFile {
+    name: String,
+    title: String,
+    #[serde(default)]
+    about: String,
+}
+
+/// Reads `<dir>/categories.toml`, in order; the built-in categories when
+/// there is none. Like a test file, one that is wrong stops every
+/// command.
+pub fn load_categories(dir: &Path) -> Result<Vec<Category>, Error> {
+    let path = dir.join("categories.toml");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BUILT_IN_CATEGORIES
+                .iter()
+                .map(|&(id, title)| Category {
+                    id: id.into(),
+                    title: title.into(),
+                    about: String::new(),
+                })
+                .collect());
+        }
+        Err(err) => return Err(Error::Usage(format!("reading {}: {err}", path.display()))),
+    };
+    let file: CategoriesFile = toml::from_str(&text)
+        .map_err(|err| Error::Usage(format!("{}: {}", path.display(), err.message())))?;
+    let mut categories: Vec<Category> = Vec::new();
+    for category in file.categories {
+        let bad = |why: &str| {
+            Error::Usage(format!("{}: category \"{}\": {why}", path.display(), category.name))
+        };
+        if !is_plain_name(&category.name) {
+            return Err(bad("a name is a folder's: letters, digits and dashes"));
+        }
+        if categories.iter().any(|known| known.id == category.name) {
+            return Err(bad("named twice"));
+        }
+        let title = category.title.trim();
+        if title.is_empty() || title.chars().count() > TITLE_MAX {
+            return Err(bad("a title is 1 to 40 characters"));
+        }
+        categories.push(Category {
+            id: category.name.clone(),
+            title: title.into(),
+            about: category.about.trim().into(),
+        });
+    }
+    if categories.is_empty() {
+        return Err(Error::Usage(format!("{}: it names no category", path.display())));
+    }
+    Ok(categories)
+}
 
 /// The longest a test may take: a soak test runs overnight, not longer.
 const LONGEST_TEST: Duration = Duration::from_secs(24 * 3600);
@@ -66,8 +147,8 @@ pub enum Step {
     Power(PowerAction),
     /// Plugs the network cable in (`true`) or pulls it (`false`).
     Link(bool),
-    /// Plugs in a USB stick holding a copy of this image file.
-    PlugUsb(PathBuf),
+    /// Plugs in a USB stick.
+    PlugUsb(Stick),
     /// Pulls the USB stick out.
     UnplugUsb,
     /// Presses keys, each a combination such as `ctrl-alt-delete`.
@@ -76,8 +157,19 @@ pub enum Step {
     Screenshot(String),
     /// Waits until the machine has booted and answers.
     WaitReady,
+    /// Waits until the machine has turned itself off.
+    WaitOff,
     /// Waits this long.
     Sleep(Duration),
+}
+
+/// What a plugged-in USB stick holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stick {
+    /// A copy of this image file, beside the test.
+    Image(PathBuf),
+    /// Nothing: this many bytes of zeros, for a test that formats it.
+    Blank(u64),
 }
 
 /// A command a `run` step runs, and what passes.
@@ -90,6 +182,9 @@ pub struct Command {
     pub expect: Vec<String>,
     /// Text its output must not hold.
     pub expect_not: Vec<String>,
+    /// Whether it runs as root, through `elevate -S` and the lab's
+    /// password.
+    pub root: bool,
 }
 
 /// What a `power` step does.
@@ -115,7 +210,7 @@ impl Step {
             Step::Run(_) => Some(Control::Ssh),
             Step::Serial(_) => Some(Control::Serial),
             Step::Power(PowerAction::Cut) => Some(Control::Cord),
-            Step::Power(_) => Some(Control::Power),
+            Step::Power(_) | Step::WaitOff => Some(Control::Power),
             Step::Link(_) => Some(Control::Link),
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
             Step::Keys(_) => Some(Control::Keys),
@@ -138,21 +233,26 @@ impl Step {
             },
             Step::Link(true) => "plug the network cable in".into(),
             Step::Link(false) => "pull the network cable".into(),
-            Step::PlugUsb(image) => {
+            Step::PlugUsb(Stick::Image(image)) => {
                 let name = image.file_name().unwrap_or_default().to_string_lossy();
                 format!("plug in a USB stick holding {name}")
+            }
+            Step::PlugUsb(Stick::Blank(bytes)) => {
+                format!("plug in a blank USB stick of {}", format_size(*bytes))
             }
             Step::UnplugUsb => "pull the USB stick".into(),
             Step::Keys(keys) => format!("press {}", keys.join(", ")),
             Step::Screenshot(name) => format!("take screenshot \"{name}\""),
             Step::WaitReady => "wait until booted".into(),
+            Step::WaitOff => "wait until it turns itself off".into(),
             Step::Sleep(time) => format!("wait {}", format_duration(*time)),
         }
     }
 }
 
 fn describe_command(command: &Command) -> String {
-    let mut text = format!("run `{}`, exit status {}", command.command, command.exit);
+    let who = if command.root { " as root" } else { "" };
+    let mut text = format!("run `{}`{who}, exit status {}", command.command, command.exit);
     for expect in &command.expect {
         text.push_str(&format!(", output has \"{expect}\""));
     }
@@ -240,6 +340,8 @@ struct StepFile {
     link: Option<LinkState>,
     usb: Option<UsbAction>,
     image: Option<String>,
+    blank: Option<String>,
+    root: Option<bool>,
     keys: Option<Vec<String>>,
     screenshot: Option<String>,
     wait: Option<String>,
@@ -283,6 +385,7 @@ pub fn load(dir: &Path) -> Result<Vec<Test>, Error> {
             Error::Usage(format!("reading the test folder {}: {err}", path.display()))
         })
     };
+    let categories = load_categories(dir)?;
     let mut tests = Vec::new();
     for category in read(dir)? {
         let category_dir = category.path();
@@ -290,10 +393,10 @@ pub fn load(dir: &Path) -> Result<Vec<Test>, Error> {
             continue;
         }
         let name = category.file_name().to_string_lossy().into_owned();
-        if !CATEGORIES.iter().any(|&(folder, _)| folder == name) {
-            let known: Vec<&str> = CATEGORIES.iter().map(|&(folder, _)| folder).collect();
+        if !categories.iter().any(|known| known.id == name) {
+            let known: Vec<&str> = categories.iter().map(|known| known.id.as_str()).collect();
             return Err(Error::Usage(format!(
-                "{}: not a test category; the categories are {}",
+                "{}: not a test category; the categories are {} (a new one goes in categories.toml)",
                 category_dir.display(),
                 known.join(", ")
             )));
@@ -307,7 +410,7 @@ pub fn load(dir: &Path) -> Result<Vec<Test>, Error> {
             }
         }
     }
-    let order = |test: &Test| CATEGORIES.iter().position(|&(folder, _)| folder == test.category);
+    let order = |test: &Test| categories.iter().position(|known| known.id == test.category);
     tests.sort_by(|a, b| order(a).cmp(&order(b)).then_with(|| a.id.cmp(&b.id)));
     Ok(tests)
 }
@@ -391,7 +494,9 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     only_with("exit", step.exit.is_some(), "run")?;
     only_with("expect", step.expect.is_some(), "run")?;
     only_with("expect_not", step.expect_not.is_some(), "run")?;
+    only_with("root", step.root.is_some(), "run")?;
     only_with("image", step.image.is_some(), "usb")?;
+    only_with("blank", step.blank.is_some(), "usb")?;
 
     if let Some(command) = step.run {
         if command.trim().is_empty() {
@@ -402,6 +507,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             exit: step.exit.unwrap_or(0),
             expect: step.expect.map(OneOrMore::into_vec).unwrap_or_default(),
             expect_not: step.expect_not.map(OneOrMore::into_vec).unwrap_or_default(),
+            root: step.root.unwrap_or(false),
         }));
     }
     if let Some(text) = step.serial {
@@ -417,7 +523,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         return Ok(Step::Link(matches!(state, LinkState::Up)));
     }
     if let Some(action) = step.usb {
-        return parse_usb(action, step.image, folder);
+        return parse_usb(action, step.image, step.blank, folder);
     }
     if let Some(keys) = step.keys {
         if keys.is_empty() || !keys.iter().all(|combo| is_key_combo(combo)) {
@@ -435,19 +541,43 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         return Ok(Step::Screenshot(name));
     }
     let wait = step.wait.unwrap_or_default();
-    if wait == "ready" {
-        return Ok(Step::WaitReady);
+    match wait.as_str() {
+        "ready" => return Ok(Step::WaitReady),
+        "off" => return Ok(Step::WaitOff),
+        _ => {}
     }
     parse_duration(&wait)
         .map(Step::Sleep)
-        .map_err(|err| format!("wait is \"ready\" or a time: {err}"))
+        .map_err(|err| format!("wait is \"ready\", \"off\" or a time: {err}"))
 }
 
-fn parse_usb(action: UsbAction, image: Option<String>, folder: &Path) -> Result<Step, String> {
-    match (action, image) {
-        (UsbAction::Unplug, _) => Ok(Step::UnplugUsb),
-        (UsbAction::Plug, None) => Err("usb = \"plug\" needs image, a file beside the test".into()),
-        (UsbAction::Plug, Some(image)) => {
+/// The largest blank stick: enough for any filesystem's smallest size,
+/// and quick to copy.
+const BLANK_MAX: u64 = 4 << 30;
+
+fn parse_usb(
+    action: UsbAction,
+    image: Option<String>,
+    blank: Option<String>,
+    folder: &Path,
+) -> Result<Step, String> {
+    match (action, image, blank) {
+        (UsbAction::Unplug, None, None) => Ok(Step::UnplugUsb),
+        (UsbAction::Unplug, ..) => Err("usb = \"unplug\" takes no image or blank".into()),
+        (UsbAction::Plug, None, None) => Err(
+            "usb = \"plug\" needs image, a file beside the test, or blank, a size such as \"64M\""
+                .into(),
+        ),
+        (UsbAction::Plug, Some(_), Some(_)) => Err("a stick is an image or blank, not both".into()),
+        (UsbAction::Plug, None, Some(size)) => match parse_size(&size) {
+            Some(bytes) if (1 << 20..=BLANK_MAX).contains(&bytes) => {
+                Ok(Step::PlugUsb(Stick::Blank(bytes)))
+            }
+            _ => Err(format!(
+                "blank = \"{size}\": a size from 1M to 4G, as a number and M or G, such as \"64M\""
+            )),
+        },
+        (UsbAction::Plug, Some(image), None) => {
             // Only files beside the test, so a test cannot read the lab
             // PC's other files into a machine.
             if image.contains('/') || image.starts_with('.') {
@@ -457,8 +587,29 @@ fn parse_usb(action: UsbAction, image: Option<String>, folder: &Path) -> Result<
             if !path.is_file() {
                 return Err(format!("image {} does not exist", path.display()));
             }
-            Ok(Step::PlugUsb(path))
+            Ok(Step::PlugUsb(Stick::Image(path)))
         }
+    }
+}
+
+/// `64M` or `2G` in bytes (binary units, as QEMU and `truncate` read them).
+fn parse_size(text: &str) -> Option<u64> {
+    let (number, unit) = text.split_at(text.len().checked_sub(1)?);
+    let shift = match unit {
+        "M" => 20,
+        "G" => 30,
+        _ => return None,
+    };
+    let number: u64 = number.parse().ok()?;
+    number.checked_mul(1 << shift)
+}
+
+/// Bytes as `parse_size` reads them.
+fn format_size(bytes: u64) -> String {
+    if bytes.is_multiple_of(1 << 30) {
+        format!("{}G", bytes >> 30)
+    } else {
+        format!("{}M", bytes >> 20)
     }
 }
 
@@ -476,7 +627,9 @@ pub fn select<'a>(tests: &'a [Test], names: &[String]) -> Result<Vec<&'a Test>, 
     let mut picked: Vec<&Test> = Vec::new();
     for name in names {
         let category = name.strip_suffix('/').unwrap_or(name);
-        let matching: Vec<&Test> = if CATEGORIES.iter().any(|&(folder, _)| folder == category) {
+        // A category is a folder the tests are in: `load` let in only
+        // the suite's own.
+        let matching: Vec<&Test> = if tests.iter().any(|test| test.category == category) {
             tests.iter().filter(|test| test.category == category).collect()
         } else {
             tests.iter().filter(|test| test.id == *name).collect()
@@ -630,6 +783,7 @@ expect = "1 received"
                 exit: 0,
                 expect: vec!["1 received".into()],
                 expect_not: vec![],
+                root: false,
             })
         );
         let controls: Vec<Control> = test.controls().into_iter().collect();
@@ -646,6 +800,52 @@ expect = "1 received"
         dir.write("features/notes.txt", "not a test");
         let ids: Vec<String> = load(dir.path()).unwrap().into_iter().map(|test| test.id).collect();
         assert_eq!(ids, ["boot/z", "drivers/m", "features/a", "features/b"]);
+    }
+
+    #[test]
+    fn the_suite_names_its_categories_and_their_order() {
+        let dir = TempDir::new("suite-categories");
+        let tiny = "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n";
+        for file in ["network/a.toml", "boot/b.toml", "storage/c.toml"] {
+            dir.write(file, tiny);
+        }
+        let categories = "[[category]]\nname = \"storage\"\ntitle = \"Disks and files\"\n\
+                          [[category]]\nname = \"boot\"\ntitle = \"Boot and power\"\n\
+                          about = \"Booting, restarting, turning off\"\n\
+                          [[category]]\nname = \"network\"\ntitle = \"Network\"\n";
+        dir.write("categories.toml", categories);
+        let ids: Vec<String> = load(dir.path()).unwrap().into_iter().map(|test| test.id).collect();
+        assert_eq!(ids, ["storage/c", "boot/b", "network/a"]);
+        let loaded = load_categories(dir.path()).unwrap();
+        assert_eq!(loaded[1].title, "Boot and power");
+        assert_eq!(loaded[1].about, "Booting, restarting, turning off");
+
+        // A folder the file does not name stops everything, saying where
+        // to add it.
+        dir.write("hardware/d.toml", tiny);
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("not a test category") && why.contains("categories.toml"), "{why}");
+
+        // Without the file, the built-in ones.
+        let old = TempDir::new("suite-categories-old");
+        old.write("drivers/link.toml", tiny);
+        assert_eq!(load(old.path()).unwrap()[0].category, "drivers");
+        assert_eq!(load_categories(old.path()).unwrap()[1].title, "Drivers and hardware");
+
+        for (text, complaint) in [
+            ("[[category]]\nname = \"Boot\"\ntitle = \"x\"\n", "letters, digits and dashes"),
+            (
+                "[[category]]\nname = \"a\"\ntitle = \"x\"\n[[category]]\nname = \"a\"\ntitle = \"y\"\n",
+                "named twice",
+            ),
+            ("[[category]]\nname = \"a\"\ntitle = \" \"\n", "1 to 40 characters"),
+            ("[[category]]\nname = \"a\"\ntitle = \"x\"\ncolour = 1\n", "unknown field"),
+            ("", "names no category"),
+        ] {
+            dir.write("categories.toml", text);
+            let Err(Error::Usage(why)) = load_categories(dir.path()) else { panic!("{text}") };
+            assert!(why.contains(complaint), "{text}: {why}");
+        }
     }
 
     #[test]
@@ -678,7 +878,7 @@ expect = "1 received"
             (
                 "boot/h.toml",
                 &format!("{head}[[step]]\nwait = \"soon\"\n"),
-                "wait is \"ready\" or a time",
+                "wait is \"ready\", \"off\" or a time",
             ),
             ("boot/i.toml", &format!("{head}[[step]]\npower = \"sideways\"\n"), "unknown variant"),
             ("boot/j.toml", &format!("{head}[[step]]\nkeys = [\"Ctrl+C\"]\n"), "key names"),
@@ -701,16 +901,53 @@ expect = "1 received"
     }
 
     #[test]
-    fn a_usb_image_is_a_file_beside_the_test() {
+    fn a_usb_stick_is_a_file_beside_the_test_or_blank() {
         let dir = TempDir::new("suite-usb");
         dir.write("features/stick.img", "");
         dir.write(
             "features/stick.toml",
-            "about = \"x\"\ntime = \"1m\"\n[[step]]\nusb = \"plug\"\nimage = \"stick.img\"\n[[step]]\nusb = \"unplug\"\n",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nusb = \"plug\"\nimage = \"stick.img\"\n\
+             [[step]]\nusb = \"unplug\"\n[[step]]\nusb = \"plug\"\nblank = \"64M\"\n",
         );
         let tests = load(dir.path()).unwrap();
-        assert_eq!(tests[0].steps[0], Step::PlugUsb(dir.path().join("features/stick.img")));
+        let image = dir.path().join("features/stick.img");
+        assert_eq!(tests[0].steps[0], Step::PlugUsb(Stick::Image(image)));
         assert_eq!(tests[0].steps[1], Step::UnplugUsb);
+        assert_eq!(tests[0].steps[2], Step::PlugUsb(Stick::Blank(64 << 20)));
+        assert_eq!(tests[0].steps[2].describe(), "plug in a blank USB stick of 64M");
+        assert_eq!(parse_size("2G"), Some(2 << 30));
+        for size in ["64", "64K", "0M", "8G", "-1M", "M"] {
+            dir.write(
+                "features/stick.toml",
+                &format!(
+                    "about = \"x\"\ntime = \"1m\"\n[[step]]\nusb = \"plug\"\nblank = \"{size}\"\n"
+                ),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{size} loaded") };
+            assert!(why.contains("a size from 1M to 4G"), "{size}: {why}");
+        }
+    }
+
+    #[test]
+    fn root_goes_with_run_and_off_with_wait() {
+        let dir = TempDir::new("suite-root");
+        dir.write(
+            "boot/off.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"poweroff\"\nroot = true\n\
+             [[step]]\nwait = \"off\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        let Step::Run(command) = &test.steps[0] else { panic!("not a run") };
+        assert!(command.root);
+        assert_eq!(test.steps[0].describe(), "run `poweroff` as root, exit status 0");
+        assert_eq!(test.steps[1], Step::WaitOff);
+        assert_eq!(test.steps[1].control(), Some(Control::Power));
+        dir.write(
+            "boot/off.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"off\"\nroot = true\n",
+        );
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("root goes only with run"), "{why}");
     }
 
     #[test]

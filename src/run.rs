@@ -47,6 +47,8 @@ use crate::units::format_duration;
 /// What a stopped test's result says.
 const STOPPED_DURING: &str = "the run was stopped during this test";
 const STOPPED_BEFORE: &str = "the run was stopped before this test";
+/// Why a `root` step cannot run.
+pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no password: run `dukovo-lab key`, then build the image again with `ob image --lab`";
 
 /// What to run.
 pub struct Request<'a> {
@@ -60,6 +62,9 @@ pub struct Request<'a> {
     pub store: PathBuf,
     /// The lab key, when there is one.
     pub key: Option<PathBuf>,
+    /// The lab account's password, which `root` steps give `elevate`,
+    /// when the lab has one.
+    pub password: Option<String>,
     /// Whether to run Needs you tests, asking a person to do their steps.
     pub with_person: bool,
     /// The preset the tests came from, for run.json.
@@ -84,6 +89,7 @@ struct Shared<'a> {
     running: &'a Running,
     stop: &'a Stop,
     with_person: bool,
+    password: Option<&'a str>,
 }
 
 /// Starts a machine's driver; [`crate::driver::start`] outside tests.
@@ -148,6 +154,7 @@ pub fn run(
         running: &running,
         stop: &stop,
         with_person: request.with_person,
+        password: request.password.as_deref(),
     };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
         // Ends the watcher below however this ends, a worker's panic too,
@@ -531,8 +538,10 @@ impl<'a> Worker<'a> {
     /// Waits for the machine's ready line on the serial console, then,
     /// when the machine has an SSH channel, for SSH to answer.
     fn wait_ready(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        // The ready line counts wherever it is in this boot, so a test may
+        // wait for it with a serial step first.
         let ready = self.machine.ready.clone();
-        self.wait_serial(&ready, deadline)?;
+        self.wait_serial_where(&ready, Search::ThisBoot, deadline)?;
         // Without a key, tests that have no `run` steps still run, on
         // the serial console alone; the run refuses the others before
         // it starts.
@@ -545,7 +554,7 @@ impl<'a> Worker<'a> {
                 return Err(StepFailure::Skip(STOPPED_DURING.into()));
             }
             let attempt = deadline.min(Instant::now() + Duration::from_secs(20));
-            match self.driver.run_command("true", attempt) {
+            match self.driver.run_command("true", None, attempt) {
                 Ok(output) if output.status == Some(0) => return Ok(None),
                 Ok(output) => last = output.text.trim().to_string(),
                 Err(err) => return Err(StepFailure::Error(err)),
@@ -574,8 +583,8 @@ impl<'a> Worker<'a> {
             Step::Serial(text) => self.wait_serial(text, deadline),
             Step::Power(action) => self.power(*action, deadline),
             Step::Link(up) => self.driver.set_link(*up).map(|()| None).map_err(StepFailure::Error),
-            Step::PlugUsb(image) => {
-                self.driver.plug_usb(image).map(|()| None).map_err(StepFailure::Error)
+            Step::PlugUsb(stick) => {
+                self.driver.plug_usb(stick).map(|()| None).map_err(StepFailure::Error)
             }
             Step::UnplugUsb => self.driver.unplug_usb().map(|()| None).map_err(StepFailure::Error),
             Step::Keys(keys) => {
@@ -585,6 +594,7 @@ impl<'a> Worker<'a> {
                 self.screenshot(test, name).map(|()| None).map_err(StepFailure::Error)
             }
             Step::WaitReady => self.wait_ready(deadline),
+            Step::WaitOff => self.wait_off(deadline),
             Step::Sleep(time) => {
                 let until = Instant::now() + *time;
                 let end = until.min(deadline);
@@ -654,13 +664,29 @@ impl<'a> Worker<'a> {
                 command.command
             )));
         }
-        let output =
-            self.driver.run_command(&command.command, deadline).map_err(StepFailure::Error)?;
+        // As root: `elevate -S` reads the lab's password from the
+        // command's input, so it is never on a command line, and it is
+        // taken out of whatever comes back.
+        let (line, input, prompt) = if command.root {
+            let Some(password) = self.shared.password else {
+                return Err(StepFailure::Error(NO_PASSWORD.into()));
+            };
+            (format!("elevate -S {}", command.command), Some(format!("{password}\n")), "#")
+        } else {
+            (command.command.clone(), None, "$")
+        };
+        let mut output = self
+            .driver
+            .run_command(&line, input.as_deref(), deadline)
+            .map_err(StepFailure::Error)?;
+        if let Some(password) = self.shared.password {
+            output.text = output.text.replace(password, "********");
+        }
         // Cut short by a stop: the command's end says nothing.
         if output.status.is_none() && self.shared.stop.requested() {
             return Err(StepFailure::Skip(STOPPED_DURING.into()));
         }
-        let shown = format!("$ {}\n{}", command.command, output.text.trim_end());
+        let shown = format!("{prompt} {}\n{}", command.command, output.text.trim_end());
         let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
         match output.status {
             None => return fail("it was still running at the test's time limit".into()),
@@ -687,19 +713,48 @@ impl<'a> Worker<'a> {
         Ok(Some(shown))
     }
 
+    /// Waits until the machine turns itself off, as after `poweroff`.
+    fn wait_off(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        while self.driver.is_on() {
+            if self.shared.stop.requested() {
+                return Err(StepFailure::Skip(STOPPED_DURING.into()));
+            }
+            if Instant::now() >= deadline {
+                return Err(StepFailure::Fail(
+                    "the machine was still on at the test's time limit".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Ok(None)
+    }
+
     /// Waits for `text` on the serial console after the last text found.
     fn wait_serial(
         &mut self,
         text: &str,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
+        self.wait_serial_where(text, Search::AfterLastFound, deadline)
+    }
+
+    fn wait_serial_where(
+        &mut self,
+        text: &str,
+        search: Search,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let found = |serial: &mut SerialWatch| match search {
+            Search::AfterLastFound => serial.find(text),
+            Search::ThisBoot => serial.seen_this_boot(text),
+        };
         loop {
-            if self.serial.find(text) {
+            if found(&mut self.serial) {
                 return Ok(None);
             }
             if !self.driver.is_on() {
                 // The last lines may have landed as the machine went off.
-                if self.serial.find(text) {
+                if found(&mut self.serial) {
                     return Ok(None);
                 }
                 return Err(StepFailure::Fail(format!(
@@ -728,7 +783,7 @@ impl<'a> Worker<'a> {
         // A new boot starts: serial steps and `wait = "ready"` after this
         // look only at what it prints, never at the boot before.
         if matches!(action, PowerAction::On | PowerAction::Reset) {
-            self.serial.skip_to_end();
+            self.serial.new_boot();
         }
         match self.driver.power(action, deadline) {
             Ok(()) => Ok(None),
@@ -777,6 +832,15 @@ impl<'a> Worker<'a> {
 
 /// Follows a serial log, finding text in order.
 ///
+/// Where a wait for serial text looks.
+#[derive(Clone, Copy)]
+enum Search {
+    /// After the last text a step found, as `serial` steps do.
+    AfterLastFound,
+    /// Anywhere in the boot going now, as `wait = "ready"` does.
+    ThisBoot,
+}
+
 /// The log is read as it grows, only its new bytes each time, since a
 /// soak test's log grows for hours. Whole lines are cleaned once and kept;
 /// the line still being written is cleaned again each time, with any
@@ -796,6 +860,10 @@ struct SerialWatch {
     lines_end: usize,
     /// Where the next search starts: the end of the last text found.
     cursor: usize,
+    /// Where the boot going now starts: the machine's last power on or
+    /// reset, or the log's start. `wait = "ready"` looks for the ready
+    /// line from here, whatever serial steps found since.
+    boot: usize,
 }
 
 impl SerialWatch {
@@ -807,6 +875,7 @@ impl SerialWatch {
             text: String::new(),
             lines_end: 0,
             cursor: 0,
+            boot: 0,
         }
     }
 
@@ -843,9 +912,25 @@ impl SerialWatch {
         self.cursor = self.text.len();
     }
 
-    /// Searches from the start of the log again.
+    /// A new boot starts at the end of the log as it is now: power on or
+    /// reset. Searches start there, and so does the boot.
+    fn new_boot(&mut self) {
+        self.skip_to_end();
+        self.boot = self.cursor;
+    }
+
+    /// Searches from the start of the log again, a fresh boot's.
     fn rewind(&mut self) {
         self.cursor = 0;
+        self.boot = 0;
+    }
+
+    /// Whether `needle` has appeared anywhere in the boot going now. It
+    /// moves nothing, so a serial step that already found the same text
+    /// does not hide it.
+    fn seen_this_boot(&mut self, needle: &str) -> bool {
+        self.refresh();
+        self.text.get(self.boot..).is_some_and(|boot| boot.contains(needle))
     }
 
     /// Whether `needle` has appeared since the last text found; moves past it.
@@ -980,6 +1065,25 @@ mod tests {
         assert!(watch.find("two"));
         watch.skip_to_end();
         assert!(!watch.find("one"));
+    }
+
+    #[test]
+    fn the_ready_line_counts_anywhere_in_the_boot_going_now() {
+        let dir = crate::testing::TempDir::new("serial-boot");
+        let path = dir.write("serial.log", "Boot complete.\n");
+        let mut watch = SerialWatch::new(path.clone());
+        // A serial step found the ready line; waiting for ready still sees it.
+        assert!(watch.find("Boot complete."));
+        assert!(watch.seen_this_boot("Boot complete."));
+        // A test sharing the boot starts after it, and still sees it.
+        watch.skip_to_end();
+        assert!(watch.seen_this_boot("Boot complete."));
+        // After power on, only the new boot's own counts.
+        watch.new_boot();
+        assert!(!watch.seen_this_boot("Boot complete."));
+        fs::write(&path, "Boot complete.\nRadix\nBoot complete.\n").unwrap();
+        assert!(watch.seen_this_boot("Boot complete."));
+        assert!(watch.find("Boot complete."), "the serial step's own place is untouched");
     }
 
     #[test]

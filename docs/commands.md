@@ -36,13 +36,13 @@ The tests by category, with their time limits, and a line for each
 machine a test does not simply run on. With `--json`:
 
 ```json
-{"tests": [{"id": "drivers/link-pull", "category": "drivers", "about": "...", "time": "3m",
-  "fresh": false, "file": "lab/tests/drivers/link-pull.toml",
+{"tests": [{"id": "network/link-pull", "category": "network", "about": "...", "time": "3m",
+  "fresh": false, "file": "lab/tests/network/link-pull.toml",
   "controls": ["power", "serial", "link", "ssh"],
   "machines": [{"machine": "qemu", "fit": "runs", "controls": []}],
   "steps": [{"step": "pull the network cable", "control": "link"}],
   "last_milliseconds": {"qemu": 61500}}],
- "categories": [{"id": "boot", "title": "Boot and install"}],
+ "categories": [{"id": "boot", "title": "Boot and power", "about": "..."}],
  "presets": [{"name": "quick", "title": "Quick check", "about": "...", "tests": ["boot/reaches-ready"]}]}
 ```
 
@@ -82,7 +82,7 @@ dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
 
 Runs the tests on each machine (default `qemu`), the machines side by
 side, and writes a results bundle (below). Tests are named by id
-(`drivers/link-pull`) or by category (`drivers`); each runs once, in the
+(`network/link-pull`) or by category (`network`); each runs once, in the
 order given. `--preset` runs a preset's tests instead. Tests a machine
 cannot run are skipped there with the reason.
 
@@ -105,7 +105,7 @@ its time in `at`:
 {"event":"run-started","id":"20261107-153012-4f2a","bundle":"/home/chase/.local/share/dukovo-lab/runs/2026-11-07/20261107-153012-4f2a","machines":["qemu"],"tests":["boot/reaches-ready"],"at":"2026-11-07T15:30:12Z"}
 {"event":"test-started","machine":"qemu","test":"boot/reaches-ready","at":"..."}
 {"event":"step-ended","machine":"qemu","test":"boot/reaches-ready","step":"run `whoami`, exit status 0, output has \"lab\"","result":"pass","milliseconds":800,"note":"$ whoami\nlab","at":"..."}
-{"event":"person-needed","machine":"optiplex","test":"drivers/cable-pull","step":"pull the network cable","done":"dukovo-lab done 20261107-153012-4f2a --machine optiplex","at":"..."}
+{"event":"person-needed","machine":"optiplex","test":"network/cable-pull","step":"pull the network cable","done":"dukovo-lab done 20261107-153012-4f2a --machine optiplex","at":"..."}
 {"event":"test-ended","machine":"qemu","test":"boot/reaches-ready","result":"pass","reason":null,"milliseconds":41000,"boot":1,"log":"logs/qemu/boot-reaches-ready.log","screenshots":[],"at":"..."}
 {"event":"run-ended","id":"20261107-153012-4f2a","bundle":"...","summary":{"passed":1,"failed":0,"skipped":0,"errors":0},"stopped":false,"findings":[],"at":"..."}
 ```
@@ -144,7 +144,7 @@ answers. With `--json`:
 {"id": "...", "state": "running", "bundle": "...", "build": "0.13.0 fd2a9e8", "preset": null,
  "started": "...", "ended": null,
  "counts": {"passed": 14, "failed": 2, "skipped": 0, "errors": 0, "running": 1, "queued": 20},
- "machines": [{"name": "qemu", "running": "drivers/link-pull", "counts": {...}}],
+ "machines": [{"name": "qemu", "running": "network/link-pull", "counts": {...}}],
  "tests": [{"test": "boot/reaches-ready", "machine": "qemu", "state": "pass", "reason": null,
             "milliseconds": 41000, "started": "..."}],
  "waiting": [{"machine": "optiplex", "test": "...", "step": "pull the network cable", "done": "dukovo-lab done ..."}],
@@ -319,10 +319,14 @@ ui` gives the image. See [the runner page](runner-page.md).
 dukovo-lab key
 ```
 
-Makes the lab's SSH key, `lab_ed25519` in the configuration folder, if
-it is not there, and prints the public key's path. `ob image --lab` puts
-that public key in the image; the private key never leaves the lab PC.
-With `--json`: `{"public_key": "<path>", "made": true}`.
+Makes the lab's SSH key, `lab_ed25519` in the configuration folder, and
+the lab password, `lab_password` beside it, each if it is not there, and
+prints the public key's path. `ob image --lab` puts the public key and
+the password's hash in the image; the private key and the password
+never leave the lab PC. The password is 32 random letters and digits,
+in a file only its owner reads; steps with `root = true` give it to
+elevate ([test files](test-files.md#running-as-root)). With `--json`:
+`{"public_key": "<path>", "made": true, "password_file": "<path>", "made_password": false}`.
 
 ## Exit status
 
@@ -369,6 +373,8 @@ JSON. Times are UTC, in RFC 3339.
 | "connecting to QMP" errors | QEMU stopped before it was ready. `qemu-<n>.log` holds its command line and its own message. |
 | A test passes on KVM and fails on time without it | QEMU's emulator is several times slower: raise the machine's `tcg_slowdown`, not the test's `time`. |
 | `run` exits 2 saying a test runs commands and the lab has no key | Run `dukovo-lab key`, then rebuild the image with `ob image --lab`. |
+| `run` exits 2 saying a step runs as root and the lab has no password | The lab key was made before the lab password existed. Run `dukovo-lab key`, which makes the password beside the key, then rebuild the image (`ob lab` does both). |
+| A root step fails with "Sorry, try again." | The image holds another password's hash: it was built before the current `lab_password`, or on another PC. Rebuild it. |
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |
 | `status` says a run `died` | Its process ended part way (killed, crashed, or the PC went down). `results` has what it finished; a detached run's own last messages are in `status`'s `output`. |
 | `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |
