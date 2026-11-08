@@ -178,6 +178,15 @@ pub enum Step {
     PlugUsb(Stick),
     /// Pulls the USB stick out.
     UnplugUsb,
+    /// Puts a memory card in the machine's card reader: the image or
+    /// blank a [`Stick`] says, on a card.
+    InsertCard(Stick),
+    /// Takes the memory card out of the card reader, whether or not the
+    /// machine let it go.
+    RemoveCard,
+    /// Puts the memory card taken out last back in, holding what the
+    /// machine wrote on it.
+    ReinsertCard,
     /// Presses keys, each a combination such as `ctrl-alt-delete`.
     Keys(Vec<String>),
     /// Keeps a screenshot under this name.
@@ -263,7 +272,8 @@ pub struct Bench {
 /// `ob bench` holds every row.
 pub const DEFAULT_LIMIT: f64 = 1.00;
 
-/// What a plugged-in USB stick holds.
+/// What a plugged-in USB stick, or a memory card put in a card reader,
+/// holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stick {
     /// A copy of this image file, beside the test.
@@ -316,6 +326,7 @@ impl Step {
             Step::Power(_) | Step::WaitOff => Some(Control::Power),
             Step::Link(_) => Some(Control::Link),
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
+            Step::InsertCard(_) | Step::RemoveCard | Step::ReinsertCard => Some(Control::Card),
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
             Step::Attack(_) => Some(Control::Attack),
@@ -349,6 +360,15 @@ impl Step {
                 format!("plug in a blank USB stick of {}", format_size(*bytes))
             }
             Step::UnplugUsb => "pull the USB stick".into(),
+            Step::InsertCard(Stick::Image(image)) => {
+                let name = image.file_name().unwrap_or_default().to_string_lossy();
+                format!("put a memory card holding {name} in the card reader")
+            }
+            Step::InsertCard(Stick::Blank(bytes)) => {
+                format!("put a blank memory card of {} in the card reader", format_size(*bytes))
+            }
+            Step::RemoveCard => "take the memory card out of the card reader".into(),
+            Step::ReinsertCard => "put the memory card back in the card reader".into(),
             Step::Keys(keys) => format!("press {}", keys.join(", ")),
             Step::Type(text) => format!("type \"{}\"", text.escape_debug()),
             Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
@@ -539,6 +559,7 @@ struct StepFile {
     power: Option<PowerAction>,
     link: Option<LinkState>,
     usb: Option<UsbAction>,
+    card: Option<CardAction>,
     image: Option<String>,
     blank: Option<String>,
     root: Option<bool>,
@@ -573,6 +594,14 @@ enum LinkState {
 enum UsbAction {
     Plug,
     Unplug,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum CardAction {
+    Insert,
+    Remove,
+    Reinsert,
 }
 
 /// `expect = "text"` or `expect = ["one", "two"]`.
@@ -681,6 +710,22 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             parse_step(step, folder).map_err(|err| bad(format!("step {}: {err}", index + 1)))?;
         steps.push(step);
     }
+    // A card is put back only once one was taken out.
+    let mut out = false;
+    for (index, step) in steps.iter().enumerate() {
+        match step {
+            Step::RemoveCard => out = true,
+            Step::InsertCard(_) => out = false,
+            Step::ReinsertCard if !out => {
+                return Err(bad(format!(
+                    "step {}: card = \"reinsert\" puts back a card the test took out, and none is out",
+                    index + 1
+                )));
+            }
+            Step::ReinsertCard => out = false,
+            _ => {}
+        }
+    }
     let mut screenshots = BTreeSet::new();
     for step in &steps {
         if let Step::Screenshot(shot) = step
@@ -711,6 +756,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("power", step.power.is_some()),
         ("link", step.link.is_some()),
         ("usb", step.usb.is_some()),
+        ("card", step.card.is_some()),
         ("keys", step.keys.is_some()),
         ("screenshot", step.screenshot.is_some()),
         ("wait", step.wait.is_some()),
@@ -727,7 +773,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, attack, host, serial, power, link, usb, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, host, serial, power, link, usb, card, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -779,8 +825,12 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     }
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
-    only_with("image", step.image.is_some(), "usb")?;
-    only_with("blank", step.blank.is_some(), "usb")?;
+    // A stick's or a card's: what it holds.
+    for (option, set) in [("image", step.image.is_some()), ("blank", step.blank.is_some())] {
+        if set && !matches!(given[0], "usb" | "card") {
+            return Err(format!("{option} goes only with usb or card"));
+        }
+    }
 
     let command = |text: String, step: &StepFile| Command {
         command: text,
@@ -844,7 +894,31 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         return Ok(Step::Link(matches!(state, LinkState::Up)));
     }
     if let Some(action) = step.usb {
-        return parse_usb(action, step.image, step.blank, folder);
+        return match action {
+            UsbAction::Unplug if step.image.is_some() || step.blank.is_some() => {
+                Err("usb = \"unplug\" takes no image or blank".into())
+            }
+            UsbAction::Unplug => Ok(Step::UnplugUsb),
+            UsbAction::Plug => {
+                parse_medium("usb = \"plug\"", "stick", step.image, step.blank, folder)
+                    .map(Step::PlugUsb)
+            }
+        };
+    }
+    if let Some(action) = step.card {
+        return match action {
+            CardAction::Remove | CardAction::Reinsert
+                if step.image.is_some() || step.blank.is_some() =>
+            {
+                Err("only card = \"insert\" takes an image or blank".into())
+            }
+            CardAction::Remove => Ok(Step::RemoveCard),
+            CardAction::Reinsert => Ok(Step::ReinsertCard),
+            CardAction::Insert => {
+                parse_medium("card = \"insert\"", "card", step.image, step.blank, folder)
+                    .map(Step::InsertCard)
+            }
+        };
     }
     if let Some(keys) = step.keys {
         if keys.is_empty() || !keys.iter().all(|combo| is_key_combo(combo)) {
@@ -970,33 +1044,32 @@ fn is_row_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The largest blank stick: enough for any filesystem's smallest size,
-/// and quick to copy.
+/// The largest blank stick or card: enough for any filesystem's smallest
+/// size, and quick to copy.
 const BLANK_MAX: u64 = 4 << 30;
 
-fn parse_usb(
-    action: UsbAction,
+/// What a stick or card that `action` (`usb = "plug"`, `card = "insert"`)
+/// puts in holds: a copy of `image`, or `blank` bytes of zeros. `what`
+/// names it in the messages.
+fn parse_medium(
+    action: &str,
+    what: &str,
     image: Option<String>,
     blank: Option<String>,
     folder: &Path,
-) -> Result<Step, String> {
-    match (action, image, blank) {
-        (UsbAction::Unplug, None, None) => Ok(Step::UnplugUsb),
-        (UsbAction::Unplug, ..) => Err("usb = \"unplug\" takes no image or blank".into()),
-        (UsbAction::Plug, None, None) => Err(
-            "usb = \"plug\" needs image, a file beside the test, or blank, a size such as \"64M\""
-                .into(),
-        ),
-        (UsbAction::Plug, Some(_), Some(_)) => Err("a stick is an image or blank, not both".into()),
-        (UsbAction::Plug, None, Some(size)) => match parse_size(&size) {
-            Some(bytes) if (1 << 20..=BLANK_MAX).contains(&bytes) => {
-                Ok(Step::PlugUsb(Stick::Blank(bytes)))
-            }
+) -> Result<Stick, String> {
+    match (image, blank) {
+        (None, None) => Err(format!(
+            "{action} needs image, a file beside the test, or blank, a size such as \"64M\""
+        )),
+        (Some(_), Some(_)) => Err(format!("a {what} is an image or blank, not both")),
+        (None, Some(size)) => match parse_size(&size) {
+            Some(bytes) if (1 << 20..=BLANK_MAX).contains(&bytes) => Ok(Stick::Blank(bytes)),
             _ => Err(format!(
                 "blank = \"{size}\": a size from 1M to 4G, as a number and M or G, such as \"64M\""
             )),
         },
-        (UsbAction::Plug, Some(image), None) => {
+        (Some(image), None) => {
             // Only files beside the test, so a test cannot read the lab
             // PC's other files into a machine.
             if image.contains('/') || image.starts_with('.') {
@@ -1006,7 +1079,7 @@ fn parse_usb(
             if !path.is_file() {
                 return Err(format!("image {} does not exist", path.display()));
             }
-            Ok(Step::PlugUsb(Stick::Image(path)))
+            Ok(Stick::Image(path))
         }
     }
 }
@@ -1363,6 +1436,52 @@ expect = "1 received"
             );
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{size} loaded") };
             assert!(why.contains("a size from 1M to 4G"), "{size}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_memory_card_is_put_in_and_taken_out_of_the_card_reader() {
+        let dir = TempDir::new("suite-card");
+        dir.write("features/card.img", "");
+        dir.write(
+            "features/card.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\ncard = \"insert\"\nimage = \"card.img\"\n\
+             [[step]]\ncard = \"remove\"\n[[step]]\ncard = \"insert\"\nblank = \"32M\"\n\
+             [[step]]\ncard = \"remove\"\n[[step]]\ncard = \"reinsert\"\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        let image = dir.path().join("features/card.img");
+        assert_eq!(tests[0].steps[0], Step::InsertCard(Stick::Image(image)));
+        assert_eq!(
+            tests[0].steps[0].describe(),
+            "put a memory card holding card.img in the card reader"
+        );
+        assert_eq!(tests[0].steps[1], Step::RemoveCard);
+        assert_eq!(tests[0].steps[1].describe(), "take the memory card out of the card reader");
+        assert_eq!(tests[0].steps[2], Step::InsertCard(Stick::Blank(32 << 20)));
+        assert_eq!(tests[0].steps[4], Step::ReinsertCard);
+        assert_eq!(tests[0].steps[4].describe(), "put the memory card back in the card reader");
+        assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Card)));
+        assert!(tests[0].controls().contains(&Control::Card));
+        for (step, complaint) in [
+            ("card = \"insert\"", "card = \"insert\" needs image"),
+            ("card = \"remove\"\nblank = \"8M\"", "only card = \"insert\" takes an image or blank"),
+            ("card = \"reinsert\"", "none is out"),
+            ("card = \"insert\"\nblank = \"8M\"\n[[step]]\ncard = \"reinsert\"", "none is out"),
+            (
+                "card = \"insert\"\nimage = \"card.img\"\nblank = \"8M\"",
+                "a card is an image or blank",
+            ),
+            ("card = \"insert\"\nblank = \"8G\"", "a size from 1M to 4G"),
+            ("card = \"open\"", "card"),
+            ("run = \"ls\"\nblank = \"8M\"", "blank"),
+        ] {
+            dir.write(
+                "features/card.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
+            assert!(why.contains(complaint), "{step}: {why}");
         }
     }
 

@@ -483,7 +483,13 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
     }
     println!("{}: {}", test.id, test.about);
     println!("File: {}", test.file.display());
-    let boot = if test.fresh {
+    // An attack test's boot has the private network, and a card test's
+    // the card reader, that no other test may find: never shared.
+    let controls = test.controls();
+    let alone = [machines::Control::Attack, machines::Control::Card]
+        .iter()
+        .any(|control| controls.contains(control));
+    let boot = if test.fresh || alone {
         "a boot of its own"
     } else {
         "shares a boot with the test before when it can"
