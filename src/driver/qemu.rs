@@ -16,8 +16,11 @@
 //! Every control maps to one QMP command: power to `system_powerdown`,
 //! `system_reset` and `quit` (the cord), the network cable to `set_link`,
 //! a USB stick to `blockdev-add` and `device_add usb-storage` on an xhci
-//! controller, keys to `send-key`, the pointer (a USB tablet) to
-//! `input-send-event`, the screen to `screendump`.
+//! controller, a memory card to `blockdev-change-medium` and `eject` on
+//! a card reader (a `usb-storage` whose medium is removable, empty at
+//! boot, there only for a test with card steps), keys to `send-key`, the
+//! pointer (a USB tablet) to `input-send-event`, the screen to
+//! `screendump`.
 //!
 //! The lab PC is the guest's peer on QEMU's user network, where the guest
 //! reaches the lab PC's loopback at 10.0.2.2 (`{peer}`); a guest's port
@@ -48,6 +51,9 @@ const QEMU: &str = "qemu-system-x86_64";
 
 /// The network device's id, which `set_link` and `hostfwd_add` name.
 const NETDEV: &str = "lab0";
+
+/// The card reader's drive, which a card goes in and comes out of.
+const CARD_DRIVE: &str = "card-reader";
 
 /// The lab PC's address on QEMU's user network, as the guest sees it.
 const HOST_ON_USER_NET: &str = "10.0.2.2";
@@ -98,6 +104,15 @@ pub struct Qemu {
     /// USB sticks plugged in so far, to name the next; and the one in now.
     sticks: u32,
     stick: Option<u32>,
+    /// Memory cards put in so far, to name the next; the one in now; and
+    /// the one taken out last, whose file is kept so that it can go back
+    /// in holding what was written on it.
+    cards: u32,
+    card: Option<u32>,
+    card_out: Option<u32>,
+    /// Whether the next fresh boot gives the machine an empty card reader,
+    /// set by [`Driver::want_card_reader`].
+    want_card_reader: bool,
     /// The install stick this boot started from, while it is still in:
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
@@ -165,6 +180,10 @@ impl Qemu {
             ssh_port: 0,
             sticks: 0,
             stick: None,
+            cards: 0,
+            card: None,
+            card_out: None,
+            want_card_reader: false,
             boot_stick: None,
             want_attacker: false,
             segment_port: 0,
@@ -289,6 +308,18 @@ impl Qemu {
         // test points at a pixel rather than moving by guesswork.
         args.push("-device".into());
         args.push("usb-tablet,bus=xhci.0,id=pointer".into());
+        // A card reader, empty: a USB one, as QEMU has no other a card
+        // can be put in and taken out of while it runs. Only on a boot for
+        // a test with card steps, as its drive would show up in a disk
+        // test.
+        if self.want_card_reader {
+            args.push("-drive".into());
+            args.push(format!("if=none,id={CARD_DRIVE}"));
+            args.push("-device".into());
+            args.push(format!(
+                "usb-storage,bus=xhci.0,drive={CARD_DRIVE},id=usb-card-reader,removable=on"
+            ));
+        }
         // The install stick, named as a stick plugged in later is, so that
         // pulling it works the same way.
         if let Some((number, overlay)) = &self.boot_stick {
@@ -336,8 +367,14 @@ impl Qemu {
         };
         self.running = Some(Running { child, qmp });
         // A stick plugged in while it ran is gone with the old QEMU; the
-        // install stick, given on its command line, is still in.
+        // install stick, given on its command line, is still in. So is a
+        // card, and the new reader is empty: a card in the old one counts
+        // as taken out.
         self.stick = self.boot_stick.as_ref().map(|(number, _)| *number);
+        if let Some(card) = self.card.take() {
+            self.forget_card_out();
+            self.card_out = Some(card);
+        }
         Ok(())
     }
 
@@ -572,6 +609,32 @@ impl Qemu {
     }
 }
 
+impl Qemu {
+    /// The file that memory card `number` holds.
+    fn card_file(&self, number: u32) -> PathBuf {
+        self.setup.work.join(format!("card-{number}.img"))
+    }
+
+    /// Puts memory card `number`, whose file is made, in the card reader.
+    fn put_card_in(&mut self, number: u32) -> Result<(), String> {
+        let file = self.card_file(number);
+        self.qmp()?.execute(
+            "blockdev-change-medium",
+            &json!({ "device": CARD_DRIVE, "filename": file, "format": "raw" }),
+        )?;
+        self.card = Some(number);
+        Ok(())
+    }
+
+    /// Deletes the file of the card taken out last, which will not go
+    /// back in.
+    fn forget_card_out(&mut self) {
+        if let Some(number) = self.card_out.take() {
+            let _ = fs::remove_file(self.card_file(number));
+        }
+    }
+}
+
 impl Driver for Qemu {
     fn boot_fresh(&mut self) -> Result<(), String> {
         self.next_boot()?;
@@ -670,14 +733,7 @@ impl Driver for Qemu {
         // A copy, so the test's own file stays as it is whatever the guest
         // writes; or zeros, as a stick fresh from the shop holds.
         let copy = self.setup.work.join(format!("stick-{number}.img"));
-        match stick {
-            Stick::Image(image) => fs::copy(image, &copy)
-                .map(drop)
-                .map_err(|err| format!("copying {}: {err}", image.display()))?,
-            Stick::Blank(bytes) => File::create(&copy)
-                .and_then(|file| file.set_len(*bytes))
-                .map_err(|err| format!("making {}: {err}", copy.display()))?,
-        }
+        make_medium(stick, &copy)?;
         let node = format!("stick{number}");
         let qmp = self.qmp()?;
         qmp.execute(
@@ -709,6 +765,54 @@ impl Driver for Qemu {
         {
             let _ = fs::remove_file(overlay);
         }
+        Ok(())
+    }
+
+    fn want_card_reader(&mut self, yes: bool) {
+        self.want_card_reader = yes;
+    }
+
+    fn insert_card(&mut self, card: &Stick) -> Result<(), String> {
+        if !self.want_card_reader {
+            return Err("this boot has no card reader".into());
+        }
+        if let Some(card) = self.card {
+            return Err(format!(
+                "memory card {card} is still in the card reader; take it out first"
+            ));
+        }
+        // Running, before a file is made for the card.
+        self.qmp()?;
+        self.cards += 1;
+        let number = self.cards;
+        make_medium(card, &self.card_file(number))?;
+        self.put_card_in(number)
+    }
+
+    fn remove_card(&mut self) -> Result<(), String> {
+        let number = self.card.ok_or("no memory card is in the card reader")?;
+        // By force: a card can be pulled out whether or not the machine
+        // let it go, and a reader that locks it in only asks the guest.
+        self.qmp()?.execute("eject", &json!({ "device": CARD_DRIVE, "force": true }))?;
+        self.card = None;
+        // Only the last card out is kept, to go back in.
+        self.forget_card_out();
+        self.card_out = Some(number);
+        Ok(())
+    }
+
+    fn reinsert_card(&mut self) -> Result<(), String> {
+        if !self.want_card_reader {
+            return Err("this boot has no card reader".into());
+        }
+        if let Some(card) = self.card {
+            return Err(format!(
+                "memory card {card} is still in the card reader; take it out first"
+            ));
+        }
+        let number = self.card_out.ok_or("no memory card was taken out to put back")?;
+        self.put_card_in(number)?;
+        self.card_out = None;
         Ok(())
     }
 
@@ -1008,6 +1112,20 @@ fn option_value(path: &Path) -> String {
     path.display().to_string().replace(',', ",,")
 }
 
+/// Makes what a stick or card holds at `copy`: a copy of its image, so
+/// the test's own file stays as it is whatever the guest writes, or
+/// zeros, as one fresh from the shop holds.
+fn make_medium(medium: &Stick, copy: &Path) -> Result<(), String> {
+    match medium {
+        Stick::Image(image) => fs::copy(image, copy)
+            .map(drop)
+            .map_err(|err| format!("copying {}: {err}", image.display())),
+        Stick::Blank(bytes) => File::create(copy)
+            .and_then(|file| file.set_len(*bytes))
+            .map_err(|err| format!("making {}: {err}", copy.display())),
+    }
+}
+
 /// These start a real QEMU, with a blank disk and no operating system, and
 /// drive it through every control. They run when DUKOVO_LAB_QEMU_TESTS=1,
 /// as CI sets, since they need QEMU installed.
@@ -1112,8 +1230,29 @@ mod tests {
         qemu.power(PowerAction::On, soon()).unwrap();
         assert!(qemu.is_on());
         assert!(qemu.power(PowerAction::On, soon()).unwrap_err().contains("already on"));
+        // A card reader, on a boot that asks for one: cards go in and come
+        // out, by force, while the reader stays.
+        qemu.want_card_reader(true);
         qemu.boot_fresh().unwrap();
         assert!(!dir.path().join("work/disk-1.qcow2").exists(), "the old boot's disk is gone");
+        assert!(qemu.remove_card().unwrap_err().contains("no memory card"));
+        qemu.insert_card(&stick).unwrap();
+        assert!(qemu.insert_card(&stick).unwrap_err().contains("still in the card reader"));
+        qemu.remove_card().unwrap();
+        qemu.insert_card(&Stick::Blank(2 << 20)).unwrap();
+        let card = dir.path().join("work/card-2.img");
+        assert_eq!(fs::metadata(&card).unwrap().len(), 2 << 20);
+        qemu.remove_card().unwrap();
+        // Put back, it holds what it held.
+        File::options().write(true).open(&card).unwrap().write_all(b"written").unwrap();
+        qemu.reinsert_card().unwrap();
+        assert!(qemu.reinsert_card().unwrap_err().contains("still in the card reader"));
+        qemu.remove_card().unwrap();
+        assert_eq!(&fs::read(&card).unwrap()[..7], b"written");
+        qemu.insert_card(&Stick::Blank(1 << 20)).unwrap();
+        qemu.remove_card().unwrap();
+        assert!(!card.exists(), "only the card taken out last is kept");
+        qemu.want_card_reader(false);
 
         // The install stick, with a blank disk of the size asked for; the
         // stick's own file is never written.

@@ -78,6 +78,9 @@ Each step has exactly one action key, and only the options that go with it.
 | `link = "down"` or `"up"` | | Pulls or plugs in the network cable. | link |
 | `usb = "plug"` | `image` or `blank` | Plugs in a USB stick: a copy of `image`, a file in the test's folder, or with `blank = "64M"` an empty stick of that size, from `1M` to `4G` (`K`, `M` or `G`). | usb |
 | `usb = "unplug"` | | Pulls the stick out. | usb |
+| `card = "insert"` | `image` or `blank` | Puts a memory card in the card reader: a copy of `image`, or with `blank = "64M"` an empty card of that size, as `usb = "plug"` takes them. The reader stays plugged in; only the card comes and goes. See [Card reader tests](#card-reader-tests). | card |
+| `card = "remove"` | | Takes the card out of the reader, whether or not the machine let go of it. | card |
+| `card = "reinsert"` | | Puts the card taken out last back in, holding what the machine wrote on it. | card |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
 | `type = "<text>"` | | Types the text on a US keyboard: `\n` is Enter, and `{password}` types the lab password, which is never shown or kept. A character with no key on a US keyboard is an error when the suite loads. | keys |
 | `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. An error if the screen is smaller. | mouse |
@@ -331,6 +334,58 @@ real machine. The runner fills them in, in the command, `input`,
 - A machine whose driver cannot reach the lab PC (`peer = "none"`)
   skips these tests, as does any test whose `run` steps name `{peer}`
   or a `{port:NAME}`.
+
+## Card reader tests
+
+A test with a `card` step uses a card reader: a drive whose medium comes
+and goes while the drive stays (ADR 0430 in Dukovo's repository). Its
+`card = "insert"`, `card = "remove"` and `card = "reinsert"` steps put
+a memory card in, take it out and put it back, as a person does with an
+SD card.
+
+```toml
+about = "A card formatted in the reader is mounted at its label when put back"
+time = "3m"
+
+[[step]]
+card = "insert"
+blank = "64M"
+[[step]]
+wait = "5s"
+[[step]]
+run = "lsblk -dn | awk '$2 == \"64M\" { print $1 }' > ~/lab-card && cat ~/lab-card"
+expect = "sd"
+[[step]]
+run = "sh -c 'mkfs-fat -n LABCARD /devices/$(cat /users/lab/lab-card)'"
+root = true
+[[step]]
+card = "remove"
+[[step]]
+card = "reinsert"
+[[step]]
+wait = "5s"
+[[step]]
+run = "ls /volumes"
+expect = "LABCARD"
+```
+
+- On QEMU the reader is a USB card reader with no card in it at boot,
+  there only on a boot for a test with `card` steps, so that its empty
+  drive never shows up in another test's disks: a card test always boots
+  afresh, and its boot is never shared with the test after it.
+- `card = "reinsert"` puts back the card taken out last, as it was when
+  it came out, so a test can format a blank card and see it mounted when
+  it goes back in, or check that what it wrote is still there.
+- The machine looks at the reader every two seconds, so give a step that
+  reads the card a moment, as `wait` above does.
+- `card = "remove"` takes the card out by force: whether the machine
+  let go of it first is for the test's own steps to check, as with
+  `eject`.
+- On a real machine a person puts the card in and takes it out, so card
+  tests are Needs you tests there until a machine has a card it can
+  switch.
+
+Card reader tests live under `lab/tests/storage/`.
 
 ## How a test runs
 

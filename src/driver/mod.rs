@@ -61,6 +61,32 @@ pub trait Driver: Send {
     /// Pulls the USB stick out.
     fn unplug_usb(&mut self) -> Result<(), String>;
 
+    /// Says whether the next [`Driver::boot_fresh`] gives the machine an
+    /// empty card reader, which [`Driver::insert_card`] puts cards in.
+    /// The runner calls it before booting a test with card steps, and with
+    /// `false` before one without, so that the reader, an empty drive, is
+    /// there only when it is wanted (it would show up in a disk test). A
+    /// driver whose machines have their own reader ignores it.
+    fn want_card_reader(&mut self, _yes: bool) {}
+
+    /// Puts a memory card in the card reader: a copy of an image, or a
+    /// blank one.
+    fn insert_card(&mut self, _card: &Stick) -> Result<(), String> {
+        Err("this machine's driver cannot put a card in its reader".into())
+    }
+
+    /// Takes the memory card out of the card reader, by force: whether or
+    /// not the machine let it go.
+    fn remove_card(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot take a card out of its reader".into())
+    }
+
+    /// Puts the memory card taken out last back in the card reader,
+    /// holding what the machine wrote on it.
+    fn reinsert_card(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot put a card in its reader".into())
+    }
+
     /// Presses each key combination in turn.
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String>;
 

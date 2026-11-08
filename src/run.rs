@@ -547,6 +547,11 @@ impl<'a> Worker<'a> {
         // driver which kind of boot to give before it boots.
         let attacks = test.controls().contains(&Control::Attack);
         self.driver.want_attacker(attacks);
+        // So does a test that puts cards in a card reader, whose reader,
+        // an empty drive, a disk test must not find either.
+        let cards = test.controls().contains(&Control::Card);
+        self.driver.want_card_reader(cards);
+        let own_boot = attacks || cards;
 
         let mut failure = None;
         if let Boot::Stick { disk } = test.boot {
@@ -556,7 +561,7 @@ impl<'a> Worker<'a> {
                 });
             steps.push(record);
             failure = outcome.err();
-        } else if test.fresh || attacks || !self.reusable || !self.driver.is_on() {
+        } else if test.fresh || own_boot || !self.reusable || !self.driver.is_on() {
             let (record, outcome) =
                 self.timed(test, "boot afresh and wait until booted", |worker| {
                     worker.boot_fresh(deadline)
@@ -605,10 +610,10 @@ impl<'a> Worker<'a> {
         }
         // After the installer, the disk no longer holds the image under
         // test, so the next test boots afresh. An attack boot has the
-        // private network port a later test must not find, so it is not
-        // shared either.
+        // private network port a later test must not find, and a card
+        // test's boot the card reader, so they are not shared either.
         self.reusable =
-            result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !attacks;
+            result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !own_boot;
         let log = self.write_log(test, result, reason.as_deref());
         let milliseconds = started.elapsed().as_millis() as u64;
         let boot = (self.boot > 0).then_some(self.boot);
@@ -829,6 +834,15 @@ impl<'a> Worker<'a> {
                 self.driver.plug_usb(stick).map(|()| None).map_err(StepFailure::Error)
             }
             Step::UnplugUsb => self.driver.unplug_usb().map(|()| None).map_err(StepFailure::Error),
+            Step::InsertCard(card) => {
+                self.driver.insert_card(card).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::RemoveCard => {
+                self.driver.remove_card().map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::ReinsertCard => {
+                self.driver.reinsert_card().map(|()| None).map_err(StepFailure::Error)
+            }
             Step::Keys(keys) => {
                 self.driver.press_keys(keys).map(|()| None).map_err(StepFailure::Error)
             }
