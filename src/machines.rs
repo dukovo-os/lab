@@ -51,11 +51,16 @@ pub enum Control {
     /// Running an attacker on a private lab network of the machine's own,
     /// to probe it from the outside.
     Attack,
+    /// Using the lab PC as a peer on the machine's network: services the
+    /// lab PC runs that the machine reaches (a Kerberos KDC, a file
+    /// server, a WireGuard end), and ports of the machine the lab PC
+    /// reaches to use the machine's own servers.
+    Peer,
 }
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 11] = [
+    pub const ALL: [Control; 12] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -67,6 +72,7 @@ impl Control {
         Control::Ssh,
         Control::Linux,
         Control::Attack,
+        Control::Peer,
     ];
 
     /// Its name in machine files and output.
@@ -83,6 +89,7 @@ impl Control {
             Control::Ssh => "ssh",
             Control::Linux => "linux",
             Control::Attack => "attack",
+            Control::Peer => "peer",
         }
     }
 }
@@ -325,6 +332,13 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
                 "attack is \"driver\" or \"none\": a person does not run the attacker".into(),
             ));
         }
+        // The lab PC's peer services and forwarded ports are the driver's
+        // to set up, so a person cannot stand in for them either.
+        if control == Control::Peer && who == Who::Person {
+            return Err(bad(
+                "peer is \"driver\" or \"none\": a person does not set up the lab PC's side".into(),
+            ));
+        }
         controls.insert(control, who);
     }
     let qemu = match file.driver {
@@ -447,6 +461,11 @@ mod tests {
                 "f.toml",
                 "about = \"x\"\ndriver = \"qemu\"\n[controls]\nattack = \"person\"\n",
                 "a person does not run the attacker",
+            ),
+            (
+                "g.toml",
+                "about = \"x\"\ndriver = \"qemu\"\n[controls]\npeer = \"person\"\n",
+                "a person does not set up the lab PC's side",
             ),
         ] {
             let dir = TempDir::new("machines-bad");

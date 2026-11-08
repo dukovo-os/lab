@@ -115,6 +115,28 @@ pub trait Driver: Send {
         Err("this machine has no attacker".into())
     }
 
+    /// The lab PC's address as the machine sees it, which a test's `run`
+    /// steps reach the lab PC's servers at (`{peer}`); none when the lab
+    /// PC is not on the machine's network.
+    fn peer_address(&self) -> Option<String> {
+        None
+    }
+
+    /// The machine's address as the lab PC reaches it (`{machine}`).
+    fn machine_address(&self) -> Option<String> {
+        None
+    }
+
+    /// The lab PC's port that reaches the machine's `port` (UDP when
+    /// `udp`, else TCP) at [`Driver::machine_address`], for the lab PC's
+    /// clients to reach a server of the machine's (`{machine-port:N}`).
+    /// A driver that forwards a port of the lab PC's does so now, for the
+    /// rest of this boot; one whose machine is on the lab PC's network
+    /// gives `port` itself.
+    fn reach(&mut self, _port: u16, _udp: bool) -> Result<u16, String> {
+        Err("the lab PC cannot reach this machine's ports".into())
+    }
+
     /// How many times longer than on real hardware tests may take here.
     fn slowdown(&self) -> u32;
 

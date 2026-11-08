@@ -42,9 +42,12 @@ A control is a way the lab acts on a machine: `power`, `cord` (pulling
 the power cord), `serial`, `link` (the network cable), `usb` (a USB
 stick), `keys`, `mouse` (moving the pointer and pressing its buttons),
 `screen`, `ssh`, `linux` (booting the machine's Linux twin, which
-performance tests measure against) and `attack` (standing up an attacker
+performance tests measure against), `attack` (standing up an attacker
 on a private network of the machine's own, which security tests probe it
-from). Each is done by one of:
+from) and `peer` (the lab PC as a peer on the machine's network: servers
+the lab PC runs that the machine reaches, such as a Kerberos KDC or a
+file server, and the machine's ports forwarded to the lab PC, so the lab
+PC's clients reach the machine's own servers). Each is done by one of:
 
 | Value | Meaning |
 | --- | --- |
@@ -54,9 +57,9 @@ from). Each is done by one of:
 
 A machine starts with every control its driver can do (QEMU can do all
 of them) set to `driver`. `[controls]` can hand one to a person or take
-it away, but cannot make a driver do what it cannot. `linux` and
-`attack` are `driver` or `none`: a person cannot measure Linux or run the
-attacker.
+it away, but cannot make a driver do what it cannot. `linux`, `attack`
+and `peer` are `driver` or `none`: a person cannot measure Linux, run the
+attacker or stand in for the lab PC's side.
 
 So one test file serves every machine: pulling the cord is automatic on
 QEMU, a Needs you step on a real machine until it has a smart plug.

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::machines::{Control, Machine, Who, is_plain_name};
+use crate::peer::{self, INPUT_MAX};
 use crate::units::{format_duration, parse_duration};
 
 /// The categories when a tests folder has no `categories.toml`: those
@@ -137,6 +138,9 @@ pub struct Test {
     /// What the machine boots from when the test boots it.
     pub boot: Boot,
     pub steps: Vec<Step>,
+    /// Programs the lab PC must have for the test's host steps; without
+    /// one, the test is skipped.
+    pub host_needs: Vec<String>,
 }
 
 /// What a test's machine boots from.
@@ -205,6 +209,21 @@ pub enum Step {
     /// with the machine under test, and checks what it did. `{target}`
     /// in the command becomes the machine's address on that network.
     Attack(Command),
+    /// Runs a command on the lab PC, the machine's peer, and checks what
+    /// it did (see peer.rs).
+    Host(Command),
+    /// Starts a server on the lab PC that runs until the test ends.
+    Serve(Serve),
+}
+
+/// A server a `host` step with `background = true` starts on the lab PC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Serve {
+    pub command: String,
+    /// Run as root on the lab PC.
+    pub root: bool,
+    /// Text its output holds once it is ready, which the step waits for.
+    pub ready: Option<String>,
 }
 
 /// A pointer button.
@@ -263,9 +282,12 @@ pub struct Command {
     pub expect: Vec<String>,
     /// Text its output must not hold.
     pub expect_not: Vec<String>,
-    /// Whether it runs as root, through `elevate -S` and the lab's
-    /// password.
+    /// Whether it runs as root: on the machine through `elevate -S` and
+    /// the lab's password; on the lab PC as the lab is, or through sudo.
     pub root: bool,
+    /// Its standard input, where `{password}` is the lab password; none
+    /// gives it none.
+    pub input: Option<String>,
 }
 
 /// What a `power` step does.
@@ -297,6 +319,7 @@ impl Step {
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
             Step::Attack(_) => Some(Control::Attack),
+            Step::Host(_) | Step::Serve(_) => Some(Control::Peer),
             Step::Screenshot(_) | Step::Screen(_) | Step::ScreenGone(_) => Some(Control::Screen),
             Step::WaitReady | Step::Sleep(_) => None,
             // It also runs over SSH: see `Test::controls`.
@@ -331,6 +354,17 @@ impl Step {
             Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
             Step::Click(button) => format!("click the {} button", button.name()),
             Step::Attack(command) => format!("on the attacker, {}", describe_command(command)),
+            Step::Host(command) => format!("on the lab PC, {}", describe_command(command)),
+            Step::Serve(serve) => {
+                let who = if serve.root { " as root" } else { "" };
+                match &serve.ready {
+                    Some(ready) => format!(
+                        "on the lab PC, start `{}`{who} and wait until it says \"{ready}\"",
+                        serve.command
+                    ),
+                    None => format!("on the lab PC, start `{}`{who}", serve.command),
+                }
+            }
             Step::Screen(texts) => {
                 let texts: Vec<String> = texts.iter().map(|text| format!("\"{text}\"")).collect();
                 format!("wait until the screen shows {}", texts.join(", "))
@@ -356,6 +390,9 @@ impl Step {
 fn describe_command(command: &Command) -> String {
     let who = if command.root { " as root" } else { "" };
     let mut text = format!("run `{}`{who}, exit status {}", command.command, command.exit);
+    if command.input.is_some() {
+        text.push_str(", with input");
+    }
     for expect in &command.expect {
         text.push_str(&format!(", output has \"{expect}\""));
     }
@@ -380,6 +417,15 @@ impl Test {
         if self.steps.iter().any(|step| matches!(step, Step::Attack(_))) {
             controls.insert(Control::Ssh);
         }
+        // A command on the machine that names the lab PC's address or one
+        // of its ports reaches a server of the lab PC's.
+        let names_peer = |command: &Command| {
+            peer::uses_peer(&command.command)
+                || command.input.as_deref().is_some_and(peer::uses_peer)
+        };
+        if self.steps.iter().any(|step| matches!(step, Step::Run(command) if names_peer(command))) {
+            controls.insert(Control::Peer);
+        }
         // The install stick is plugged in as the machine powers on.
         if matches!(self.boot, Boot::Stick { .. }) {
             controls.insert(Control::Usb);
@@ -392,8 +438,12 @@ impl Test {
     /// Whether a step needs the lab password: one run as root, or one that
     /// types it.
     pub fn uses_password(&self) -> bool {
+        let types_it = |command: &Command| {
+            command.input.as_deref().is_some_and(|input| input.contains(PASSWORD_TOKEN))
+        };
         self.steps.iter().any(|step| match step {
-            Step::Run(command) => command.root,
+            Step::Run(command) => command.root || types_it(command),
+            Step::Host(command) => types_it(command),
             Step::Bench(bench) => bench.root,
             Step::Type(text) => text.contains(PASSWORD_TOKEN),
             // The harness elevates on both machines to give them their
@@ -456,6 +506,8 @@ struct TestFile {
     fresh: bool,
     boot: Option<BootFrom>,
     disk: Option<String>,
+    #[serde(default)]
+    host_needs: Vec<String>,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
@@ -503,6 +555,10 @@ struct StepFile {
     point: Option<Vec<u32>>,
     click: Option<Button>,
     attack: Option<String>,
+    host: Option<String>,
+    background: Option<bool>,
+    ready: Option<String>,
+    input: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -520,7 +576,7 @@ enum UsbAction {
 }
 
 /// `expect = "text"` or `expect = ["one", "two"]`.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(untagged)]
 enum OneOrMore {
     One(String),
@@ -607,6 +663,17 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             }
         },
     };
+    // A program's name, as the lab PC's PATH finds it: no folders.
+    if let Some(bad_name) = file.host_needs.iter().find(|name| {
+        name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+    }) {
+        return Err(bad(format!(
+            "host_needs: {bad_name:?} is not a program's name, as krb5kdc or smbd"
+        )));
+    }
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut steps = Vec::new();
     for (index, step) in file.steps.into_iter().enumerate() {
@@ -631,6 +698,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         fresh: file.fresh,
         boot,
         steps,
+        host_needs: file.host_needs,
     })
 }
 
@@ -653,12 +721,13 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("point", step.point.is_some()),
         ("click", step.click.is_some()),
         ("attack", step.attack.is_some()),
+        ("host", step.host.is_some()),
     ];
     let given: Vec<&str> = actions.iter().filter(|(_, set)| *set).map(|(key, _)| *key).collect();
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, attack, serial, power, link, usb, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, host, serial, power, link, usb, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -672,10 +741,17 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             Ok(())
         }
     };
-    // A command's checks go with `run` or `attack`, which both run one.
+    // A command's checks go with `run`, `attack` or `host`, which all run
+    // one and wait for its end; a server started in the background has no
+    // end to check.
+    let background = step.background.unwrap_or(false);
     let checks = |option: &str, set: bool| {
-        if set && !matches!(given[0], "run" | "attack") {
-            Err(format!("{option} goes only with run or attack"))
+        if set && !matches!(given[0], "run" | "attack" | "host") {
+            Err(format!("{option} goes only with run, attack or host"))
+        } else if set && background {
+            Err(format!(
+                "{option} does not go with background = true: a server has no end to check"
+            ))
         } else {
             Ok(())
         }
@@ -683,37 +759,74 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     checks("exit", step.exit.is_some())?;
     checks("expect", step.expect.is_some())?;
     checks("expect_not", step.expect_not.is_some())?;
-    if step.root.is_some() && !matches!(given[0], "run" | "bench" | "attack") {
-        return Err("root goes only with run, bench or attack".into());
+    if step.root.is_some() && !matches!(given[0], "run" | "bench" | "attack" | "host") {
+        return Err("root goes only with run, bench, attack or host".into());
+    }
+    if step.input.is_some() && !matches!(given[0], "run" | "host") {
+        return Err("input goes only with run or host".into());
+    }
+    if step.input.is_some() && background {
+        return Err("input does not go with background = true".into());
+    }
+    if let Some(input) = &step.input
+        && input.len() > INPUT_MAX
+    {
+        return Err(format!("input holds at most {} KiB", INPUT_MAX / 1024));
+    }
+    only_with("background", step.background.is_some(), "host")?;
+    if step.ready.is_some() && !background {
+        return Err("ready goes only with host and background = true".into());
     }
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
     only_with("image", step.image.is_some(), "usb")?;
     only_with("blank", step.blank.is_some(), "usb")?;
 
-    if let Some(command) = step.run {
-        if command.trim().is_empty() {
+    let command = |text: String, step: &StepFile| Command {
+        command: text,
+        exit: step.exit.unwrap_or(0),
+        expect: step.expect.clone().map(OneOrMore::into_vec).unwrap_or_default(),
+        expect_not: step.expect_not.clone().map(OneOrMore::into_vec).unwrap_or_default(),
+        root: step.root.unwrap_or(false),
+        input: step.input.clone(),
+    };
+    if let Some(text) = step.run.clone() {
+        if text.trim().is_empty() {
             return Err("run needs a command".into());
         }
-        return Ok(Step::Run(Command {
-            command,
-            exit: step.exit.unwrap_or(0),
-            expect: step.expect.map(OneOrMore::into_vec).unwrap_or_default(),
-            expect_not: step.expect_not.map(OneOrMore::into_vec).unwrap_or_default(),
-            root: step.root.unwrap_or(false),
-        }));
+        let command = command(text, &step);
+        check_placeholders(&command, "run")?;
+        return Ok(Step::Run(command));
     }
-    if let Some(command) = step.attack {
-        if command.trim().is_empty() {
+    if let Some(text) = step.attack.clone() {
+        if text.trim().is_empty() {
             return Err("attack needs a command to run on the attacker".into());
         }
-        return Ok(Step::Attack(Command {
-            command,
-            exit: step.exit.unwrap_or(0),
-            expect: step.expect.map(OneOrMore::into_vec).unwrap_or_default(),
-            expect_not: step.expect_not.map(OneOrMore::into_vec).unwrap_or_default(),
-            root: step.root.unwrap_or(false),
-        }));
+        let command = command(text, &step);
+        check_placeholders(&command, "attack")?;
+        return Ok(Step::Attack(command));
+    }
+    if let Some(text) = step.host.clone() {
+        if text.trim().is_empty() {
+            return Err("host needs a command to run on the lab PC".into());
+        }
+        if background {
+            let ready = step.ready.clone();
+            if ready.as_deref().is_some_and(|ready| ready.trim().is_empty()) {
+                return Err("ready needs the text the server prints once it is ready".into());
+            }
+            for text in std::iter::once(&text).chain(&ready) {
+                peer::scan(text)?;
+            }
+            return Ok(Step::Serve(Serve {
+                command: text,
+                root: step.root.unwrap_or(false),
+                ready,
+            }));
+        }
+        let command = command(text, &step);
+        check_placeholders(&command, "host")?;
+        return Ok(Step::Host(command));
     }
     if let Some(command) = step.bench {
         return parse_bench(command, step.root, step.rows, step.limit);
@@ -792,6 +905,35 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     parse_duration(&wait)
         .map(Step::Sleep)
         .map_err(|err| format!("wait is \"ready\", \"off\" or a time: {err}"))
+}
+
+/// Checks the placeholders of a `run`, `attack` or `host` step's command
+/// (see peer.rs): each written right, and each one the step may hold.
+fn check_placeholders(command: &Command, action: &str) -> Result<(), String> {
+    let texts = std::iter::once(&command.command)
+        .chain(&command.input)
+        .chain(&command.expect)
+        .chain(&command.expect_not);
+    for text in texts {
+        for (range, token) in peer::scan(text)? {
+            let written = &text[range];
+            match action {
+                "host" => {}
+                "run" if token.fits_run() => {}
+                "run" => {
+                    return Err(format!(
+                        "{written} names something of the lab PC's, so it goes only in a host step"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "{written} goes in run and host steps; the attacker's network has no lab PC"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The range a `limit` may take: a bar below a tenth of Linux's time, or
@@ -1061,6 +1203,7 @@ expect = "1 received"
                 expect: vec!["1 received".into()],
                 expect_not: vec![],
                 root: false,
+                input: None,
             })
         );
         let controls: Vec<Control> = test.controls().into_iter().collect();
@@ -1307,6 +1450,7 @@ expect = "1 received"
                 expect: vec!["22/tcp open".into()],
                 expect_not: vec![],
                 root: false,
+                input: None,
             })
         );
         assert_eq!(

@@ -89,6 +89,9 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
 - The lab network never faces the internet, and an attack stays on a
   private network only the attacker and the machine under test share,
   reachable from nowhere else.
+- A test's servers on the lab PC (a file share's far end, a Kerberos
+  KDC) run in a folder of the test's own, on ports it picks, and end with
+  the test; a test never changes the lab PC's own settings or services.
 - Lab images carry a test agent that release images never contain.
 - Security findings stay private until they are fixed.
 

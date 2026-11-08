@@ -37,6 +37,7 @@ expect_not = "NO-CARRIER"
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
 | `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk: see [Installer tests](#installer-tests). |
 | `disk` | no | With `boot = "stick"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
+| `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
 | `[[step]]` | at least one | The steps, in order. |
 
 ## Categories
@@ -64,9 +65,10 @@ Each step has exactly one action key, and only the options that go with it.
 
 | Action | Options | Does | Control |
 | --- | --- | --- | --- |
-| `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. | ssh |
+| `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root`, `input` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. `input` is the command's standard input, at most 16 KiB, where `{password}` is the lab password: a file's text for `cat > file`, or a password a command asks for. | ssh |
 | `bench = "<command>"` | `rows` (required), `limit` (default 1.00), `root` | Runs a benchmark program over SSH and holds each of its `rows` to the same row on the machine's Linux twin: passes when Dukovo takes at most `limit` times Linux's time per operation (see [Performance tests](#performance-tests)). | ssh, linux |
 | `attack = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command on the attacker, a second machine on a private network only it and the machine under test share, and holds its output as `run` does. `{target}` in the command, `expect` or `expect_not` becomes the machine's address on that network. See [Attack tests](#attack-tests-the-security-range). | attack |
+| `host = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root`, `input`, or `background` and `ready` | Runs the command on the lab PC, in a folder of the test's own, and holds it as `run` does; with `background = true`, starts a server there that runs until the test ends, waiting until its output holds `ready` when given. See [The lab PC as a peer](#the-lab-pc-as-a-peer). | peer |
 | `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started; after `power = "on"` or `"reset"`, only what the new boot printed. | serial |
 | `power = "on"` | | Powers the machine on. | power |
 | `power = "off"` | | Presses the power button and waits until the machine is off. Fails if it is still on at the time limit. | power |
@@ -255,6 +257,80 @@ exit = 1
 Attack tests live under `lab/tests/security/`. Keep them to probing the
 machine from the outside over the private range; a check of the machine's
 own state belongs in a `run` step.
+
+## The lab PC as a peer
+
+Some of what Dukovo does needs another computer: a file share has a far
+end, Kerberos has a KDC, a WireGuard tunnel has a peer. A `host` step
+runs a command on the lab PC itself, so a test stands that far end up
+with the lab PC's own programs (Samba, MIT Kerberos, NFS-Ganesha,
+wireguard-go) and checks Dukovo against them both ways: the machine as
+the client of the lab PC's servers, and the lab PC's clients against the
+machine's servers.
+
+```toml
+about = "kinit takes a ticket from MIT's KDC on the lab PC"
+time = "5m"
+host_needs = ["krb5kdc", "kdb5_util", "kadmin.local"]
+
+[[step]]
+host = "sh {here}/kdc.sh {port:kdc}"
+background = true
+ready = "kdc ready"
+[[step]]
+run = "cat > krb5.conf"
+input = """
+[realms]
+DUKOVO.TEST = { kdc = {peer}:{port:kdc} }
+"""
+[[step]]
+run = "KRB5_CONFIG=krb5.conf kinit alice@DUKOVO.TEST"
+input = "alice's password\n"
+```
+
+Placeholders name the two ends, so the same test reads on QEMU and on a
+real machine. The runner fills them in, in the command, `input`,
+`expect`, `expect_not` and `ready`, when the step runs:
+
+| Placeholder | Becomes | In |
+| --- | --- | --- |
+| `{peer}` | The lab PC's address as the machine sees it: under QEMU, `10.0.2.2`, where the guest reaches the lab PC's own loopback. | run, host |
+| `{port:NAME}` | A port of the lab PC's, free for TCP and UDP when the test first names it and the same for the rest of the test, for one of its servers: `{port:kdc}`, `{port:smb}`. | run, host |
+| `{machine}` | The machine's address as the lab PC reaches it: under QEMU, `127.0.0.1`. | host |
+| `{machine-port:N}` | The lab PC's port that reaches the machine's TCP port N, so the lab PC's clients reach the machine's servers: under QEMU, a free port forwarded to the guest's port N for the rest of the boot. `{machine-udp-port:N}` for UDP. | host |
+| `{work}` | The test's own folder on the lab PC, where host steps run. It goes when the test ends. | host |
+| `{here}` | The folder the test file is in, for a script beside the test. | host |
+
+- A `host` step runs its command with `sh -c` as the account the lab
+  runs as, in `{work}`, and passes on the same terms as a `run` step.
+  With `root = true` it runs as root on the lab PC: as it is when the
+  lab runs as root, else through `sudo -n`. A lab whose sudo asks for a
+  password skips the test and says so.
+- A `background` step starts a server and goes on: once its output holds
+  `ready`, or at once without `ready`. Its output and errors are kept in
+  the bundle as `logs/<machine>/<category>-<test>-host-<n>.log`. When the
+  test ends, passed or not, the runner ends the server and everything it
+  started (SIGTERM to its process group, and SIGKILL five seconds
+  later), so run the server in the foreground: `exec` it last in a
+  script. A server that ends or never prints `ready` is an error of the
+  lab's, not a failure of Dukovo's.
+- A foreground `host` command must end; whatever it started and left
+  running is ended with it. A server that must stay up is a
+  `background` step.
+- A host command that exits with 77 says the lab PC cannot do its part
+  (a kernel with no NFS client, say): the test is skipped, with what the
+  command printed as the reason.
+- Keep what a test needs on the lab PC in its folder: a script beside
+  the test (`sh {here}/kdc.sh`), its files in `{work}`, its servers on
+  `{port:NAME}` ports. Never change the lab PC's own settings or
+  services; a root step that must (a network interface for WireGuard)
+  undoes it when its server ends.
+- `host_needs` lists the programs the test runs on the lab PC. The
+  runner looks for each on the PATH and in the `sbin` folders, and skips
+  the test, naming what is missing, before it boots anything.
+- A machine whose driver cannot reach the lab PC (`peer = "none"`)
+  skips these tests, as does any test whose `run` steps name `{peer}`
+  or a `{port:NAME}`.
 
 ## How a test runs
 
