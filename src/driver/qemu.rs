@@ -1077,10 +1077,24 @@ mod tests {
         let screen = Image::parse_ppm(&fs::read(&dump).unwrap()).unwrap();
         assert!(screen.width > 0 && screen.height > 0);
 
-        // The pointer: anywhere on the screen, never past its edge.
+        // The pointer: anywhere on the screen, never past its edge. OVMF
+        // may change the screen's size as it starts, so each check takes
+        // the size the screen has just before it.
+        let size = |qemu: &mut Qemu| {
+            qemu.screen_dump(&dump).unwrap();
+            let screen = Image::parse_ppm(&fs::read(&dump).unwrap()).unwrap();
+            (screen.width as u32, screen.height as u32)
+        };
         qemu.point(0, 0).unwrap();
-        qemu.point(screen.width as u32 - 1, screen.height as u32 - 1).unwrap();
-        let off = qemu.point(screen.width as u32, 0).unwrap_err();
+        let (width, height) = size(&mut qemu);
+        qemu.point(width - 1, height - 1).unwrap();
+        // Tried again should the screen grow between its size and the point.
+        let off = (0..5)
+            .find_map(|_| {
+                let (width, _) = size(&mut qemu);
+                qemu.point(width, 0).err()
+            })
+            .expect("a point past the screen's edge is refused");
         assert!(off.contains("off the screen"), "{off}");
         qemu.click(Button::Left).unwrap();
         qemu.click(Button::Right).unwrap();
