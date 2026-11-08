@@ -228,6 +228,13 @@ impl Driver for FakeMachine {
                     .into(),
             ),
             "true" => (Some(0), String::new()),
+            // Says what it was given on its input, as a command a test
+            // hands a file's text to does with it.
+            "cat" => (Some(0), input.unwrap_or_default().to_string()),
+            // Reaching a server of the lab PC's, as kinit reaches a KDC.
+            cmd if cmd.starts_with("reach ") => {
+                (Some(0), format!("reached {}\n", cmd.trim_start_matches("reach ")))
+            }
             "uname" => (Some(0), "Dukovo\n".into()),
             "false" => (Some(1), String::new()),
             // Giving the machine its address on the private network, as
@@ -281,6 +288,22 @@ impl Driver for FakeMachine {
             other => (Some(127), format!("{other}: not found\n")),
         };
         Ok(Output { status, text })
+    }
+
+    fn peer_address(&self) -> Option<String> {
+        Some("10.0.2.2".into())
+    }
+
+    fn machine_address(&self) -> Option<String> {
+        Some("127.0.0.1".into())
+    }
+
+    /// The machine's port N is at the lab PC's 40000 + N.
+    fn reach(&mut self, port: u16, udp: bool) -> Result<u16, String> {
+        if udp {
+            return Err("this fake forwards no UDP".into());
+        }
+        port.checked_add(40000).ok_or_else(|| "this fake forwards only low ports".into())
     }
 
     fn slowdown(&self) -> u32 {
@@ -986,4 +1009,118 @@ fn a_step_that_panics_does_not_hang_the_run() {
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("a panicking step should end the run, not hang it");
     assert!(panicked, "the step's panic should reach the caller");
+}
+
+#[test]
+fn host_steps_run_the_lab_pc_side_and_end_its_servers() {
+    let setting = setting_with(&[
+        (
+            "features/peer.toml",
+            "about = \"a server on the lab PC, reached both ways\"\ntime = \"1m\"\n\
+             host_needs = [\"sh\"]\n\
+             [[step]]\nhost = \"echo started > server.txt; echo $$ > pid; echo ready; exec sleep 30\"\n\
+             background = true\nready = \"ready\"\n\
+             [[step]]\nhost = \"cat server.txt; pwd; echo here is {here}\"\n\
+             expect = [\"started\", \"{work}\", \"here is \"]\n\
+             [[step]]\nrun = \"reach {peer}:{port:kdc}\"\nexpect = \"reached 10.0.2.2:\"\n\
+             [[step]]\nhost = \"echo {machine}:{machine-port:445} {port:kdc}\"\nexpect = \"127.0.0.1:40445\"\n\
+             [[step]]\nrun = \"cat\"\ninput = \"realm at {peer}:{port:kdc} for {password}\\n\"\n\
+             expect = \"realm at 10.0.2.2:\"\nexpect_not = \"sesame\"\n\
+             [[step]]\nhost = \"read word; echo heard $word; exit 2\"\ninput = \"lab\\n\"\n\
+             exit = 2\nexpect = \"heard lab\"\n",
+        ),
+        (
+            "features/peer-missing.toml",
+            "about = \"needs a server the lab PC lacks\"\ntime = \"1m\"\n\
+             host_needs = [\"no-such-server-anywhere\"]\n\
+             [[step]]\nhost = \"true\"\n",
+        ),
+        (
+            "features/peer-cannot.toml",
+            "about = \"the lab PC cannot do its part\"\ntime = \"1m\"\n\
+             [[step]]\nhost = \"echo this kernel has no NFS client; exit 77\"\n\
+             [[step]]\nrun = \"uname\"\n",
+        ),
+        (
+            "features/peer-broken.toml",
+            "about = \"the lab PC's server breaks\"\ntime = \"1m\"\n\
+             [[step]]\nhost = \"echo no such realm; exit 1\"\nbackground = true\nready = \"ready\"\n",
+        ),
+    ]);
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        with_person: false,
+        linux: None,
+        fonts: None,
+        stick: None,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    assert!(setting.tests.iter().all(|test| test.controls().contains(&Control::Peer)));
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let by_test = |test: &str| results.results.iter().find(|r| r.test == test).unwrap().clone();
+
+    let peer = by_test("features/peer");
+    assert_eq!(peer.result, Outcome::Pass, "{:?}", peer.reason);
+    let log = fs::read_to_string(bundle.join(peer.log.as_ref().unwrap())).unwrap();
+    // The server ran in the test's folder until the test ended, and its
+    // output was kept.
+    assert!(log.contains("Lab PC server `echo started"), "{log}");
+    assert!(log.contains("ended at the test's end"), "{log}");
+    let server_log = bundle.join("logs/qemu/features-peer-host-1.log");
+    assert_eq!(fs::read_to_string(&server_log).unwrap(), "ready\n");
+    // The lab password reached the command, but no log shows it.
+    assert!(log.contains("for ********"), "{log}");
+    assert!(log.contains("lab-pc $ echo 127.0.0.1:40445"), "{log}");
+    assert!(log.contains("here is /"), "{{here}} is a whole path: {log}");
+
+    let missing = by_test("features/peer-missing");
+    assert_eq!(missing.result, Outcome::Skip);
+    assert!(missing.reason.as_ref().unwrap().contains("no-such-server-anywhere"));
+
+    let cannot = by_test("features/peer-cannot");
+    assert_eq!(cannot.result, Outcome::Skip);
+    assert!(cannot.reason.as_ref().unwrap().contains("this kernel has no NFS client"));
+
+    let broken = by_test("features/peer-broken");
+    assert_eq!(broken.result, Outcome::Error);
+    let reason = broken.reason.as_ref().unwrap();
+    assert!(reason.contains("ended (status 1) before it said \"ready\""), "{reason}");
+    assert!(reason.contains("no such realm"), "{reason}");
+    assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 2, errors: 1 });
+}
+
+#[test]
+fn a_run_step_may_not_name_the_lab_pc_s_own_places() {
+    let dir = TempDir::new("peer-places");
+    for (step, wrong) in [
+        ("run = \"ls {work}\"", "{work} names something of the lab PC's"),
+        ("run = \"nc {machine} 22\"", "{machine} names something of the lab PC's"),
+        ("attack = \"nc {peer} 88\"", "{peer} goes in run and host steps"),
+        ("run = \"nc {peer} {port:}\"", "a port's name is"),
+        (
+            "host = \"smbd\"\nbackground = true\nexpect = \"x\"",
+            "expect does not go with background",
+        ),
+        ("host = \"smbd\"\nready = \"x\"", "ready goes only with host and background"),
+        ("run = \"x\"\nbackground = true", "background goes only with host"),
+        ("attack = \"x\"\ninput = \"y\"", "input goes only with run or host"),
+    ] {
+        dir.write(
+            "tests/features/wrong.toml",
+            &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+        );
+        let err = format!("{:?}", crate::suite::load(&dir.path().join("tests")).unwrap_err());
+        assert!(err.contains(wrong), "{step}: {err}");
+    }
 }

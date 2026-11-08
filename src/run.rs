@@ -43,12 +43,13 @@ use crate::driver::{ATTACKER_ON_SEGMENT, Driver, Setup, TARGET_ON_SEGMENT};
 use crate::findings;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
+use crate::peer::{self, Job, Ports, Readiness, SKIP_STATUS, Token};
 use crate::screen::{self, Font};
 use crate::ssh;
 use crate::stop::Stop;
 use crate::store::Running;
 use crate::suite::{
-    Bench, Boot, Command, Fit, PASSWORD_TOKEN, PowerAction, Step, TARGET_TOKEN, Test,
+    Bench, Boot, Command, Fit, PASSWORD_TOKEN, PowerAction, Serve, Step, TARGET_TOKEN, Test,
 };
 use crate::units::format_duration;
 
@@ -85,19 +86,22 @@ fn address_setup(ip: &str) -> String {
     format!("sh -c 'ip address add {ip}/24 dev net1 && ip link set net1 up'")
 }
 
-/// Holds `output` of a `run` or `attack` command to what the command asked:
-/// its exit status, and the text its output must and must not hold. `shown`
-/// is how a log shows the command and what it printed, for a failure
-/// message. Returns `shown` on success, so the step's log line is the run.
+/// Holds `output` of a `run`, `attack` or `host` command to what the
+/// command asked: its exit status, and the text its output must and must
+/// not hold. `shown` is how a log shows the command and what it printed,
+/// for a failure message. `over_ssh` says it ran over SSH, whose own
+/// failures exit with 255. Returns `shown` on success, so the step's log
+/// line is the run.
 fn check_command(
     command: &Command,
     output: &ssh::Output,
     shown: String,
+    over_ssh: bool,
 ) -> Result<Option<String>, StepFailure> {
     let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
     match output.status {
         None => return fail("it was still running at the test's time limit".into()),
-        Some(255) if command.exit != 255 => {
+        Some(255) if over_ssh && command.exit != 255 => {
             return fail("SSH could not run it (exit status 255); SSH's message is below".into());
         }
         Some(status) if status != command.exit => {
@@ -339,6 +343,12 @@ fn pin_image(image: &Path, work: &Path, name: &str) -> PathBuf {
     }
 }
 
+/// `path` from the root: a host step runs in its folder, so a placeholder
+/// naming a folder must not depend on where the lab was started.
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn socket_folder(id: &str) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
     base.join("dukovo-lab").join(id)
@@ -354,8 +364,13 @@ fn run_machine(
 ) -> Vec<ResultRecord> {
     let has_key = setup.key.is_some();
     let screen_file = setup.work.join("screen.ppm");
+    // The tests' folders on the lab PC go in the short socket folder, as
+    // servers run in them make sockets of their own.
+    let peer_folder = setup.sockets.join("peer");
     let (mut worker, broken) = match start(machine, setup) {
-        Ok(driver) => (Some(Worker::new(machine, driver, has_key, shared, screen_file)), None),
+        Ok(driver) => {
+            (Some(Worker::new(machine, driver, has_key, shared, screen_file, peer_folder)), None)
+        }
         Err(err) => (None, Some(format!("the {} machine did not start: {err}", machine.name))),
     };
     let mut results = Vec::new();
@@ -365,6 +380,16 @@ fn run_machine(
             Fit::NeedsPerson(_) if shared.with_person => None,
             fit => fit.skip_reason(),
         };
+        // A lab PC without a server the test runs on it cannot do its side.
+        let skip = skip.or_else(|| {
+            let missing = peer::missing_programs(&test.host_needs);
+            (!missing.is_empty()).then(|| {
+                format!(
+                    "the lab PC has no {}, which this test runs there: install it to run the test",
+                    missing.join(", ")
+                )
+            })
+        });
         let ran_here = skip.is_none() && worker.is_some();
         let result = match (skip, &mut worker) {
             (Some(reason), _) => skipped(test, machine, reason),
@@ -449,6 +474,31 @@ struct Worker<'a> {
     /// Whether this boot's attacker is up and both sides have their
     /// addresses on the private network; set up on the first attack step.
     attacker_ready: bool,
+    /// The test's side on the lab PC: see [`PeerSide`].
+    peer: PeerSide,
+    /// How host steps run as root, found the first time one does (as
+    /// they are, or through sudo), or why they cannot.
+    host_root: Option<Result<Vec<String>, String>>,
+}
+
+/// What a test has on the lab PC, which goes when the test ends.
+#[derive(Default)]
+struct PeerSide {
+    /// Where each test's folder goes, in the run's short socket folder.
+    base: PathBuf,
+    /// Tests run so far, which names each test's folder.
+    tests: u32,
+    /// The ports named with `{port:NAME}`.
+    ports: Ports,
+    /// The test's folder (`{work}`), once a step needed it.
+    work: Option<PathBuf>,
+    /// The test file's folder (`{here}`).
+    here: PathBuf,
+    /// Servers started by `background` steps.
+    jobs: Vec<Job>,
+    /// Whether a host step ran as root, and so may have left root's files
+    /// in the test's folder.
+    rooted: bool,
 }
 
 impl<'a> Worker<'a> {
@@ -458,6 +508,7 @@ impl<'a> Worker<'a> {
         has_key: bool,
         shared: &'a Shared<'a>,
         screen_file: PathBuf,
+        peer_folder: PathBuf,
     ) -> Self {
         Worker {
             machine,
@@ -472,6 +523,8 @@ impl<'a> Worker<'a> {
             linux: None,
             screen_file,
             attacker_ready: false,
+            peer: PeerSide { base: peer_folder, ..PeerSide::default() },
+            host_root: None,
         }
     }
 
@@ -485,6 +538,8 @@ impl<'a> Worker<'a> {
         self.log = vec![format!("Test {} on {machine}: {}", test.id, test.about)];
         self.screenshots = Vec::new();
         let mut steps = Vec::new();
+        self.peer.tests += 1;
+        self.peer.here = test.file.parent().map(absolute).unwrap_or_default();
 
         // A test that attacks the machine wants its private network port,
         // which only an armed boot has; one that does not must not have it
@@ -529,6 +584,9 @@ impl<'a> Worker<'a> {
                 StepFailure::Skip(why) => StepFailure::Skip(format!("step {}: {why}", index + 1)),
             });
         }
+
+        // The test's servers on the lab PC end with it, failed or not.
+        self.end_peer_side();
 
         let (result, reason) = match failure {
             None => (Outcome::Pass, None),
@@ -761,6 +819,8 @@ impl<'a> Worker<'a> {
         match step {
             Step::Run(command) => self.run_command(command, deadline),
             Step::Attack(command) => self.run_attack(command, deadline),
+            Step::Host(command) => self.run_host(command, deadline),
+            Step::Serve(serve) => self.serve(test, serve, deadline),
             Step::Bench(bench) => self.bench(bench, deadline),
             Step::Serial(text) => self.wait_serial(text, deadline),
             Step::Power(action) => self.power(*action, deadline),
@@ -847,8 +907,200 @@ impl<'a> Worker<'a> {
         command: &Command,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
-        let (output, shown) = self.execute(&command.command, command.root, deadline)?;
-        check_command(command, &output, shown)
+        let command = self.fill_command(command)?;
+        let input = self.fill_input(&command)?;
+        let (output, shown) =
+            self.execute(&command.command, command.root, input.as_deref(), deadline)?;
+        check_command(&command, &output, shown, true)
+    }
+
+    /// Runs a `host` step's command on the lab PC and checks it as a `run`
+    /// step's is. One that exits with [`SKIP_STATUS`] says the lab PC
+    /// cannot do its part, and the test is skipped with what it printed.
+    fn run_host(
+        &mut self,
+        command: &Command,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let command = self.fill_command(command)?;
+        let input = self.fill_input(&command)?;
+        let root = self.host_root(command.root)?;
+        let folder = self.peer_work()?;
+        let scratch = self.peer.base.join("output");
+        let output = peer::run(
+            &command.command,
+            &root,
+            input.as_deref(),
+            &folder,
+            &scratch,
+            deadline,
+            self.shared.stop,
+        )
+        .map_err(StepFailure::Error)?;
+        let prompt = if command.root { "lab-pc #" } else { "lab-pc $" };
+        let (output, shown) = self.finish(&command.command, output, prompt)?;
+        if output.status == Some(SKIP_STATUS) && command.exit != SKIP_STATUS {
+            return Err(StepFailure::Skip(format!(
+                "the lab PC cannot do its part of this test: {}",
+                output.text.trim()
+            )));
+        }
+        check_command(&command, &output, shown, false)
+    }
+
+    /// Starts a server on the lab PC for the rest of the test, and waits
+    /// until it says it is ready when the step says what it prints then.
+    /// A server that ends or never gets ready is the lab's fault, not
+    /// Dukovo's: an error, or a skip when it exits with [`SKIP_STATUS`].
+    fn serve(
+        &mut self,
+        test: &Test,
+        serve: &Serve,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let command = self.fill(&serve.command)?;
+        let ready = serve.ready.as_deref().map(|ready| self.fill(ready)).transpose()?;
+        let root = self.host_root(serve.root)?;
+        let folder = self.peer_work()?;
+        let logs = self.shared.bundle.logs(&self.machine.name);
+        fs::create_dir_all(&logs)
+            .map_err(|err| StepFailure::Error(format!("making {}: {err}", logs.display())))?;
+        let log = logs.join(format!(
+            "{}-host-{}.log",
+            test.id.replace('/', "-"),
+            self.peer.jobs.len() + 1
+        ));
+        let job = Job::start(&command, &root, &folder, &log).map_err(StepFailure::Error)?;
+        self.peer.rooted |= serve.root;
+        self.peer.jobs.push(job);
+        let shown = self.shared.bundle.relative(&log);
+        let Some(ready) = ready else {
+            return Ok(Some(format!("started; its output goes to {shown}")));
+        };
+        let job = self.peer.jobs.last_mut().expect("pushed above");
+        let readiness = job.wait_for(&ready, deadline, self.shared.stop);
+        let tail = job.tail();
+        match readiness {
+            Readiness::Ready => Ok(Some(format!("ready; its output goes to {shown}"))),
+            Readiness::Stopped => Err(StepFailure::Skip(STOPPED_DURING.into())),
+            Readiness::Exited(Some(SKIP_STATUS)) => Err(StepFailure::Skip(format!(
+                "the lab PC cannot do its part of this test: {}",
+                tail.trim()
+            ))),
+            Readiness::Exited(status) => {
+                let status = status.map_or("a signal".to_string(), |s| format!("status {s}"));
+                Err(StepFailure::Error(format!(
+                    "the lab PC's server ended ({status}) before it said \"{ready}\"; the end of {shown}:\n{tail}"
+                )))
+            }
+            Readiness::TimedOut => Err(StepFailure::Error(format!(
+                "the lab PC's server did not say \"{ready}\" before the test's time limit; the end of {shown}:\n{tail}"
+            ))),
+        }
+    }
+
+    /// How a host step runs: as it is, or as root through
+    /// [`peer::root_prefix`], found once a run. A lab that cannot run it
+    /// as root skips the test, as that says nothing about Dukovo.
+    fn host_root(&mut self, root: bool) -> Result<Vec<String>, StepFailure> {
+        if !root {
+            return Ok(Vec::new());
+        }
+        self.peer.rooted = true;
+        self.host_root.get_or_insert_with(peer::root_prefix).clone().map_err(StepFailure::Skip)
+    }
+
+    /// The test's folder on the lab PC (`{work}`), made the first time a
+    /// step needs it.
+    fn peer_work(&mut self) -> Result<PathBuf, StepFailure> {
+        if let Some(work) = &self.peer.work {
+            return Ok(work.clone());
+        }
+        let work = self.peer.base.join(self.peer.tests.to_string());
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work)
+            .map_err(|err| StepFailure::Error(format!("making {}: {err}", work.display())))?;
+        let work = absolute(&work);
+        self.peer.work = Some(work.clone());
+        Ok(work)
+    }
+
+    /// `text` with its placeholders (see peer.rs) filled in.
+    fn fill(&mut self, text: &str) -> Result<String, StepFailure> {
+        peer::fill(text, |token| match token {
+            Token::Peer => self.driver.peer_address().ok_or_else(|| {
+                StepFailure::Error("this machine's driver has no address for the lab PC".into())
+            }),
+            Token::Machine => self.driver.machine_address().ok_or_else(|| {
+                StepFailure::Error("this machine's driver has no address for the machine".into())
+            }),
+            Token::MachinePort { port, udp } => self
+                .driver
+                .reach(*port, *udp)
+                .map(|port| port.to_string())
+                .map_err(StepFailure::Error),
+            Token::Port(name) => {
+                self.peer.ports.get(name).map(|port| port.to_string()).map_err(StepFailure::Error)
+            }
+            Token::Work => self.peer_work().map(|work| work.display().to_string()),
+            Token::Here => Ok(self.peer.here.display().to_string()),
+        })
+    }
+
+    /// `command` with the placeholders of its command and checks filled in.
+    fn fill_command(&mut self, command: &Command) -> Result<Command, StepFailure> {
+        Ok(Command {
+            command: self.fill(&command.command)?,
+            exit: command.exit,
+            expect: command.expect.iter().map(|text| self.fill(text)).collect::<Result<_, _>>()?,
+            expect_not: command
+                .expect_not
+                .iter()
+                .map(|text| self.fill(text))
+                .collect::<Result<_, _>>()?,
+            root: command.root,
+            input: command.input.as_deref().map(|input| self.fill(input)).transpose()?,
+        })
+    }
+
+    /// A command's input, with `{password}` the lab password. It is never
+    /// logged, and what the command prints has the password taken out.
+    fn fill_input(&self, command: &Command) -> Result<Option<String>, StepFailure> {
+        let Some(input) = &command.input else { return Ok(None) };
+        if !input.contains(PASSWORD_TOKEN) {
+            return Ok(Some(input.clone()));
+        }
+        let Some(password) = self.shared.password else {
+            return Err(StepFailure::Error(NO_PASSWORD.into()));
+        };
+        Ok(Some(input.replace(PASSWORD_TOKEN, password)))
+    }
+
+    /// Ends the test's servers on the lab PC, noting in its log how each
+    /// ended, and clears its ports and folder for the next test.
+    fn end_peer_side(&mut self) {
+        for mut job in std::mem::take(&mut self.peer.jobs) {
+            let ended = job.end();
+            let log = self.shared.bundle.relative(&job.log);
+            self.log
+                .push(format!("Lab PC server `{}`: {ended}; its output is in {log}", job.command));
+        }
+        self.peer.ports = Ports::default();
+        if let Some(work) = self.peer.work.take()
+            && fs::remove_dir_all(&work).is_err()
+            && self.peer.rooted
+            && let Some(Ok(root)) = &self.host_root
+            && let Some((first, rest)) = root.split_first()
+        {
+            // Root's files, which the lab's own account cannot remove.
+            let _ = std::process::Command::new(first)
+                .args(rest)
+                .args(["rm", "-rf", "--"])
+                .arg(&work)
+                .stdin(std::process::Stdio::null())
+                .status();
+        }
+        self.peer.rooted = false;
     }
 
     /// Runs an `attack` step on the attacker, bringing the attacker up and
@@ -877,9 +1129,10 @@ impl<'a> Worker<'a> {
                 .map(|text| text.replace(TARGET_TOKEN, TARGET_ON_SEGMENT))
                 .collect(),
             root: command.root,
+            input: None,
         };
         let (output, shown) = self.execute_attack(&resolved.command, resolved.root, deadline)?;
-        check_command(&resolved, &output, shown)
+        check_command(&resolved, &output, shown, true)
     }
 
     /// Brings the attacker up and gives it and the machine under test their
@@ -894,7 +1147,8 @@ impl<'a> Worker<'a> {
         // net1, the port on their private network, and that port is up.
         // Both commands go to a shell run as root (`elevate` elevates only
         // the first command it is given), so setting the port up is root's.
-        let (output, shown) = self.execute(&address_setup(TARGET_ON_SEGMENT), true, deadline)?;
+        let (output, shown) =
+            self.execute(&address_setup(TARGET_ON_SEGMENT), true, None, deadline)?;
         if output.status != Some(0) {
             return Err(StepFailure::Error(format!(
                 "could not give the machine its address on the private network\n{shown}"
@@ -912,12 +1166,13 @@ impl<'a> Worker<'a> {
     }
 
     /// Runs `command` on the machine, as root through elevate when `root`,
-    /// and gives back its output and how a log shows it: a prompt, the
-    /// command and what it printed.
+    /// with `input` as its standard input, and gives back its output and
+    /// how a log shows it: a prompt, the command and what it printed.
     fn execute(
         &mut self,
         command: &str,
         root: bool,
+        input: Option<&str>,
         deadline: Instant,
     ) -> Result<(ssh::Output, String), StepFailure> {
         // The machine went off when the test needed it on: Dukovo's
@@ -927,7 +1182,7 @@ impl<'a> Worker<'a> {
                 "the machine was off, so `{command}` could not run"
             )));
         }
-        let (line, input, prompt) = self.as_root(command, root)?;
+        let (line, input, prompt) = self.as_root(command, root, input)?;
         let output = self
             .driver
             .run_command(&line, input.as_deref(), deadline)
@@ -944,7 +1199,7 @@ impl<'a> Worker<'a> {
         root: bool,
         deadline: Instant,
     ) -> Result<(ssh::Output, String), StepFailure> {
-        let (line, input, prompt) = self.as_root(command, root)?;
+        let (line, input, prompt) = self.as_root(command, root, None)?;
         let output =
             self.driver.attack(&line, input.as_deref(), deadline).map_err(StepFailure::Error)?;
         self.finish(command, output, prompt)
@@ -952,20 +1207,24 @@ impl<'a> Worker<'a> {
 
     /// Wraps `command` to run as root when `root`: `elevate -S` reads the
     /// lab's password from the command's input, so it is never on a command
-    /// line. Gives back the line to run, its input, and the prompt a log
-    /// shows it under (`#` as root, `$` otherwise).
+    /// line, and leaves the rest of the input, `input`, to the command (it
+    /// reads the password a byte at a time). Gives back the line to run,
+    /// its input, and the prompt a log shows it under (`#` as root, `$`
+    /// otherwise).
     fn as_root(
         &self,
         command: &str,
         root: bool,
+        input: Option<&str>,
     ) -> Result<(String, Option<String>, &'static str), StepFailure> {
         if root {
             let Some(password) = self.shared.password else {
                 return Err(StepFailure::Error(NO_PASSWORD.into()));
             };
-            Ok((format!("elevate -S {command}"), Some(format!("{password}\n")), "#"))
+            let input = format!("{password}\n{}", input.unwrap_or_default());
+            Ok((format!("elevate -S {command}"), Some(input), "#"))
         } else {
-            Ok((command.to_string(), None, "$"))
+            Ok((command.to_string(), input.map(String::from), "$"))
         }
     }
 
@@ -1032,7 +1291,7 @@ impl<'a> Worker<'a> {
                 unmeasured.join(", ")
             )));
         }
-        let (output, shown) = self.execute(&bench.command, bench.root, deadline)?;
+        let (output, shown) = self.execute(&bench.command, bench.root, None, deadline)?;
         let fail = |why: String| Err(StepFailure::Fail(format!("{why}\n{shown}")));
         match output.status {
             None => return fail("it was still running at the test's time limit".into()),

@@ -20,6 +20,7 @@ mod findings;
 mod http;
 mod machines;
 mod output;
+mod peer;
 mod qmp;
 mod run;
 mod schedule;

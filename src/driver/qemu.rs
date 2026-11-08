@@ -18,7 +18,14 @@
 //! a USB stick to `blockdev-add` and `device_add usb-storage` on an xhci
 //! controller, keys to `send-key`, the pointer (a USB tablet) to
 //! `input-send-event`, the screen to `screendump`.
+//!
+//! The lab PC is the guest's peer on QEMU's user network, where the guest
+//! reaches the lab PC's loopback at 10.0.2.2 (`{peer}`); a guest's port
+//! the lab PC's clients need is forwarded from a free port of the lab
+//! PC's loopback with the monitor's `hostfwd_add`, for the rest of the
+//! boot.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::net::TcpListener;
@@ -39,8 +46,11 @@ use crate::suite::{Button, PowerAction, Stick};
 /// The QEMU binary.
 const QEMU: &str = "qemu-system-x86_64";
 
-/// The network device's id, which `set_link` names.
+/// The network device's id, which `set_link` and `hostfwd_add` name.
 const NETDEV: &str = "lab0";
+
+/// The lab PC's address on QEMU's user network, as the guest sees it.
+const HOST_ON_USER_NET: &str = "10.0.2.2";
 
 /// The private-network device's id on the machine under test and on the
 /// attacker, joining the two over a QEMU socket link.
@@ -100,6 +110,9 @@ pub struct Qemu {
     segment_port: u16,
     /// The attacker machine while it is running, with its SSH port.
     attacker: Option<Attacker>,
+    /// The guest's ports forwarded to the lab PC this boot, as (UDP,
+    /// the guest's port) to the lab PC's port.
+    forwards: BTreeMap<(bool, u16), u16>,
 }
 
 /// The attacker machine: a second QEMU on the private network.
@@ -156,6 +169,7 @@ impl Qemu {
             want_attacker: false,
             segment_port: 0,
             attacker: None,
+            forwards: BTreeMap::new(),
         })
     }
 
@@ -457,6 +471,8 @@ impl Qemu {
         File::create(&self.serial)
             .map_err(|err| format!("making {}: {err}", self.serial.display()))?;
         self.ssh_port = free_port()?;
+        // A new QEMU has none of the last boot's forwarded ports.
+        self.forwards.clear();
         // The attacker is of the last boot; a new boot gets its own.
         self.stop_attacker();
         // An armed boot opens the private network's port for the attacker
@@ -889,6 +905,35 @@ impl Driver for Qemu {
         target.run(command, input, deadline, &self.setup.stop)
     }
 
+    fn peer_address(&self) -> Option<String> {
+        Some(HOST_ON_USER_NET.into())
+    }
+
+    fn machine_address(&self) -> Option<String> {
+        Some("127.0.0.1".into())
+    }
+
+    fn reach(&mut self, port: u16, udp: bool) -> Result<u16, String> {
+        if let Some(&forwarded) = self.forwards.get(&(udp, port)) {
+            return Ok(forwarded);
+        }
+        let (protocol, host_port) =
+            if udp { ("udp", crate::peer::free_udp_port()?) } else { ("tcp", free_port()?) };
+        // QMP has no command of its own for this; the human monitor's,
+        // through QMP, says nothing when it works and why when it does not.
+        let rule = format!("{protocol}:127.0.0.1:{host_port}-:{port}");
+        let said = self.qmp()?.execute(
+            "human-monitor-command",
+            &json!({ "command-line": format!("hostfwd_add {NETDEV} {rule}") }),
+        )?;
+        let said = said.as_str().unwrap_or_default().trim();
+        if !said.is_empty() {
+            return Err(format!("forwarding the guest's port: hostfwd_add {rule}: {said}"));
+        }
+        self.forwards.insert((udp, port), host_port);
+        Ok(host_port)
+    }
+
     fn slowdown(&self) -> u32 {
         if self.kvm { 1 } else { self.settings.tcg_slowdown }
     }
@@ -1003,6 +1048,11 @@ mod tests {
 
         qemu.set_link(false).unwrap();
         qemu.set_link(true).unwrap();
+
+        // A guest's port, forwarded to the lab PC once a boot.
+        let forwarded = qemu.reach(445, false).unwrap();
+        assert_eq!(qemu.reach(445, false).unwrap(), forwarded);
+        assert_ne!(qemu.reach(51820, true).unwrap(), 0);
 
         let image = dir.write("stick.img", "");
         File::options().write(true).open(&image).unwrap().set_len(1 << 20).unwrap();
