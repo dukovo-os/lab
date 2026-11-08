@@ -236,6 +236,8 @@ impl Driver for FakeMachine {
                 Some("sesame\n") => (Some(0), String::new()),
                 _ => (Some(1), "elevate: a password is needed\n".into()),
             },
+            // A fault in the lab itself, not in the machine under test.
+            "panic" => panic!("the fake machine broke"),
             "hang" => {
                 while Instant::now() < deadline && !self.stop.requested() {
                     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -963,4 +965,25 @@ fn a_long_step_reports_it_is_still_running() {
     );
     assert!(beats[0].contains("run `hang`"), "the beat names the step: {}", beats[0]);
     assert!(beats[0].contains("\"milliseconds\":"), "the beat says how long: {}", beats[0]);
+}
+
+#[test]
+fn a_step_that_panics_does_not_hang_the_run() {
+    // A panic inside a step must reach the caller, not leave the run
+    // waiting for ever on the step's heartbeat. The run goes on its own
+    // thread, so a hang shows as a failed wait here rather than a stuck
+    // test.
+    let (sent, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let setting = setting_with(&[(
+            "stress/broken.toml",
+            "about = \"breaks\"\ntime = \"1m\"\n[[step]]\nrun = \"panic\"\n",
+        )]);
+        let ended = std::panic::catch_unwind(|| run_on(&setting, vec![&setting.qemu]));
+        let _ = sent.send(ended.is_err());
+    });
+    let panicked = got
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("a panicking step should end the run, not hang it");
+    assert!(panicked, "the step's panic should reach the caller");
 }

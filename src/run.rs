@@ -28,6 +28,7 @@ use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -595,14 +596,22 @@ impl<'a> Worker<'a> {
         let machine = self.machine.name.clone();
         let test_id = test.id.clone();
         let step = what.to_string();
-        let done = AtomicBool::new(false);
+        // The beat sleeps on this channel between beats. Nothing is ever
+        // sent: the step's end drops `alive`, which wakes the beat at once,
+        // so a step does not wait out the rest of a sleep before it ends.
+        // A step that panics drops `alive` as it unwinds too, so the scope
+        // below never waits for ever on a beat that would not stop.
+        let (alive, ended) = mpsc::channel::<()>();
         let outcome = std::thread::scope(|scope| {
-            scope.spawn(|| {
+            scope.spawn(move || {
                 let mut next = HEARTBEAT;
                 loop {
-                    std::thread::sleep(Duration::from_millis(50));
-                    if done.load(Ordering::Relaxed) {
-                        return;
+                    let wait = next.saturating_sub(started.elapsed());
+                    match ended.recv_timeout(wait) {
+                        Err(RecvTimeoutError::Timeout) => {}
+                        // The step is over (or nothing was sent, which
+                        // cannot happen): stop beating.
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
                     }
                     let elapsed = started.elapsed();
                     if elapsed >= next {
@@ -617,7 +626,7 @@ impl<'a> Worker<'a> {
                 }
             });
             let outcome = action(self);
-            done.store(true, Ordering::Relaxed);
+            drop(alive);
             outcome
         });
         let milliseconds = started.elapsed().as_millis() as u64;
