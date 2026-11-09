@@ -357,7 +357,18 @@ mod tests {
 
         running.end();
         assert!(!is_running(store.path(), id));
-        assert_eq!(machine_user(store.path(), "qemu"), None);
+        // A test beside this one that starts a program forks first, and
+        // until the child execs it holds a copy of every open file, the
+        // machine's lock among them, so the lock may outlive the run by
+        // that moment.
+        let let_go = (0..LOCK_TRIES * 10).any(|_| {
+            let free = machine_user(store.path(), "qemu").is_none();
+            if !free {
+                std::thread::sleep(LOCK_PAUSE);
+            }
+            free
+        });
+        assert!(let_go, "the run's end let its machine go");
         assert!(!store.path().join("running").join(id).exists());
 
         // A detached run that broke before its end keeps what it said.

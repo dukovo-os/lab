@@ -136,6 +136,17 @@ impl Driver for FakeMachine {
         Ok(())
     }
 
+    fn boot_dvd(&mut self, dvd: &Path, disk: u64) -> Result<(), String> {
+        assert!(dvd.is_file(), "the DVD is given a second name, not lost");
+        if !self.disc_drive {
+            return Err("this boot was not given an optical drive".into());
+        }
+        self.new_serial();
+        self.say(&format!("live: from the DVD, a blank disk of {disk} bytes"));
+        self.screen = vec!["Install Dukovo".into()];
+        Ok(())
+    }
+
     fn power(&mut self, action: PowerAction, _deadline: Instant) -> Result<(), String> {
         match action {
             PowerAction::On | PowerAction::Reset => {
@@ -478,6 +489,7 @@ fn run_with(
         linux: None,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(
@@ -624,6 +636,7 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
         linux,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -702,6 +715,7 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         linux: None,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -757,6 +771,7 @@ fn attack_steps_run_on_a_private_lab_network() {
         linux: None,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -814,6 +829,7 @@ fn card_tests_boot_with_a_card_reader_of_their_own() {
         linux: None,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -871,6 +887,7 @@ fn disc_tests_boot_with_an_optical_drive_of_their_own() {
         linux: None,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
@@ -929,6 +946,12 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
              [[step]]\nscreen = \"Installing\"\n[[step]]\nusb = \"unplug\"\n",
         ),
         (
+            "boot/install-dvd.toml",
+            "about = \"install from the DVD\"\ntime = \"1m\"\nboot = \"dvd\"\n\
+             [[step]]\nserial = \"from the DVD, a blank disk of 8589934592 bytes\"\n\
+             [[step]]\nscreen = \"Install Dukovo\"\n[[step]]\ndisc = \"eject\"\n",
+        ),
+        (
             "features/uname.toml",
             "about = \"after the install\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
         ),
@@ -937,7 +960,10 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
     fs::create_dir_all(&fonts).unwrap();
     fs::write(fonts.join("test-4x6.psfu"), fake_font()).unwrap();
     let stick = setting.dir.write("dukovo.img", "the install stick");
-    let request = |fonts: Option<Vec<crate::screen::Font>>, stick: Option<PathBuf>| Request {
+    let dvd = setting.dir.write("dukovo.iso", "the install DVD");
+    let request = |fonts: Option<Vec<crate::screen::Font>>,
+                   stick: Option<PathBuf>,
+                   dvd: Option<PathBuf>| Request {
         tests: setting.tests.iter().collect(),
         machines: vec![&setting.qemu],
         image: "dukovo.img".into(),
@@ -949,12 +975,16 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
         linux: None,
         fonts,
         stick,
+        dvd,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
     };
-    let with_both =
-        request(Some(crate::screen::Font::read_dir(&fonts).unwrap()), Some(stick.clone()));
+    let with_both = request(
+        Some(crate::screen::Font::read_dir(&fonts).unwrap()),
+        Some(stick.clone()),
+        Some(dvd.clone()),
+    );
     let ended = run(&with_both, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&with_both.store, with_both.id.as_deref().unwrap());
     let results: crate::bundle::ResultsFile =
@@ -1001,12 +1031,16 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
     let after = by_test("features/uname");
     assert_eq!(after.result, Outcome::Pass);
     assert_eq!(after.steps[0].step, "boot afresh and wait until booted");
-    assert_eq!(ended.summary, Summary { passed: 3, failed: 2, skipped: 0, errors: 1 });
+    // So does the install DVD, in the optical drive the test is given.
+    let from_dvd = by_test("boot/install-dvd");
+    assert_eq!(from_dvd.result, Outcome::Pass, "{:?}", from_dvd.reason);
+    assert_eq!(from_dvd.steps[0].step, "boot from the install DVD, with a blank disk");
+    assert_eq!(ended.summary, Summary { passed: 4, failed: 2, skipped: 0, errors: 1 });
 
-    // Without fonts the screen steps skip, and without a stick the
-    // installer's test does, each saying how to get one.
-    let ended = run(&request(None, None), &Reporter::silent(), &start_fake).unwrap();
-    assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 4, errors: 1 });
+    // Without fonts the screen steps skip, and without a stick or a DVD
+    // the installer's tests do, each saying how to get one.
+    let ended = run(&request(None, None, None), &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 5, errors: 1 });
 }
 
 #[test]
@@ -1223,6 +1257,7 @@ fn host_steps_run_the_lab_pc_side_and_end_its_servers() {
         linux: None,
         fonts: None,
         stick: None,
+        dvd: None,
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),

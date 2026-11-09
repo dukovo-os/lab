@@ -42,6 +42,14 @@ pub trait Driver: Send {
     /// stick stays in until [`Driver::unplug_usb`] pulls it.
     fn boot_stick(&mut self, stick: &Path, disk: u64) -> Result<(), String>;
 
+    /// As [`Driver::boot_stick`], from the install DVD `dvd` (an ISO the
+    /// driver never writes to) in the machine's optical drive, which the
+    /// runner asked for with [`Driver::want_disc_drive`]. The disc stays
+    /// in until [`Driver::eject_disc`] takes it out.
+    fn boot_dvd(&mut self, _dvd: &Path, _disk: u64) -> Result<(), String> {
+        Err("this machine's driver cannot start it from a disc".into())
+    }
+
     /// Does a power action. [`PowerAction::Off`] returns once the machine
     /// is off, or fails at `deadline` or when the run is stopped.
     fn power(&mut self, action: PowerAction, deadline: Instant) -> Result<(), String>;
