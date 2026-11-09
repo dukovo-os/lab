@@ -1260,6 +1260,10 @@ fn save(arguments: &Arguments, rest: &[String]) -> Result<Value, Error> {
     Ok(json!({ "saved": schedule.name, "new": new, "schedule": schedule }))
 }
 
+/// What the list says a start is doing while it holds its lock but has
+/// said nothing yet, or has said how it went.
+const STARTING_OR_ENDING: &str = "starting or ending";
+
 /// Every schedule, when it runs next and how it went last.
 fn list(config: &Path, store: &Path) -> Result<Value, Error> {
     let schedules = load(config)?;
@@ -1286,7 +1290,16 @@ fn list(config: &Path, store: &Path) -> Result<Value, Error> {
                 (Ok(zone), Some(next)) => json!(ahead_text(zone, now, next)),
                 _ => Value::Null,
             };
-            item["going"] = if going { json!(state.going) } else { Value::Null };
+            // A start writes how it went a moment before it lets go of its
+            // lock, and the tick takes a held lock for a start that is still
+            // going: so does the list, until the lock is free.
+            item["going"] = match (going, &state.going) {
+                (false, _) => Value::Null,
+                (true, Some(doing)) => json!(doing),
+                (true, None) => {
+                    json!({ "started": null, "doing": STARTING_OR_ENDING, "run": null })
+                }
+            };
             item["last"] = json!(state.last);
             item
         })
@@ -1448,6 +1461,28 @@ mod tests {
             send: true,
             paused: false,
         }
+    }
+
+    /// A start writes how it went a moment before it lets go of its lock:
+    /// until it does, the list says it is going, as the tick takes it.
+    #[test]
+    fn a_start_is_going_until_it_lets_go_of_its_lock() {
+        let dir = crate::testing::TempDir::new("schedule-going");
+        let (config, store) = (dir.path().join("config"), dir.path().join("store"));
+        let schedules = Schedules { schedules: vec![nightly()], ..Schedules::default() };
+        dir.write("config/schedules.json", &serde_json::to_string(&schedules).unwrap());
+        edit_state(&store, "nightly", |state| {
+            state.going = None;
+            state.last = Some(Last { result: "passed".into(), ..Last::default() });
+        })
+        .unwrap();
+        let lock = store::take_lock(&going_lock(&store, "nightly")).unwrap().unwrap();
+        let listed = list(&config, &store).unwrap();
+        assert_eq!(listed["schedules"][0]["going"]["doing"], STARTING_OR_ENDING);
+        drop(lock);
+        let listed = list(&config, &store).unwrap();
+        assert_eq!(listed["schedules"][0]["going"], Value::Null);
+        assert_eq!(listed["schedules"][0]["last"]["result"], "passed");
     }
 
     #[test]
