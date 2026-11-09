@@ -84,6 +84,7 @@ Each step has exactly one action key, and only the options that go with it.
 | `disc = "insert"` | `image` | Puts a disc in the optical drive: `image`, a disc image (an ISO) in the test's folder, which the machine only reads. See [Optical drive tests](#optical-drive-tests). | disc |
 | `disc = "eject"` | | Opens the drive's tray and takes the disc out, whether or not the machine let go of it. | disc |
 | `disc = "reinsert"` | | Puts the disc taken out last back in. | disc |
+| `disc = "button"` | | Presses the drive's eject button: a drive whose disc the machine locked in keeps it and asks the machine to let it go; one the machine did not lock opens, and the disc is taken out. | disc |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
 | `type = "<text>"` | | Types the text on a US keyboard: `\n` is Enter, and `{password}` types the lab password, which is never shown or kept. A character with no key on a US keyboard is an error when the suite loads. | keys |
 | `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. An error if the screen is smaller. | mouse |
@@ -395,7 +396,8 @@ Card reader tests live under `lab/tests/storage/`.
 A test with a `disc` step uses an optical drive, a CD, DVD or Blu-ray
 drive whose disc comes and goes while the drive stays (ADR 0431 in
 Dukovo's repository). Its `disc = "insert"`, `disc = "eject"` and
-`disc = "reinsert"` steps put a disc in, take it out and put it back.
+`disc = "reinsert"` steps put a disc in, take it out and put it back,
+and `disc = "button"` presses the drive's eject button (ADR 0432).
 
 ```toml
 about = "A disc put in the drive is mounted at its label, read-only"
@@ -427,6 +429,11 @@ disc = "eject"
 - `disc = "eject"` opens the tray by force, as a paper clip in the
   drive's hole does: whether the machine let go of the disc first is for
   the test's own steps to check, as with `eject`.
+- `disc = "button"` presses the drive's button, as a person does. A
+  drive whose disc the machine locked in keeps it and tells the machine,
+  which unmounts the disc and opens the tray; the disc stays in the open
+  tray until a `disc = "eject"` takes it out. A drive the machine did not
+  lock opens at once, and the disc is out.
 - On a real machine a person puts the disc in and takes it out, so disc
   tests are Needs you tests there.
 

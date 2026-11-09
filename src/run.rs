@@ -854,6 +854,9 @@ impl<'a> Worker<'a> {
             Step::ReinsertDisc => {
                 self.driver.reinsert_disc().map(|()| None).map_err(StepFailure::Error)
             }
+            Step::PressDiscButton => {
+                self.driver.press_disc_button().map(|()| None).map_err(StepFailure::Error)
+            }
             Step::Keys(keys) => {
                 self.driver.press_keys(keys).map(|()| None).map_err(StepFailure::Error)
             }

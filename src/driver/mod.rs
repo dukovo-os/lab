@@ -108,6 +108,13 @@ pub trait Driver: Send {
         Err("this machine's driver cannot put a disc in its drive".into())
     }
 
+    /// Presses the optical drive's eject button: a drive whose disc the
+    /// machine locked in keeps it and asks the machine to let it go; one
+    /// the machine did not lock opens its tray, and the disc is taken out.
+    fn press_disc_button(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot press its drive's eject button".into())
+    }
+
     /// Presses each key combination in turn.
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String>;
 

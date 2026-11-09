@@ -211,6 +211,10 @@ impl Driver for FakeMachine {
         self.eject_disc()
     }
 
+    fn press_disc_button(&mut self) -> Result<(), String> {
+        self.eject_disc()
+    }
+
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
         for combo in combos {
             self.key(combo);

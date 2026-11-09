@@ -195,6 +195,10 @@ pub enum Step {
     EjectDisc,
     /// Puts the disc taken out last back in.
     ReinsertDisc,
+    /// Presses the optical drive's eject button: a drive whose disc the
+    /// machine locked in keeps it and asks the machine to let it go; one
+    /// it did not opens, and the disc is taken out.
+    PressDiscButton,
     /// Presses keys, each a combination such as `ctrl-alt-delete`.
     Keys(Vec<String>),
     /// Keeps a screenshot under this name.
@@ -335,7 +339,9 @@ impl Step {
             Step::Link(_) => Some(Control::Link),
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
             Step::InsertCard(_) | Step::RemoveCard | Step::ReinsertCard => Some(Control::Card),
-            Step::InsertDisc(_) | Step::EjectDisc | Step::ReinsertDisc => Some(Control::Disc),
+            Step::InsertDisc(_) | Step::EjectDisc | Step::ReinsertDisc | Step::PressDiscButton => {
+                Some(Control::Disc)
+            }
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
             Step::Attack(_) => Some(Control::Attack),
@@ -384,6 +390,7 @@ impl Step {
             }
             Step::EjectDisc => "take the disc out of the optical drive".into(),
             Step::ReinsertDisc => "put the disc back in the optical drive".into(),
+            Step::PressDiscButton => "press the optical drive's eject button".into(),
             Step::Keys(keys) => format!("press {}", keys.join(", ")),
             Step::Type(text) => format!("type \"{}\"", text.escape_debug()),
             Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
@@ -626,6 +633,7 @@ enum DiscAction {
     Insert,
     Eject,
     Reinsert,
+    Button,
 }
 
 /// `expect = "text"` or `expect = ["one", "two"]`.
@@ -747,7 +755,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
                 )));
             }
             Step::ReinsertCard => card_out = false,
-            Step::EjectDisc => disc_out = true,
+            Step::EjectDisc | Step::PressDiscButton => disc_out = true,
             Step::InsertDisc(_) => disc_out = false,
             Step::ReinsertDisc if !disc_out => {
                 return Err(bad(format!(
@@ -958,11 +966,12 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     }
     if let Some(action) = step.disc {
         return match (action, step.image) {
-            (DiscAction::Eject | DiscAction::Reinsert, Some(_)) => {
+            (DiscAction::Eject | DiscAction::Reinsert | DiscAction::Button, Some(_)) => {
                 Err("only disc = \"insert\" takes an image".into())
             }
             (DiscAction::Eject, None) => Ok(Step::EjectDisc),
             (DiscAction::Reinsert, None) => Ok(Step::ReinsertDisc),
+            (DiscAction::Button, None) => Ok(Step::PressDiscButton),
             (DiscAction::Insert, None) => {
                 Err("disc = \"insert\" needs image, a disc image beside the test".into())
             }
@@ -1546,7 +1555,8 @@ expect = "1 received"
         dir.write(
             "features/disc.toml",
             "about = \"x\"\ntime = \"1m\"\n[[step]]\ndisc = \"insert\"\nimage = \"disc.iso\"\n\
-             [[step]]\ndisc = \"eject\"\n[[step]]\ndisc = \"reinsert\"\n",
+             [[step]]\ndisc = \"eject\"\n[[step]]\ndisc = \"reinsert\"\n\
+             [[step]]\ndisc = \"button\"\n",
         );
         let tests = load(dir.path()).unwrap();
         let image = dir.path().join("features/disc.iso");
@@ -1559,6 +1569,8 @@ expect = "1 received"
         assert_eq!(tests[0].steps[1].describe(), "take the disc out of the optical drive");
         assert_eq!(tests[0].steps[2], Step::ReinsertDisc);
         assert_eq!(tests[0].steps[2].describe(), "put the disc back in the optical drive");
+        assert_eq!(tests[0].steps[3], Step::PressDiscButton);
+        assert_eq!(tests[0].steps[3].describe(), "press the optical drive's eject button");
         assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Disc)));
         assert!(tests[0].controls().contains(&Control::Disc));
         for (step, complaint) in [
@@ -1566,6 +1578,7 @@ expect = "1 received"
             ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb or card"),
             ("disc = \"insert\"\nimage = \"none.iso\"", "does not exist"),
             ("disc = \"eject\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
+            ("disc = \"button\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
             ("disc = \"reinsert\"", "none is out"),
             ("disc = \"open\"", "disc"),
             ("run = \"ls\"\nimage = \"disc.iso\"", "image goes only with usb, card or disc"),
