@@ -81,6 +81,9 @@ Each step has exactly one action key, and only the options that go with it.
 | `card = "insert"` | `image` or `blank` | Puts a memory card in the card reader: a copy of `image`, or with `blank = "64M"` an empty card of that size, as `usb = "plug"` takes them. The reader stays plugged in; only the card comes and goes. See [Card reader tests](#card-reader-tests). | card |
 | `card = "remove"` | | Takes the card out of the reader, whether or not the machine let go of it. | card |
 | `card = "reinsert"` | | Puts the card taken out last back in, holding what the machine wrote on it. | card |
+| `disc = "insert"` | `image` | Puts a disc in the optical drive: `image`, a disc image (an ISO) in the test's folder, which the machine only reads. See [Optical drive tests](#optical-drive-tests). | disc |
+| `disc = "eject"` | | Opens the drive's tray and takes the disc out, whether or not the machine let go of it. | disc |
+| `disc = "reinsert"` | | Puts the disc taken out last back in. | disc |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
 | `type = "<text>"` | | Types the text on a US keyboard: `\n` is Enter, and `{password}` types the lab password, which is never shown or kept. A character with no key on a US keyboard is an error when the suite loads. | keys |
 | `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. An error if the screen is smaller. | mouse |
@@ -386,6 +389,48 @@ expect = "LABCARD"
   switch.
 
 Card reader tests live under `lab/tests/storage/`.
+
+## Optical drive tests
+
+A test with a `disc` step uses an optical drive, a CD, DVD or Blu-ray
+drive whose disc comes and goes while the drive stays (ADR 0431 in
+Dukovo's repository). Its `disc = "insert"`, `disc = "eject"` and
+`disc = "reinsert"` steps put a disc in, take it out and put it back.
+
+```toml
+about = "A disc put in the drive is mounted at its label, read-only"
+time = "3m"
+
+[[step]]
+disc = "insert"
+image = "optical.iso"
+[[step]]
+wait = "5s"
+[[step]]
+run = "findmnt /volumes/LABDISC"
+expect = ["iso9660", "ro"]
+[[step]]
+disc = "eject"
+```
+
+- A disc is an image in the test's folder, such as one `xorriso -as
+  mkisofs` makes, and is never written: the machine reads it, so there
+  is no blank disc, and no copy is made.
+- On QEMU the drive is a DVD drive on the chipset's AHCI controller with
+  no disc in it at boot, there only on a boot for a test with `disc`
+  steps, so that its empty drive never shows up in another test's disks:
+  a disc test always boots afresh, and its boot is never shared with the
+  test after it.
+- The machine looks at the drive every two seconds, and a disc takes a
+  moment to spin up, so give a step that reads the disc a moment, as
+  `wait` above does.
+- `disc = "eject"` opens the tray by force, as a paper clip in the
+  drive's hole does: whether the machine let go of the disc first is for
+  the test's own steps to check, as with `eject`.
+- On a real machine a person puts the disc in and takes it out, so disc
+  tests are Needs you tests there.
+
+Optical drive tests live under `lab/tests/storage/` too.
 
 ## How a test runs
 

@@ -40,6 +40,8 @@ pub enum Control {
     /// Putting a memory card in the machine's card reader and taking it
     /// out.
     Card,
+    /// Putting a disc in the machine's optical drive and ejecting it.
+    Disc,
     /// Pressing keys on the machine's keyboard.
     Keys,
     /// Moving the pointer and pressing its buttons.
@@ -63,13 +65,14 @@ pub enum Control {
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 13] = [
+    pub const ALL: [Control; 14] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
         Control::Link,
         Control::Usb,
         Control::Card,
+        Control::Disc,
         Control::Keys,
         Control::Mouse,
         Control::Screen,
@@ -88,6 +91,7 @@ impl Control {
             Control::Link => "link",
             Control::Usb => "usb",
             Control::Card => "card",
+            Control::Disc => "disc",
             Control::Keys => "keys",
             Control::Mouse => "mouse",
             Control::Screen => "screen",

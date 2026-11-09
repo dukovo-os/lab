@@ -551,7 +551,10 @@ impl<'a> Worker<'a> {
         // an empty drive, a disk test must not find either.
         let cards = test.controls().contains(&Control::Card);
         self.driver.want_card_reader(cards);
-        let own_boot = attacks || cards;
+        // And one that puts discs in an optical drive, as empty.
+        let discs = test.controls().contains(&Control::Disc);
+        self.driver.want_disc_drive(discs);
+        let own_boot = attacks || cards || discs;
 
         let mut failure = None;
         if let Boot::Stick { disk } = test.boot {
@@ -610,8 +613,9 @@ impl<'a> Worker<'a> {
         }
         // After the installer, the disk no longer holds the image under
         // test, so the next test boots afresh. An attack boot has the
-        // private network port a later test must not find, and a card
-        // test's boot the card reader, so they are not shared either.
+        // private network port a later test must not find, a card test's
+        // boot the card reader and a disc test's the optical drive, so
+        // they are not shared either.
         self.reusable =
             result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !own_boot;
         let log = self.write_log(test, result, reason.as_deref());
@@ -842,6 +846,13 @@ impl<'a> Worker<'a> {
             }
             Step::ReinsertCard => {
                 self.driver.reinsert_card().map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::InsertDisc(image) => {
+                self.driver.insert_disc(image).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::EjectDisc => self.driver.eject_disc().map(|()| None).map_err(StepFailure::Error),
+            Step::ReinsertDisc => {
+                self.driver.reinsert_disc().map(|()| None).map_err(StepFailure::Error)
             }
             Step::Keys(keys) => {
                 self.driver.press_keys(keys).map(|()| None).map_err(StepFailure::Error)
