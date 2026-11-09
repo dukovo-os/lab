@@ -130,6 +130,10 @@ pub struct Qemu {
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
     boot_stick: Option<(u32, PathBuf)>,
+    /// The install DVD this boot started from, while it is still in the
+    /// optical drive: it stays in across power cycles, as a real disc
+    /// would, until it is taken out.
+    boot_disc: Option<PathBuf>,
     /// Whether the next fresh boot gives the machine a second network port
     /// on a private network for an attacker, set by [`Driver::want_attacker`].
     want_attacker: bool,
@@ -201,6 +205,7 @@ impl Qemu {
             disc_out: None,
             want_disc_drive: false,
             boot_stick: None,
+            boot_disc: None,
             want_attacker: false,
             segment_port: 0,
             attacker: None,
@@ -293,9 +298,9 @@ impl Qemu {
         args.push("-drive".into());
         args.push(format!("if=none,id=disk,format=qcow2,file={}", option_value(&self.disk())));
         args.push("-device".into());
-        // While the install stick is in, the firmware starts it first, as
-        // a person picks it in the boot menu; the disk after.
-        let disk_index = if self.boot_stick.is_some() { 1 } else { 0 };
+        // While the install stick or DVD is in, the firmware starts it
+        // first, as a person picks it in the boot menu; the disk after.
+        let disk_index = if self.boot_stick.is_some() || self.boot_disc.is_some() { 1 } else { 0 };
         args.push(match settings.disk {
             // q35's own SATA controller is AHCI, as the OptiPlex's in AHCI mode.
             DiskBus::Sata => format!("ide-hd,drive=disk,bootindex={disk_index}"),
@@ -336,14 +341,22 @@ impl Qemu {
                 "usb-storage,bus=xhci.0,drive={CARD_DRIVE},id=usb-card-reader,removable=on"
             ));
         }
-        // An optical drive, empty: a DVD drive on the chipset's AHCI
-        // controller's second port, after a SATA disk's first. Only on a
-        // boot for a test with disc steps, for the same reason.
+        // An optical drive: a DVD drive on the chipset's AHCI controller's
+        // second port, after a SATA disk's first. Only on a boot for a
+        // test with disc steps, for the same reason. It is empty, or holds
+        // the install DVD the boot starts from.
         if self.want_disc_drive {
             args.push("-drive".into());
-            args.push(format!("if=none,id={DISC_DRIVE},media=cdrom"));
+            args.push(match &self.boot_disc {
+                Some(dvd) => format!(
+                    "if=none,id={DISC_DRIVE},media=cdrom,format=raw,readonly=on,file={}",
+                    option_value(dvd)
+                ),
+                None => format!("if=none,id={DISC_DRIVE},media=cdrom"),
+            });
             args.push("-device".into());
-            args.push(format!("ide-cd,drive={DISC_DRIVE},bus=ide.1,id=dvd-drive"));
+            let first = if self.boot_disc.is_some() { ",bootindex=0" } else { "" };
+            args.push(format!("ide-cd,drive={DISC_DRIVE},bus=ide.1,id=dvd-drive{first}"));
         }
         // The install stick, named as a stick plugged in later is, so that
         // pulling it works the same way.
@@ -400,8 +413,14 @@ impl Qemu {
             self.forget_card_out();
             self.card_out = Some(card);
         }
-        if let Some(disc) = self.disc.take() {
+        if let Some(disc) = self.disc.take()
+            && self.boot_disc.as_ref() != Some(&disc)
+        {
             self.disc_out = Some(disc);
+        }
+        // The install DVD, given on its command line, is still in.
+        if self.boot_disc.is_some() {
+            self.disc.clone_from(&self.boot_disc);
         }
         Ok(())
     }
@@ -526,6 +545,7 @@ impl Qemu {
             let _ = fs::remove_file(overlay);
         }
         self.stick = None;
+        self.boot_disc = None;
         self.boot += 1;
         if let Some((_, template)) = &self.ovmf {
             fs::copy(template, self.variables()).map_err(|err| {
@@ -725,6 +745,26 @@ impl Driver for Qemu {
         self.power_on()
     }
 
+    fn boot_dvd(&mut self, dvd: &Path, disk: u64) -> Result<(), String> {
+        if !self.want_disc_drive {
+            return Err("this boot has no optical drive for the install DVD".into());
+        }
+        self.next_boot()?;
+        // A blank disk for the installer, and the DVD read-only in the
+        // drive: a disc is never written.
+        let blank = self.disk();
+        Self::qemu_img(
+            &["-f", "qcow2", &blank.to_string_lossy(), &disk.to_string()],
+            "the installer's blank disk",
+        )?;
+        let image = fs::canonicalize(dvd)
+            .map_err(|err| format!("the install DVD {}: {err}", dvd.display()))?;
+        self.disc = None;
+        self.disc_out = None;
+        self.boot_disc = Some(image);
+        self.power_on()
+    }
+
     fn power(&mut self, action: PowerAction, deadline: Instant) -> Result<(), String> {
         match action {
             PowerAction::On => self.power_on(),
@@ -888,6 +928,8 @@ impl Driver for Qemu {
             return Err(err);
         }
         self.disc_out = Some(disc);
+        // The install DVD, if it was the one, is out for good.
+        self.boot_disc = None;
         Ok(())
     }
 
@@ -910,6 +952,7 @@ impl Driver for Qemu {
         match self.qmp().and_then(|qmp| qmp.execute("eject", &json!({ "device": DISC_DRIVE }))) {
             Ok(_) => {
                 self.disc_out = self.disc.take();
+                self.boot_disc = None;
                 Ok(())
             }
             Err(err) if err.contains("is locked") => Ok(()),
@@ -1385,6 +1428,25 @@ mod tests {
         assert!(dir.path().join("work/disk-4.qcow2").is_file());
         assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
+
+        // The install DVD, in the optical drive the test asked for, with a
+        // blank disk: in across a power cycle until it is taken out, and
+        // never written.
+        assert!(qemu.boot_dvd(&install, 1 << 30).unwrap_err().contains("no optical drive"));
+        qemu.want_disc_drive(true);
+        qemu.boot_dvd(&install, 1 << 30).unwrap();
+        assert!(qemu.is_on());
+        assert!(dir.path().join("work/disk-5.qcow2").is_file());
+        assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
+        qemu.power(PowerAction::Cut, soon()).unwrap();
+        qemu.power(PowerAction::On, soon()).unwrap();
+        assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
+        qemu.eject_disc().unwrap();
+        qemu.power(PowerAction::Cut, soon()).unwrap();
+        qemu.power(PowerAction::On, soon()).unwrap();
+        assert!(qemu.eject_disc().unwrap_err().contains("no disc"), "taken out for good");
+        assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
+        qemu.want_disc_drive(false);
         qemu.shut_off();
         assert!(!qemu.is_on());
         let log = fs::read_to_string(dir.path().join("logs/qemu-1.log")).unwrap();

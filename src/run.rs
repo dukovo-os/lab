@@ -75,6 +75,9 @@ pub const NO_FONTS: &str = "this step reads the screen, and the run was given no
 /// Why a test that boots the install stick is skipped.
 pub const NO_STICK: &str = "this test boots the install stick, and the run was given none: `ob lab` builds one and passes it with --stick";
 
+/// Why a test that boots the install DVD is skipped.
+pub const NO_DVD: &str = "this test boots the install DVD, and the run was given none: `ob lab` builds one and passes it with --dvd";
+
 /// Why a `bench` step's numbers are kept but not held to Linux's.
 pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers (no KVM), so they are kept but not held to Linux's";
 
@@ -142,6 +145,8 @@ pub struct Request<'a> {
     pub fonts: Option<Vec<Font>>,
     /// The install stick's image, for tests that boot it, when given.
     pub stick: Option<PathBuf>,
+    /// The install DVD's ISO, for tests that boot it, when given.
+    pub dvd: Option<PathBuf>,
     /// The preset the tests came from, for run.json.
     pub preset: Option<String>,
     /// The schedule that started the run, for run.json.
@@ -173,6 +178,8 @@ struct Shared<'a> {
     /// The install stick, given a second name in the work folder as the
     /// image is.
     stick: Option<&'a Path>,
+    /// The install DVD, likewise.
+    dvd: Option<&'a Path>,
 }
 
 /// Starts a machine's driver; [`crate::driver::start`] outside tests.
@@ -228,6 +235,7 @@ pub fn run(
     let work = request.store.join("work").join(&id);
     let image = pin_image(&request.image, &work, "under-test");
     let stick = request.stick.as_ref().map(|stick| pin_image(stick, &work, "install-stick"));
+    let dvd = request.dvd.as_ref().map(|dvd| pin_image(dvd, &work, "install-dvd"));
     let sockets = socket_folder(&id);
     let stop = Stop::default();
     let finished = AtomicBool::new(false);
@@ -244,6 +252,7 @@ pub fn run(
         measuring: &measuring,
         fonts: request.fonts.as_deref(),
         stick: stick.as_deref(),
+        dvd: dvd.as_deref(),
     };
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
         // Ends the watcher below however this ends, a worker's panic too,
@@ -564,6 +573,13 @@ impl<'a> Worker<'a> {
                 });
             steps.push(record);
             failure = outcome.err();
+        } else if let Boot::Dvd { disk } = test.boot {
+            let (record, outcome) =
+                self.timed(test, "boot from the install DVD, with a blank disk", |worker| {
+                    worker.boot_dvd(disk)
+                });
+            steps.push(record);
+            failure = outcome.err();
         } else if test.fresh || own_boot || !self.reusable || !self.driver.is_on() {
             let (record, outcome) =
                 self.timed(test, "boot afresh and wait until booted", |worker| {
@@ -772,6 +788,22 @@ impl<'a> Worker<'a> {
         self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
         self.log.push(format!(
             "Boot {}: from the install stick; serial log {}",
+            self.boot,
+            self.relative_serial()
+        ));
+        Ok(None)
+    }
+
+    fn boot_dvd(&mut self, disk: u64) -> Result<Option<String>, StepFailure> {
+        let Some(dvd) = self.shared.dvd else {
+            return Err(StepFailure::Skip(NO_DVD.into()));
+        };
+        self.driver.boot_dvd(dvd, disk).map_err(StepFailure::Error)?;
+        self.boot += 1;
+        self.attacker_ready = false;
+        self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
+        self.log.push(format!(
+            "Boot {}: from the install DVD; serial log {}",
             self.boot,
             self.relative_serial()
         ));

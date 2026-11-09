@@ -85,10 +85,11 @@ struct Page {
     build: Option<String>,
     /// The Linux kit runs from the page hold Dukovo to, when given.
     linux: Option<PathBuf>,
-    /// The console's fonts and the install stick runs from the page use,
-    /// when given.
+    /// The console's fonts and the install stick and DVD runs from the
+    /// page use, when given.
     fonts: Option<PathBuf>,
     stick: Option<PathBuf>,
+    dvd: Option<PathBuf>,
     /// When the image was made, as the page opened: a later one is a new
     /// build, which `build` no longer names.
     image_made: Option<SystemTime>,
@@ -149,6 +150,13 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         Some(stick) => Some(absolute(stick.clone())?),
         None => None,
     };
+    let dvd = match &arguments.dvd {
+        Some(dvd) if !dvd.is_file() => {
+            return Err(Error::Usage(format!("the install DVD {} does not exist", dvd.display())));
+        }
+        Some(dvd) => Some(absolute(dvd.clone())?),
+        None => None,
+    };
     let port = arguments.port.unwrap_or(DEFAULT_PORT);
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|err| {
         Error::Usage(format!(
@@ -170,6 +178,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         linux,
         fonts,
         stick,
+        dvd,
     });
     let address = format!("http://127.0.0.1:{port}/?key={}", page.key);
     if arguments.json {
@@ -381,6 +390,9 @@ impl Page {
         }
         if let Some(stick) = &self.stick {
             args.extend(["--stick".into(), stick.display().to_string()]);
+        }
+        if let Some(dvd) = &self.dvd {
+            args.extend(["--dvd".into(), dvd.display().to_string()]);
         }
         if let Some(build) = &self.build {
             args.extend(["--build".into(), build.clone()]);
@@ -634,6 +646,7 @@ mod tests {
             linux: None,
             fonts: None,
             stick: None,
+            dvd: None,
             image_made: None,
         }
     }

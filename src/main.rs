@@ -105,6 +105,8 @@ Options for run:
                    (`ob lab` gives Dukovo's)
   --stick <file>   The install stick's image, for tests that boot it (`ob
                    lab` builds it with `ob image`)
+  --dvd <file>     The install DVD's ISO, for tests that boot it (`ob lab`
+                   builds it with `ob image --iso`)
   --machine <a,b>  The machines to run on (default: qemu)
   --build <text>   The build's name for the bundle, such as \"0.13.0 fd2a9e8\"
   --all            Every test
@@ -174,6 +176,8 @@ struct Arguments {
     fonts: Option<PathBuf>,
     /// The install stick's image.
     stick: Option<PathBuf>,
+    /// The install DVD's ISO.
+    dvd: Option<PathBuf>,
     machine: Option<String>,
     build: Option<String>,
     preset: Option<String>,
@@ -248,6 +252,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--linux" => arguments.linux = Some(value("--linux")?.into()),
             "--fonts" => arguments.fonts = Some(value("--fonts")?.into()),
             "--stick" => arguments.stick = Some(value("--stick")?.into()),
+            "--dvd" => arguments.dvd = Some(value("--dvd")?.into()),
             "--machine" => arguments.machine = Some(value("--machine")?),
             "--build" => arguments.build = Some(value("--build")?),
             "--preset" => arguments.preset = Some(value("--preset")?),
@@ -392,6 +397,7 @@ fn test_json(test: &Test, machines: &[&Machine]) -> Value {
         "boot": match test.boot {
             suite::Boot::Image => "image",
             suite::Boot::Stick { .. } => "stick",
+            suite::Boot::Dvd { .. } => "dvd",
         },
         "file": test.file,
         "controls": test.controls(),
@@ -599,6 +605,11 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     {
         return Err(Error::Usage(format!("the install stick {} does not exist", stick.display())));
     }
+    if let Some(dvd) = &arguments.dvd
+        && !dvd.is_file()
+    {
+        return Err(Error::Usage(format!("the install DVD {} does not exist", dvd.display())));
+    }
     let store = arguments.store_dir()?;
     if arguments.detach {
         return detach(arguments, &store, &machines);
@@ -620,6 +631,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         linux,
         fonts,
         stick: arguments.stick.clone(),
+        dvd: arguments.dvd.clone(),
         preset: arguments.preset.clone(),
         schedule: arguments.schedule.clone(),
         id: arguments.run_id.clone(),

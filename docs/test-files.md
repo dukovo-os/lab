@@ -35,8 +35,8 @@ expect_not = "NO-CARRIER"
 | `about` | yes | What the test checks, in one line. |
 | `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `24h`. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. |
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
-| `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk: see [Installer tests](#installer-tests). |
-| `disk` | no | With `boot = "stick"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
+| `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk, and `"dvd"` the install DVD in the optical drive: see [Installer tests](#installer-tests). |
+| `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
 | `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
 | `[[step]]` | at least one | The steps, in order. |
 
@@ -164,6 +164,15 @@ test's steps drive the installer's screens and check them. `usb =
 "unplug"` pulls the stick, after which the machine boots from the disk.
 The test after it boots afresh from the image under test, as the disk no
 longer holds it. A run without a stick skips these tests and says why.
+
+A test with `boot = "dvd"` starts the same way from the install DVD, an
+ISO that `ob lab` builds with `ob image --iso` and passes with `--dvd`
+(ADR 0433 in Dukovo's repository): the machine has an optical drive
+holding the disc, first in the boot order, and the blank disk. `disc =
+"eject"` takes the disc out, after which the machine boots from the
+disk. Such a test uses the optical drive, as an [optical drive
+test](#optical-drive-tests) does, so it runs on machines whose driver
+puts discs in.
 
 ```toml
 about = "The installer erases a blank disk and installs Dukovo"

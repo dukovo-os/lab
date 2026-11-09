@@ -154,6 +154,9 @@ pub enum Boot {
     /// the test's own steps follow the stick's boot. The machine boots
     /// afresh for the test after, as its disk no longer holds the image.
     Stick { disk: u64 },
+    /// As [`Boot::Stick`], from the install DVD the run was given, in the
+    /// machine's optical drive, which the firmware starts first.
+    Dvd { disk: u64 },
 }
 
 /// What a `type` step types in place of this text: the lab password, which
@@ -468,9 +471,16 @@ impl Test {
         if self.steps.iter().any(|step| matches!(step, Step::Run(command) if names_peer(command))) {
             controls.insert(Control::Peer);
         }
-        // The install stick is plugged in as the machine powers on.
-        if matches!(self.boot, Boot::Stick { .. }) {
-            controls.insert(Control::Usb);
+        // The install stick is plugged in as the machine powers on, and
+        // the install DVD is in the optical drive.
+        match self.boot {
+            Boot::Stick { .. } => {
+                controls.insert(Control::Usb);
+            }
+            Boot::Dvd { .. } => {
+                controls.insert(Control::Disc);
+            }
+            Boot::Image => {}
         }
         controls.insert(Control::Power);
         controls.insert(Control::Serial);
@@ -559,6 +569,7 @@ struct TestFile {
 enum BootFrom {
     Image,
     Stick,
+    Dvd,
 }
 
 /// The installer's disk unless a test says: room for an installed system,
@@ -709,20 +720,24 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
     if file.steps.is_empty() {
         return Err(bad("a test needs at least one [[step]]".into()));
     }
-    let boot = match (file.boot, file.disk) {
-        (None | Some(BootFrom::Image), None) => Boot::Image,
-        (None | Some(BootFrom::Image), Some(_)) => {
-            return Err(bad("disk goes only with boot = \"stick\"".into()));
+    let disk = match file.disk {
+        None => DEFAULT_INSTALL_DISK,
+        Some(_) if matches!(file.boot, None | Some(BootFrom::Image)) => {
+            return Err(bad("disk goes only with boot = \"stick\" or \"dvd\"".into()));
         }
-        (Some(BootFrom::Stick), None) => Boot::Stick { disk: DEFAULT_INSTALL_DISK },
-        (Some(BootFrom::Stick), Some(size)) => match parse_size(&size) {
-            Some(disk) if (1 << 30..=DISK_MAX).contains(&disk) => Boot::Stick { disk },
+        Some(size) => match parse_size(&size) {
+            Some(disk) if (1 << 30..=DISK_MAX).contains(&disk) => disk,
             _ => {
                 return Err(bad(format!(
                     "disk = \"{size}\": a size from 1G to 2048G, as a number and M or G, such as \"8G\""
                 )));
             }
         },
+    };
+    let boot = match file.boot {
+        None | Some(BootFrom::Image) => Boot::Image,
+        Some(BootFrom::Stick) => Boot::Stick { disk },
+        Some(BootFrom::Dvd) => Boot::Dvd { disk },
     };
     // A program's name, as the lab PC's PATH finds it: no folders.
     if let Some(bad_name) = file.host_needs.iter().find(|name| {
@@ -1635,6 +1650,15 @@ expect = "1 received"
         let test = &load(dir.path()).unwrap()[0];
         assert_eq!(test.boot, Boot::Image);
         assert!(!test.uses_password());
+        // The install DVD: in the optical drive, with the default disk.
+        dir.write(
+            "console/screens.toml",
+            "about = \"x\"\ntime = \"1m\"\nboot = \"dvd\"\n[[step]]\nscreen = \"Step 1 of 6\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert_eq!(test.boot, Boot::Dvd { disk: DEFAULT_INSTALL_DISK });
+        assert!(test.controls().contains(&Control::Disc));
+        assert!(!test.controls().contains(&Control::Usb));
     }
 
     #[test]
