@@ -898,6 +898,25 @@ impl Driver for Qemu {
         Ok(())
     }
 
+    fn press_disc_button(&mut self) -> Result<(), String> {
+        if self.disc.is_none() {
+            return Err("no disc is in the optical drive".into());
+        }
+        // Not by force: QEMU refuses to open a drive the machine locked,
+        // and has the drive report an eject request (GET EVENT STATUS
+        // NOTIFICATION), as a real drive's button does; the machine then
+        // opens the tray itself, and a `disc = "eject"` takes the disc
+        // out. A drive the machine did not lock opens at once.
+        match self.qmp().and_then(|qmp| qmp.execute("eject", &json!({ "device": DISC_DRIVE }))) {
+            Ok(_) => {
+                self.disc_out = self.disc.take();
+                Ok(())
+            }
+            Err(err) if err.contains("is locked") => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
         for combo in combos {
             let keys: Vec<_> =
@@ -1348,6 +1367,10 @@ mod tests {
         qemu.insert_disc(&disc).unwrap();
         assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
         qemu.eject_disc().unwrap();
+        qemu.reinsert_disc().unwrap();
+        // Nothing locked it in: its button opens the tray.
+        qemu.press_disc_button().unwrap();
+        assert!(qemu.press_disc_button().unwrap_err().contains("no disc"));
         qemu.reinsert_disc().unwrap();
         qemu.eject_disc().unwrap();
         assert_eq!(fs::metadata(&disc).unwrap().len(), 1 << 20);
