@@ -187,6 +187,14 @@ pub enum Step {
     /// Puts the memory card taken out last back in, holding what the
     /// machine wrote on it.
     ReinsertCard,
+    /// Puts a disc holding this image, beside the test, in the machine's
+    /// optical drive.
+    InsertDisc(PathBuf),
+    /// Takes the disc out of the optical drive, whether or not the
+    /// machine let it go.
+    EjectDisc,
+    /// Puts the disc taken out last back in.
+    ReinsertDisc,
     /// Presses keys, each a combination such as `ctrl-alt-delete`.
     Keys(Vec<String>),
     /// Keeps a screenshot under this name.
@@ -327,6 +335,7 @@ impl Step {
             Step::Link(_) => Some(Control::Link),
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
             Step::InsertCard(_) | Step::RemoveCard | Step::ReinsertCard => Some(Control::Card),
+            Step::InsertDisc(_) | Step::EjectDisc | Step::ReinsertDisc => Some(Control::Disc),
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
             Step::Attack(_) => Some(Control::Attack),
@@ -369,6 +378,12 @@ impl Step {
             }
             Step::RemoveCard => "take the memory card out of the card reader".into(),
             Step::ReinsertCard => "put the memory card back in the card reader".into(),
+            Step::InsertDisc(image) => {
+                let name = image.file_name().unwrap_or_default().to_string_lossy();
+                format!("put a disc holding {name} in the optical drive")
+            }
+            Step::EjectDisc => "take the disc out of the optical drive".into(),
+            Step::ReinsertDisc => "put the disc back in the optical drive".into(),
             Step::Keys(keys) => format!("press {}", keys.join(", ")),
             Step::Type(text) => format!("type \"{}\"", text.escape_debug()),
             Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
@@ -560,6 +575,7 @@ struct StepFile {
     link: Option<LinkState>,
     usb: Option<UsbAction>,
     card: Option<CardAction>,
+    disc: Option<DiscAction>,
     image: Option<String>,
     blank: Option<String>,
     root: Option<bool>,
@@ -601,6 +617,14 @@ enum UsbAction {
 enum CardAction {
     Insert,
     Remove,
+    Reinsert,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum DiscAction {
+    Insert,
+    Eject,
     Reinsert,
 }
 
@@ -710,19 +734,28 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             parse_step(step, folder).map_err(|err| bad(format!("step {}: {err}", index + 1)))?;
         steps.push(step);
     }
-    // A card is put back only once one was taken out.
-    let mut out = false;
+    // A card or disc is put back only once one was taken out.
+    let (mut card_out, mut disc_out) = (false, false);
     for (index, step) in steps.iter().enumerate() {
         match step {
-            Step::RemoveCard => out = true,
-            Step::InsertCard(_) => out = false,
-            Step::ReinsertCard if !out => {
+            Step::RemoveCard => card_out = true,
+            Step::InsertCard(_) => card_out = false,
+            Step::ReinsertCard if !card_out => {
                 return Err(bad(format!(
                     "step {}: card = \"reinsert\" puts back a card the test took out, and none is out",
                     index + 1
                 )));
             }
-            Step::ReinsertCard => out = false,
+            Step::ReinsertCard => card_out = false,
+            Step::EjectDisc => disc_out = true,
+            Step::InsertDisc(_) => disc_out = false,
+            Step::ReinsertDisc if !disc_out => {
+                return Err(bad(format!(
+                    "step {}: disc = \"reinsert\" puts back a disc the test took out, and none is out",
+                    index + 1
+                )));
+            }
+            Step::ReinsertDisc => disc_out = false,
             _ => {}
         }
     }
@@ -757,6 +790,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("link", step.link.is_some()),
         ("usb", step.usb.is_some()),
         ("card", step.card.is_some()),
+        ("disc", step.disc.is_some()),
         ("keys", step.keys.is_some()),
         ("screenshot", step.screenshot.is_some()),
         ("wait", step.wait.is_some()),
@@ -773,7 +807,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, attack, host, serial, power, link, usb, card, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, host, serial, power, link, usb, card, disc, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -825,11 +859,13 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     }
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
-    // A stick's or a card's: what it holds.
-    for (option, set) in [("image", step.image.is_some()), ("blank", step.blank.is_some())] {
-        if set && !matches!(given[0], "usb" | "card") {
-            return Err(format!("{option} goes only with usb or card"));
-        }
+    // A stick's, a card's or a disc's: what it holds. A disc is never
+    // blank: a blank one holds nothing to read.
+    if step.image.is_some() && !matches!(given[0], "usb" | "card" | "disc") {
+        return Err("image goes only with usb, card or disc".into());
+    }
+    if step.blank.is_some() && !matches!(given[0], "usb" | "card") {
+        return Err("blank goes only with usb or card".into());
     }
 
     let command = |text: String, step: &StepFile| Command {
@@ -917,6 +953,24 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             CardAction::Insert => {
                 parse_medium("card = \"insert\"", "card", step.image, step.blank, folder)
                     .map(Step::InsertCard)
+            }
+        };
+    }
+    if let Some(action) = step.disc {
+        return match (action, step.image) {
+            (DiscAction::Eject | DiscAction::Reinsert, Some(_)) => {
+                Err("only disc = \"insert\" takes an image".into())
+            }
+            (DiscAction::Eject, None) => Ok(Step::EjectDisc),
+            (DiscAction::Reinsert, None) => Ok(Step::ReinsertDisc),
+            (DiscAction::Insert, None) => {
+                Err("disc = \"insert\" needs image, a disc image beside the test".into())
+            }
+            (DiscAction::Insert, image) => {
+                match parse_medium("disc = \"insert\"", "disc", image, None, folder)? {
+                    Stick::Image(path) => Ok(Step::InsertDisc(path)),
+                    Stick::Blank(_) => Err("a disc is never blank".into()),
+                }
             }
         };
     }
@@ -1478,6 +1532,46 @@ expect = "1 received"
         ] {
             dir.write(
                 "features/card.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
+            assert!(why.contains(complaint), "{step}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_disc_is_put_in_and_taken_out_of_the_optical_drive() {
+        let dir = TempDir::new("suite-disc");
+        dir.write("features/disc.iso", "");
+        dir.write(
+            "features/disc.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\ndisc = \"insert\"\nimage = \"disc.iso\"\n\
+             [[step]]\ndisc = \"eject\"\n[[step]]\ndisc = \"reinsert\"\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        let image = dir.path().join("features/disc.iso");
+        assert_eq!(tests[0].steps[0], Step::InsertDisc(image));
+        assert_eq!(
+            tests[0].steps[0].describe(),
+            "put a disc holding disc.iso in the optical drive"
+        );
+        assert_eq!(tests[0].steps[1], Step::EjectDisc);
+        assert_eq!(tests[0].steps[1].describe(), "take the disc out of the optical drive");
+        assert_eq!(tests[0].steps[2], Step::ReinsertDisc);
+        assert_eq!(tests[0].steps[2].describe(), "put the disc back in the optical drive");
+        assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Disc)));
+        assert!(tests[0].controls().contains(&Control::Disc));
+        for (step, complaint) in [
+            ("disc = \"insert\"", "disc = \"insert\" needs image"),
+            ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb or card"),
+            ("disc = \"insert\"\nimage = \"none.iso\"", "does not exist"),
+            ("disc = \"eject\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
+            ("disc = \"reinsert\"", "none is out"),
+            ("disc = \"open\"", "disc"),
+            ("run = \"ls\"\nimage = \"disc.iso\"", "image goes only with usb, card or disc"),
+        ] {
+            dir.write(
+                "features/disc.toml",
                 &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
             );
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };

@@ -18,9 +18,11 @@
 //! a USB stick to `blockdev-add` and `device_add usb-storage` on an xhci
 //! controller, a memory card to `blockdev-change-medium` and `eject` on
 //! a card reader (a `usb-storage` whose medium is removable, empty at
-//! boot, there only for a test with card steps), keys to `send-key`, the
-//! pointer (a USB tablet) to `input-send-event`, the screen to
-//! `screendump`.
+//! boot, there only for a test with card steps), a disc to the same on
+//! an optical drive (an `ide-cd` on the q35 chipset's AHCI controller,
+//! empty at boot, there only for a test with disc steps), keys to
+//! `send-key`, the pointer (a USB tablet) to `input-send-event`, the
+//! screen to `screendump`.
 //!
 //! The lab PC is the guest's peer on QEMU's user network, where the guest
 //! reaches the lab PC's loopback at 10.0.2.2 (`{peer}`); a guest's port
@@ -54,6 +56,9 @@ const NETDEV: &str = "lab0";
 
 /// The card reader's drive, which a card goes in and comes out of.
 const CARD_DRIVE: &str = "card-reader";
+
+/// The optical drive's drive, which a disc goes in and comes out of.
+const DISC_DRIVE: &str = "optical-drive";
 
 /// The lab PC's address on QEMU's user network, as the guest sees it.
 const HOST_ON_USER_NET: &str = "10.0.2.2";
@@ -113,6 +118,14 @@ pub struct Qemu {
     /// Whether the next fresh boot gives the machine an empty card reader,
     /// set by [`Driver::want_card_reader`].
     want_card_reader: bool,
+    /// The image of the disc in the optical drive now, and of the one
+    /// taken out last, to go back in. The guest never writes a disc, so
+    /// it is the test's own file, opened read-only.
+    disc: Option<PathBuf>,
+    disc_out: Option<PathBuf>,
+    /// Whether the next fresh boot gives the machine an empty optical
+    /// drive, set by [`Driver::want_disc_drive`].
+    want_disc_drive: bool,
     /// The install stick this boot started from, while it is still in:
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
@@ -184,6 +197,9 @@ impl Qemu {
             card: None,
             card_out: None,
             want_card_reader: false,
+            disc: None,
+            disc_out: None,
+            want_disc_drive: false,
             boot_stick: None,
             want_attacker: false,
             segment_port: 0,
@@ -320,6 +336,15 @@ impl Qemu {
                 "usb-storage,bus=xhci.0,drive={CARD_DRIVE},id=usb-card-reader,removable=on"
             ));
         }
+        // An optical drive, empty: a DVD drive on the chipset's AHCI
+        // controller's second port, after a SATA disk's first. Only on a
+        // boot for a test with disc steps, for the same reason.
+        if self.want_disc_drive {
+            args.push("-drive".into());
+            args.push(format!("if=none,id={DISC_DRIVE},media=cdrom"));
+            args.push("-device".into());
+            args.push(format!("ide-cd,drive={DISC_DRIVE},bus=ide.1,id=dvd-drive"));
+        }
         // The install stick, named as a stick plugged in later is, so that
         // pulling it works the same way.
         if let Some((number, overlay)) = &self.boot_stick {
@@ -374,6 +399,9 @@ impl Qemu {
         if let Some(card) = self.card.take() {
             self.forget_card_out();
             self.card_out = Some(card);
+        }
+        if let Some(disc) = self.disc.take() {
+            self.disc_out = Some(disc);
         }
         Ok(())
     }
@@ -626,6 +654,30 @@ impl Qemu {
         Ok(())
     }
 
+    /// Puts a disc holding `image` in the optical drive, read-only.
+    fn put_disc_in(&mut self, image: &Path) -> Result<(), String> {
+        if !self.want_disc_drive {
+            return Err("this boot has no optical drive".into());
+        }
+        if let Some(disc) = &self.disc {
+            return Err(format!(
+                "a disc holding {} is still in the optical drive; take it out first",
+                disc.display()
+            ));
+        }
+        self.qmp()?.execute(
+            "blockdev-change-medium",
+            &json!({
+                "device": DISC_DRIVE,
+                "filename": image,
+                "format": "raw",
+                "read-only-mode": "read-only",
+            }),
+        )?;
+        self.disc = Some(image.to_path_buf());
+        Ok(())
+    }
+
     /// Deletes the file of the card taken out last, which will not go
     /// back in.
     fn forget_card_out(&mut self) {
@@ -813,6 +865,36 @@ impl Driver for Qemu {
         let number = self.card_out.ok_or("no memory card was taken out to put back")?;
         self.put_card_in(number)?;
         self.card_out = None;
+        Ok(())
+    }
+
+    fn want_disc_drive(&mut self, yes: bool) {
+        self.want_disc_drive = yes;
+    }
+
+    fn insert_disc(&mut self, image: &Path) -> Result<(), String> {
+        self.put_disc_in(image)
+    }
+
+    fn eject_disc(&mut self) -> Result<(), String> {
+        let disc = self.disc.take().ok_or("no disc is in the optical drive")?;
+        // By force: the tray opens whether or not the machine locked the
+        // disc in, as a paper clip in the drive's hole opens it.
+        if let Err(err) = self
+            .qmp()
+            .and_then(|qmp| qmp.execute("eject", &json!({ "device": DISC_DRIVE, "force": true })))
+        {
+            self.disc = Some(disc);
+            return Err(err);
+        }
+        self.disc_out = Some(disc);
+        Ok(())
+    }
+
+    fn reinsert_disc(&mut self) -> Result<(), String> {
+        let disc = self.disc_out.clone().ok_or("no disc was taken out to put back")?;
+        self.put_disc_in(&disc)?;
+        self.disc_out = None;
         Ok(())
     }
 
@@ -1253,6 +1335,23 @@ mod tests {
         qemu.remove_card().unwrap();
         assert!(!card.exists(), "only the card taken out last is kept");
         qemu.want_card_reader(false);
+        // An optical drive, on a boot that asks for one: a disc goes in,
+        // is ejected by force, and goes back in; its file is never
+        // written.
+        let disc = dir.write("disc.iso", "");
+        File::options().write(true).open(&disc).unwrap().set_len(1 << 20).unwrap();
+        assert!(qemu.insert_disc(&disc).unwrap_err().contains("no optical drive"));
+        qemu.want_disc_drive(true);
+        qemu.boot_fresh().unwrap();
+        assert!(qemu.eject_disc().unwrap_err().contains("no disc"));
+        assert!(qemu.reinsert_disc().unwrap_err().contains("no disc was taken out"));
+        qemu.insert_disc(&disc).unwrap();
+        assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
+        qemu.eject_disc().unwrap();
+        qemu.reinsert_disc().unwrap();
+        qemu.eject_disc().unwrap();
+        assert_eq!(fs::metadata(&disc).unwrap().len(), 1 << 20);
+        qemu.want_disc_drive(false);
 
         // The install stick, with a blank disk of the size asked for; the
         // stick's own file is never written.
@@ -1260,7 +1359,7 @@ mod tests {
         File::options().write(true).open(&install).unwrap().set_len(1 << 20).unwrap();
         qemu.boot_stick(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-3.qcow2").is_file());
+        assert!(dir.path().join("work/disk-4.qcow2").is_file());
         assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
         qemu.shut_off();

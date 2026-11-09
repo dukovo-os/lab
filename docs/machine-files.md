@@ -40,7 +40,8 @@ cord = "person"    # treat pulling the cord as a person's job here
 
 A control is a way the lab acts on a machine: `power`, `cord` (pulling
 the power cord), `serial`, `link` (the network cable), `usb` (a USB
-stick), `card` (a memory card in a card reader), `keys`, `mouse` (moving
+stick), `card` (a memory card in a card reader), `disc` (a disc in an
+optical drive), `keys`, `mouse` (moving
 the pointer and pressing its buttons), `screen`, `ssh`, `linux` (booting
 the machine's Linux twin, which performance tests measure against),
 `attack` (standing up an attacker on a private network of the machine's

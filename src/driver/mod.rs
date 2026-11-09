@@ -87,6 +87,27 @@ pub trait Driver: Send {
         Err("this machine's driver cannot put a card in its reader".into())
     }
 
+    /// Says whether the next [`Driver::boot_fresh`] gives the machine an
+    /// empty optical drive, which [`Driver::insert_disc`] puts discs in,
+    /// as [`Driver::want_card_reader`] says of a card reader.
+    fn want_disc_drive(&mut self, _yes: bool) {}
+
+    /// Puts a disc holding `image` in the optical drive.
+    fn insert_disc(&mut self, _image: &Path) -> Result<(), String> {
+        Err("this machine's driver cannot put a disc in its drive".into())
+    }
+
+    /// Takes the disc out of the optical drive, by force: whether or not
+    /// the machine let it go.
+    fn eject_disc(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot take a disc out of its drive".into())
+    }
+
+    /// Puts the disc taken out last back in the optical drive.
+    fn reinsert_disc(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot put a disc in its drive".into())
+    }
+
     /// Presses each key combination in turn.
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String>;
 
