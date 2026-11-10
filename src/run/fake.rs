@@ -39,6 +39,8 @@ struct FakeMachine {
     card_reader: bool,
     /// Whether the next boot gives the machine an optical drive.
     disc_drive: bool,
+    /// Whether the next boot gives the machine a floppy drive.
+    floppy_drive: bool,
 }
 
 /// The characters the fake console draws, in the test font.
@@ -224,6 +226,25 @@ impl Driver for FakeMachine {
 
     fn press_disc_button(&mut self) -> Result<(), String> {
         self.eject_disc()
+    }
+
+    fn want_floppy_drive(&mut self, yes: bool) {
+        self.floppy_drive = yes;
+    }
+
+    fn insert_floppy(&mut self, _floppy: &crate::suite::Floppy) -> Result<(), String> {
+        self.eject_floppy()
+    }
+
+    fn eject_floppy(&mut self) -> Result<(), String> {
+        if !self.floppy_drive {
+            return Err("this boot was not given a floppy drive".into());
+        }
+        Ok(())
+    }
+
+    fn reinsert_floppy(&mut self) -> Result<(), String> {
+        self.eject_floppy()
     }
 
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
@@ -412,6 +433,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         want_attacker: false,
         card_reader: false,
         disc_drive: false,
+        floppy_drive: false,
         attacker_on: false,
     }))
 }
@@ -906,6 +928,66 @@ fn disc_tests_boot_with_an_optical_drive_of_their_own() {
     assert_eq!(disc.steps[1].step, "put a disc holding disc.iso in the optical drive");
     assert_eq!(disc.steps[2].step, "take the disc out of the optical drive");
     assert_eq!(disc.steps[3].step, "put the disc back in the optical drive");
+    // Nor is its boot shared with the test after it.
+    let after = by_test("drivers/zz-after");
+    assert_eq!(after.steps[0].step, "boot afresh and wait until booted");
+    assert_eq!(ended.summary, Summary { passed: 3, failed: 0, skipped: 0, errors: 0 });
+}
+
+#[test]
+fn floppy_tests_boot_with_a_floppy_drive_of_their_own() {
+    let setting = setting_with(&[
+        (
+            "drivers/a-boot.toml",
+            "about = \"a boot to share\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+        ),
+        (
+            "drivers/floppy.toml",
+            "about = \"a floppy disk in and out\"\ntime = \"1m\"\n\
+             [[step]]\nfloppy = \"insert\"\nblank = \"1.44M\"\nprotected = true\n\
+             [[step]]\nfloppy = \"eject\"\n[[step]]\nfloppy = \"reinsert\"\n",
+        ),
+        // Sorts after `floppy` in the same category, so it runs next, and
+        // would fail had it been given the drive's boot.
+        (
+            "drivers/zz-after.toml",
+            "about = \"after the floppy boot\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+        ),
+    ]);
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: None,
+        with_person: false,
+        linux: None,
+        fonts: None,
+        stick: None,
+        dvd: None,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let by_test = |test: &str| results.results.iter().find(|r| r.test == test).unwrap().clone();
+
+    // The floppy test does not share the boot before it, which had no
+    // drive, and the fake driver refuses a disk on a boot with none.
+    let floppy = by_test("drivers/floppy");
+    assert_eq!(floppy.result, Outcome::Pass, "{:?}", floppy.reason);
+    assert_eq!(floppy.steps[0].step, "boot afresh and wait until booted");
+    assert_eq!(
+        floppy.steps[1].step,
+        "put a blank 1.44M floppy disk, write-protected, in the floppy drive"
+    );
+    assert_eq!(floppy.steps[2].step, "take the floppy disk out of the floppy drive");
+    assert_eq!(floppy.steps[3].step, "put the floppy disk back in the floppy drive");
     // Nor is its boot shared with the test after it.
     let after = by_test("drivers/zz-after");
     assert_eq!(after.steps[0].step, "boot afresh and wait until booted");

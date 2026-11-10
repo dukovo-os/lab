@@ -20,7 +20,7 @@ use crate::bench::Kit;
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
-use crate::suite::{Button, PowerAction, Stick};
+use crate::suite::{Button, Floppy, PowerAction, Stick};
 
 /// The machine under test's address on the private lab network an attack
 /// runs over. An `attack` step's `{target}` becomes this.
@@ -121,6 +121,29 @@ pub trait Driver: Send {
     /// the machine did not lock opens its tray, and the disc is taken out.
     fn press_disc_button(&mut self) -> Result<(), String> {
         Err("this machine's driver cannot press its drive's eject button".into())
+    }
+
+    /// Says whether the next [`Driver::boot_fresh`] gives the machine an
+    /// empty floppy drive, which [`Driver::insert_floppy`] puts disks in,
+    /// as [`Driver::want_card_reader`] says of a card reader.
+    fn want_floppy_drive(&mut self, _yes: bool) {}
+
+    /// Puts a floppy disk in the floppy drive: a copy of an image, or a
+    /// blank one, write-protected or not.
+    fn insert_floppy(&mut self, _floppy: &Floppy) -> Result<(), String> {
+        Err("this machine's driver cannot put a floppy disk in its drive".into())
+    }
+
+    /// Takes the floppy disk out of the floppy drive, by force: whether or
+    /// not the machine let it go.
+    fn eject_floppy(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot take a floppy disk out of its drive".into())
+    }
+
+    /// Puts the floppy disk taken out last back in the floppy drive,
+    /// holding what the machine wrote on it.
+    fn reinsert_floppy(&mut self) -> Result<(), String> {
+        Err("this machine's driver cannot put a floppy disk in its drive".into())
     }
 
     /// Presses each key combination in turn.

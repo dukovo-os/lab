@@ -202,6 +202,14 @@ pub enum Step {
     /// machine locked in keeps it and asks the machine to let it go; one
     /// it did not opens, and the disc is taken out.
     PressDiscButton,
+    /// Puts a floppy disk in the machine's floppy drive.
+    InsertFloppy(Floppy),
+    /// Takes the floppy disk out of the floppy drive, whether or not the
+    /// machine let it go.
+    EjectFloppy,
+    /// Puts the floppy disk taken out last back in, holding what the
+    /// machine wrote on it, its write-protect tab as it was.
+    ReinsertFloppy,
     /// Presses keys, each a combination such as `ctrl-alt-delete`.
     Keys(Vec<String>),
     /// Keeps a screenshot under this name.
@@ -297,6 +305,21 @@ pub enum Stick {
     Blank(u64),
 }
 
+/// The floppy disk a `floppy = "insert"` step puts in a floppy drive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Floppy {
+    /// What it holds: a copy of an image, or a blank disk of 720 KB or
+    /// 1.44 MB, all zeros, as a disk never formatted reads.
+    pub holds: Stick,
+    /// Whether its write-protect tab is open, so the drive writes nothing
+    /// to it.
+    pub protected: bool,
+}
+
+/// The floppy disks a 3.5-inch drive takes, as `blank` names them, and
+/// their sizes: a disk's image is exactly one of these.
+pub const FLOPPY_SIZES: [(&str, u64); 2] = [("720K", 737_280), ("1.44M", 1_474_560)];
+
 /// A command a `run` step runs, and what passes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command {
@@ -344,6 +367,9 @@ impl Step {
             Step::InsertCard(_) | Step::RemoveCard | Step::ReinsertCard => Some(Control::Card),
             Step::InsertDisc(_) | Step::EjectDisc | Step::ReinsertDisc | Step::PressDiscButton => {
                 Some(Control::Disc)
+            }
+            Step::InsertFloppy(_) | Step::EjectFloppy | Step::ReinsertFloppy => {
+                Some(Control::Floppy)
             }
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
@@ -394,6 +420,25 @@ impl Step {
             Step::EjectDisc => "take the disc out of the optical drive".into(),
             Step::ReinsertDisc => "put the disc back in the optical drive".into(),
             Step::PressDiscButton => "press the optical drive's eject button".into(),
+            Step::InsertFloppy(floppy) => {
+                let disk = match &floppy.holds {
+                    Stick::Image(image) => {
+                        let name = image.file_name().unwrap_or_default().to_string_lossy();
+                        format!("a floppy disk holding {name}")
+                    }
+                    Stick::Blank(bytes) => {
+                        let size = FLOPPY_SIZES
+                            .iter()
+                            .find(|(_, size)| size == bytes)
+                            .map_or("odd", |(name, _)| name);
+                        format!("a blank {size} floppy disk")
+                    }
+                };
+                let tab = if floppy.protected { ", write-protected," } else { "" };
+                format!("put {disk}{tab} in the floppy drive")
+            }
+            Step::EjectFloppy => "take the floppy disk out of the floppy drive".into(),
+            Step::ReinsertFloppy => "put the floppy disk back in the floppy drive".into(),
             Step::Keys(keys) => format!("press {}", keys.join(", ")),
             Step::Type(text) => format!("type \"{}\"", text.escape_debug()),
             Step::Point { x, y } => format!("point at ({x}, {y}) on the screen"),
@@ -594,8 +639,10 @@ struct StepFile {
     usb: Option<UsbAction>,
     card: Option<CardAction>,
     disc: Option<DiscAction>,
+    floppy: Option<FloppyAction>,
     image: Option<String>,
     blank: Option<String>,
+    protected: Option<bool>,
     root: Option<bool>,
     keys: Option<Vec<String>>,
     screenshot: Option<String>,
@@ -645,6 +692,14 @@ enum DiscAction {
     Eject,
     Reinsert,
     Button,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum FloppyAction {
+    Insert,
+    Eject,
+    Reinsert,
 }
 
 /// `expect = "text"` or `expect = ["one", "two"]`.
@@ -757,8 +812,9 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             parse_step(step, folder).map_err(|err| bad(format!("step {}: {err}", index + 1)))?;
         steps.push(step);
     }
-    // A card or disc is put back only once one was taken out.
-    let (mut card_out, mut disc_out) = (false, false);
+    // A card, disc or floppy disk is put back only once one was taken
+    // out.
+    let (mut card_out, mut disc_out, mut floppy_out) = (false, false, false);
     for (index, step) in steps.iter().enumerate() {
         match step {
             Step::RemoveCard => card_out = true,
@@ -779,6 +835,15 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
                 )));
             }
             Step::ReinsertDisc => disc_out = false,
+            Step::EjectFloppy => floppy_out = true,
+            Step::InsertFloppy(_) => floppy_out = false,
+            Step::ReinsertFloppy if !floppy_out => {
+                return Err(bad(format!(
+                    "step {}: floppy = \"reinsert\" puts back a floppy disk the test took out, and none is out",
+                    index + 1
+                )));
+            }
+            Step::ReinsertFloppy => floppy_out = false,
             _ => {}
         }
     }
@@ -814,6 +879,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("usb", step.usb.is_some()),
         ("card", step.card.is_some()),
         ("disc", step.disc.is_some()),
+        ("floppy", step.floppy.is_some()),
         ("keys", step.keys.is_some()),
         ("screenshot", step.screenshot.is_some()),
         ("wait", step.wait.is_some()),
@@ -830,7 +896,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, attack, host, serial, power, link, usb, card, disc, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, host, serial, power, link, usb, card, disc, floppy, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -882,14 +948,15 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     }
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
-    // A stick's, a card's or a disc's: what it holds. A disc is never
-    // blank: a blank one holds nothing to read.
-    if step.image.is_some() && !matches!(given[0], "usb" | "card" | "disc") {
-        return Err("image goes only with usb, card or disc".into());
+    // A stick's, a card's, a disc's or a floppy disk's: what it holds. A
+    // disc is never blank: a blank one holds nothing to read.
+    if step.image.is_some() && !matches!(given[0], "usb" | "card" | "disc" | "floppy") {
+        return Err("image goes only with usb, card, disc or floppy".into());
     }
-    if step.blank.is_some() && !matches!(given[0], "usb" | "card") {
-        return Err("blank goes only with usb or card".into());
+    if step.blank.is_some() && !matches!(given[0], "usb" | "card" | "floppy") {
+        return Err("blank goes only with usb, card or floppy".into());
     }
+    only_with("protected", step.protected.is_some(), "floppy")?;
 
     let command = |text: String, step: &StepFile| Command {
         command: text,
@@ -996,6 +1063,21 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
                     Stick::Blank(_) => Err("a disc is never blank".into()),
                 }
             }
+        };
+    }
+    if let Some(action) = step.floppy {
+        return match action {
+            FloppyAction::Eject | FloppyAction::Reinsert
+                if step.image.is_some() || step.blank.is_some() || step.protected.is_some() =>
+            {
+                Err("only floppy = \"insert\" takes an image, blank or protected".into())
+            }
+            FloppyAction::Eject => Ok(Step::EjectFloppy),
+            FloppyAction::Reinsert => Ok(Step::ReinsertFloppy),
+            FloppyAction::Insert => Ok(Step::InsertFloppy(Floppy {
+                holds: parse_floppy(step.image, step.blank, folder)?,
+                protected: step.protected.unwrap_or(false),
+            })),
         };
     }
     if let Some(keys) = step.keys {
@@ -1158,6 +1240,45 @@ fn parse_medium(
                 return Err(format!("image {} does not exist", path.display()));
             }
             Ok(Stick::Image(path))
+        }
+    }
+}
+
+/// What a floppy disk that `floppy = "insert"` puts in holds: a copy of
+/// `image`, which is the size of a disk, or a blank disk of a size
+/// [`FLOPPY_SIZES`] names.
+fn parse_floppy(
+    image: Option<String>,
+    blank: Option<String>,
+    folder: &Path,
+) -> Result<Stick, String> {
+    const SIZES: &str = "\"720K\" or \"1.44M\"";
+    match (image, blank) {
+        (None, None) => Err(format!(
+            "floppy = \"insert\" needs image, a disk image beside the test, or blank, {SIZES}"
+        )),
+        (Some(_), Some(_)) => Err("a floppy disk is an image or blank, not both".into()),
+        (None, Some(size)) => FLOPPY_SIZES
+            .iter()
+            .find(|(name, _)| *name == size)
+            .map(|&(_, bytes)| Stick::Blank(bytes))
+            .ok_or_else(|| format!("blank = \"{size}\": a floppy disk is {SIZES}")),
+        (image, None) => {
+            let disk = parse_medium("floppy = \"insert\"", "floppy disk", image, None, folder)?;
+            if let Stick::Image(path) = &disk {
+                // A drive reads a disk of another size wrongly, or not at
+                // all, which would fail the test for the wrong reason.
+                let bytes = fs::metadata(path)
+                    .map_err(|err| format!("image {}: {err}", path.display()))?
+                    .len();
+                if !FLOPPY_SIZES.iter().any(|&(_, size)| size == bytes) {
+                    return Err(format!(
+                        "image {} is {bytes} bytes, and a floppy disk's image is 737280 (720 KB) or 1474560 (1.44 MB)",
+                        path.display()
+                    ));
+                }
+            }
+            Ok(disk)
         }
     }
 }
@@ -1590,16 +1711,78 @@ expect = "1 received"
         assert!(tests[0].controls().contains(&Control::Disc));
         for (step, complaint) in [
             ("disc = \"insert\"", "disc = \"insert\" needs image"),
-            ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb or card"),
+            ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb, card or floppy"),
             ("disc = \"insert\"\nimage = \"none.iso\"", "does not exist"),
             ("disc = \"eject\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
             ("disc = \"button\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
             ("disc = \"reinsert\"", "none is out"),
             ("disc = \"open\"", "disc"),
-            ("run = \"ls\"\nimage = \"disc.iso\"", "image goes only with usb, card or disc"),
+            (
+                "run = \"ls\"\nimage = \"disc.iso\"",
+                "image goes only with usb, card, disc or floppy",
+            ),
         ] {
             dir.write(
                 "features/disc.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
+            assert!(why.contains(complaint), "{step}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_floppy_disk_is_put_in_and_taken_out_of_the_floppy_drive() {
+        let dir = TempDir::new("suite-floppy");
+        let image = dir.write("features/disk.img", "");
+        fs::File::options().write(true).open(&image).unwrap().set_len(1_474_560).unwrap();
+        dir.write("features/odd.img", "a disk of no size a drive takes");
+        dir.write(
+            "features/floppy.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nfloppy = \"insert\"\nimage = \"disk.img\"\n\
+             [[step]]\nfloppy = \"eject\"\n[[step]]\nfloppy = \"reinsert\"\n[[step]]\nfloppy = \"eject\"\n\
+             [[step]]\nfloppy = \"insert\"\nblank = \"720K\"\nprotected = true\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        let disk = |holds, protected| Step::InsertFloppy(Floppy { holds, protected });
+        assert_eq!(tests[0].steps[0], disk(Stick::Image(image), false));
+        assert_eq!(
+            tests[0].steps[0].describe(),
+            "put a floppy disk holding disk.img in the floppy drive"
+        );
+        assert_eq!(tests[0].steps[1], Step::EjectFloppy);
+        assert_eq!(tests[0].steps[1].describe(), "take the floppy disk out of the floppy drive");
+        assert_eq!(tests[0].steps[2], Step::ReinsertFloppy);
+        assert_eq!(tests[0].steps[2].describe(), "put the floppy disk back in the floppy drive");
+        assert_eq!(tests[0].steps[4], disk(Stick::Blank(737_280), true));
+        assert_eq!(
+            tests[0].steps[4].describe(),
+            "put a blank 720K floppy disk, write-protected, in the floppy drive"
+        );
+        assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Floppy)));
+        assert!(tests[0].controls().contains(&Control::Floppy));
+        for (step, complaint) in [
+            ("floppy = \"insert\"", "floppy = \"insert\" needs image"),
+            ("floppy = \"insert\"\nblank = \"64M\"", "a floppy disk is \"720K\" or \"1.44M\""),
+            ("floppy = \"insert\"\nimage = \"odd.img\"", "is 31 bytes, and a floppy disk's image"),
+            ("floppy = \"insert\"\nimage = \"none.img\"", "does not exist"),
+            (
+                "floppy = \"insert\"\nimage = \"disk.img\"\nblank = \"720K\"",
+                "an image or blank, not both",
+            ),
+            (
+                "floppy = \"eject\"\nprotected = true",
+                "only floppy = \"insert\" takes an image, blank or protected",
+            ),
+            ("floppy = \"reinsert\"", "none is out"),
+            ("floppy = \"open\"", "floppy"),
+            (
+                "card = \"insert\"\nblank = \"8M\"\nprotected = true",
+                "protected goes only with floppy",
+            ),
+        ] {
+            dir.write(
+                "features/floppy.toml",
                 &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
             );
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
