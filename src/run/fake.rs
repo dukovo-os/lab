@@ -35,8 +35,8 @@ struct FakeMachine {
     want_attacker: bool,
     /// Whether the attacker is up on that network.
     attacker_on: bool,
-    /// Whether the next boot gives the machine a card reader.
-    card_reader: bool,
+    /// The card reader the next boot gives the machine, if any.
+    card_reader: Option<crate::suite::Reader>,
     /// Whether the next boot gives the machine an optical drive.
     disc_drive: bool,
     /// Whether the next boot gives the machine a floppy drive.
@@ -183,19 +183,19 @@ impl Driver for FakeMachine {
         Ok(())
     }
 
-    fn want_card_reader(&mut self, yes: bool) {
-        self.card_reader = yes;
+    fn want_card_reader(&mut self, reader: Option<crate::suite::Reader>) {
+        self.card_reader = reader;
     }
 
     fn insert_card(&mut self, _card: &crate::suite::Stick) -> Result<(), String> {
-        if !self.card_reader {
+        if self.card_reader.is_none() {
             return Err("this boot was not given a card reader".into());
         }
         Ok(())
     }
 
     fn remove_card(&mut self) -> Result<(), String> {
-        if !self.card_reader {
+        if self.card_reader.is_none() {
             return Err("this boot was not given a card reader".into());
         }
         Ok(())
@@ -431,7 +431,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         typing: String::new(),
         pointer: (0, 0),
         want_attacker: false,
-        card_reader: false,
+        card_reader: None,
         disc_drive: false,
         floppy_drive: false,
         attacker_on: false,
@@ -832,7 +832,13 @@ fn card_tests_boot_with_a_card_reader_of_their_own() {
              [[step]]\ncard = \"insert\"\nblank = \"16M\"\n[[step]]\ncard = \"remove\"\n\
              [[step]]\ncard = \"reinsert\"\n",
         ),
-        // Sorts after `card` in the same category, so it runs next, and
+        // Sorts after `card`: its boot has an SD card reader instead.
+        (
+            "drivers/sd.toml",
+            "about = \"an SD card in and out\"\ntime = \"1m\"\n\
+             [[step]]\nsd = \"insert\"\nblank = \"16M\"\n[[step]]\nsd = \"remove\"\n",
+        ),
+        // Sorts after `sd` in the same category, so it runs next, and
         // would fail had it been given the reader's boot.
         (
             "drivers/zz-after.toml",
@@ -870,10 +876,16 @@ fn card_tests_boot_with_a_card_reader_of_their_own() {
     assert_eq!(card.steps[1].step, "put a blank memory card of 16M in the card reader");
     assert_eq!(card.steps[2].step, "take the memory card out of the card reader");
     assert_eq!(card.steps[3].step, "put the memory card back in the card reader");
+    // The SD card test boots afresh too, for its own reader.
+    let sd = by_test("drivers/sd");
+    assert_eq!(sd.result, Outcome::Pass, "{:?}", sd.reason);
+    assert_eq!(sd.steps[0].step, "boot afresh and wait until booted");
+    assert_eq!(sd.steps[1].step, "put a blank memory card of 16M in the SD card slot");
+    assert_eq!(sd.steps[2].step, "take the memory card out of the SD card slot");
     // Nor is its boot shared with the test after it.
     let after = by_test("drivers/zz-after");
     assert_eq!(after.steps[0].step, "boot afresh and wait until booted");
-    assert_eq!(ended.summary, Summary { passed: 3, failed: 0, skipped: 0, errors: 0 });
+    assert_eq!(ended.summary, Summary { passed: 4, failed: 0, skipped: 0, errors: 0 });
 }
 
 #[test]

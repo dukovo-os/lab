@@ -81,6 +81,7 @@ Each step has exactly one action key, and only the options that go with it.
 | `card = "insert"` | `image` or `blank` | Puts a memory card in the card reader: a copy of `image`, or with `blank = "64M"` an empty card of that size, as `usb = "plug"` takes them. The reader stays plugged in; only the card comes and goes. See [Card reader tests](#card-reader-tests). | card |
 | `card = "remove"` | | Takes the card out of the reader, whether or not the machine let go of it. | card |
 | `card = "reinsert"` | | Puts the card taken out last back in, holding what the machine wrote on it. | card |
+| `sd = "insert"`, `"remove"`, `"reinsert"` | as `card` | As `card`, in the machine's own SD card slot, on PCI as a laptop's is, instead of a USB card reader. See [SD card slot tests](#sd-card-slot-tests). | sd |
 | `disc = "insert"` | `image` | Puts a disc in the optical drive: `image`, a disc image (an ISO) in the test's folder, which the machine only reads. See [Optical drive tests](#optical-drive-tests). | disc |
 | `disc = "eject"` | | Opens the drive's tray and takes the disc out, whether or not the machine let go of it. | disc |
 | `disc = "reinsert"` | | Puts the disc taken out last back in. | disc |
@@ -402,6 +403,36 @@ expect = "LABCARD"
   switch.
 
 Card reader tests live under `lab/tests/storage/`.
+
+## SD card slot tests
+
+A test with an `sd` step puts its cards in the machine's own SD card
+reader, on PCI as a laptop's is, rather than a USB one: the slot is a
+drive whose card comes and goes while the slot stays (ADR 0437 in
+Dukovo's repository), and its steps are the card steps', `sd =
+"insert"`, `sd = "remove"` and `sd = "reinsert"`, which take what they
+take.
+
+```toml
+[[step]]
+sd = "insert"
+blank = "64M"
+[[step]]
+wait = "5s"
+[[step]]
+run = "cat /kernel/block/mmcblk0/size"
+expect = "131072"
+```
+
+- A test puts its cards in one reader: card steps or sd steps, not
+  both.
+- On QEMU the slot is an `sd-card` with no medium in an `sdhci-pci`
+  reader, there only on a boot for a test with sd steps, as the USB card
+  reader is for card steps. QEMU's SD cards are a power of two in size,
+  so a card of another size is padded to the next.
+- A machine whose own reader takes no SD card, or has none, sets `sd =
+  "none"`, and its SD card slot tests are skipped; on one that has a
+  slot a person puts the card in, as with `card`.
 
 ## Optical drive tests
 

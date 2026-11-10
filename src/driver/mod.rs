@@ -20,7 +20,7 @@ use crate::bench::Kit;
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
-use crate::suite::{Button, Floppy, PowerAction, Stick};
+use crate::suite::{Button, Floppy, PowerAction, Reader, Stick};
 
 /// The machine under test's address on the private lab network an attack
 /// runs over. An `attack` step's `{target}` becomes this.
@@ -70,12 +70,13 @@ pub trait Driver: Send {
     fn unplug_usb(&mut self) -> Result<(), String>;
 
     /// Says whether the next [`Driver::boot_fresh`] gives the machine an
-    /// empty card reader, which [`Driver::insert_card`] puts cards in.
-    /// The runner calls it before booting a test with card steps, and with
-    /// `false` before one without, so that the reader, an empty drive, is
-    /// there only when it is wanted (it would show up in a disk test). A
-    /// driver whose machines have their own reader ignores it.
-    fn want_card_reader(&mut self, _yes: bool) {}
+    /// empty card reader, and which kind, which [`Driver::insert_card`]
+    /// puts cards in. The runner calls it before booting a test with card
+    /// or sd steps, and with `None` before one without, so that the
+    /// reader, an empty drive, is there only when it is wanted (it would
+    /// show up in a disk test). A driver whose machines have their own
+    /// reader ignores it.
+    fn want_card_reader(&mut self, _reader: Option<Reader>) {}
 
     /// Puts a memory card in the card reader: a copy of an image, or a
     /// blank one.
