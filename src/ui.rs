@@ -90,6 +90,9 @@ struct Page {
     fonts: Option<PathBuf>,
     stick: Option<PathBuf>,
     dvd: Option<PathBuf>,
+    /// Dukovo's ob, which holds the music CDs of runs from the page in
+    /// QEMU, when given.
+    ob: Option<PathBuf>,
     /// When the image was made, as the page opened: a later one is a new
     /// build, which `build` no longer names.
     image_made: Option<SystemTime>,
@@ -157,6 +160,13 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         Some(dvd) => Some(absolute(dvd.clone())?),
         None => None,
     };
+    let ob = match &arguments.ob {
+        Some(ob) if !ob.is_file() => {
+            return Err(Error::Usage(format!("Dukovo's ob {} does not exist", ob.display())));
+        }
+        Some(ob) => Some(absolute(ob.clone())?),
+        None => None,
+    };
     let port = arguments.port.unwrap_or(DEFAULT_PORT);
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|err| {
         Error::Usage(format!(
@@ -179,6 +189,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         fonts,
         stick,
         dvd,
+        ob,
     });
     let address = format!("http://127.0.0.1:{port}/?key={}", page.key);
     if arguments.json {
@@ -393,6 +404,9 @@ impl Page {
         }
         if let Some(dvd) = &self.dvd {
             args.extend(["--dvd".into(), dvd.display().to_string()]);
+        }
+        if let Some(ob) = &self.ob {
+            args.extend(["--ob".into(), ob.display().to_string()]);
         }
         if let Some(build) = &self.build {
             args.extend(["--build".into(), build.clone()]);
@@ -647,6 +661,7 @@ mod tests {
             fonts: None,
             stick: None,
             dvd: None,
+            ob: None,
             image_made: None,
         }
     }

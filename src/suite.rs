@@ -465,7 +465,13 @@ impl Step {
             }
             Step::InsertDisc(image) => {
                 let name = image.file_name().unwrap_or_default().to_string_lossy();
-                format!("put a disc holding {name} in the optical drive")
+                // A music CD's cue sheet is burned to a CD-R, CD-Text and
+                // all, once.
+                if image.extension().is_some_and(|e| e.eq_ignore_ascii_case("cue")) {
+                    format!("put the music CD burned from {name} in the optical drive")
+                } else {
+                    format!("put a disc holding {name} in the optical drive")
+                }
             }
             Step::EjectDisc => "take the disc out of the optical drive".into(),
             Step::ReinsertDisc => "put the disc back in the optical drive".into(),
@@ -1852,6 +1858,11 @@ expect = "1 received"
         assert_eq!(tests[0].steps[2], Step::ReinsertDisc);
         assert_eq!(tests[0].steps[2].describe(), "put the disc back in the optical drive");
         assert_eq!(tests[0].steps[3], Step::PressDiscButton);
+        // A music CD's cue sheet is burned once for a real drive.
+        assert_eq!(
+            Step::InsertDisc(dir.path().join("features/music.cue")).describe(),
+            "put the music CD burned from music.cue in the optical drive"
+        );
         assert_eq!(tests[0].steps[3].describe(), "press the optical drive's eject button");
         assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Disc)));
         assert!(tests[0].controls().contains(&Control::Disc));

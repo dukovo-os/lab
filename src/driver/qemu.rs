@@ -29,6 +29,14 @@
 //! `send-key`, the pointer (a USB tablet) to `input-send-event`, the
 //! screen to `screendump`.
 //!
+//! A music CD (a disc whose file is a cue sheet) goes in a drive of its
+//! own beside the optical drive, as QEMU's drives hold no music CD: an
+//! emulated USB CD drive that Dukovo's `ob disc-drive` serves over
+//! usbredir to a `usb-redir` device on the xhci controller, which the
+//! driver tells to put the disc in, take it out or press its button, a
+//! line on its standard input each (Dukovo's ADR 0447). It is there on a
+//! boot with an optical drive when the run was given `--ob`.
+//!
 //! A test that asks for a CompactFlash card has its boot give the machine
 //! a blank one: an `ide-cf` on a `piix3-ide` controller of its own, as
 //! the q35 chipset has no parallel IDE. A card stays in for the boot, as
@@ -42,10 +50,10 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -72,6 +80,9 @@ const CARD_DRIVE: &str = "card-reader";
 
 /// The optical drive's drive, which a disc goes in and comes out of.
 const DISC_DRIVE: &str = "optical-drive";
+/// The character device of the drive of music CDs, which `ob disc-drive`
+/// connects to.
+const MUSIC_DRIVE: &str = "music-drive";
 
 /// The IDE controller a CompactFlash card is on, and the card's drive.
 const CF_ADAPTER: &str = "cf-adapter";
@@ -187,10 +198,83 @@ struct Attacker {
     ssh_port: u16,
 }
 
-/// A running QEMU and its QMP connection.
+/// A running QEMU and its QMP connection, and the `ob disc-drive` that
+/// serves its drive of music CDs, if it has one.
 struct Running {
     child: Child,
     qmp: Qmp,
+    music: Option<MusicDrive>,
+}
+
+/// An `ob disc-drive`: an emulated USB CD drive, plugged into a machine
+/// through its socket, told what to do a line at a time.
+struct MusicDrive {
+    child: Child,
+    input: Option<ChildStdin>,
+    /// What it answers: `locked yes` or `locked no`, to `locked`.
+    output: BufReader<ChildStdout>,
+}
+
+impl MusicDrive {
+    /// Starts `ob disc-drive` on `socket`, its messages to `log`.
+    fn start(ob: &Path, socket: &Path, log: File) -> Result<MusicDrive, String> {
+        let mut child = Command::new(ob)
+            .arg("disc-drive")
+            .arg(socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(log)
+            .spawn()
+            .map_err(|err| format!("starting {} disc-drive: {err}", ob.display()))?;
+        let input = child.stdin.take();
+        let output = BufReader::new(child.stdout.take().ok_or("ob disc-drive has no output")?);
+        Ok(MusicDrive { child, input, output })
+    }
+
+    /// Asks `line` of the drive.
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        let input = self.input.as_mut().ok_or("the drive of music CDs was unplugged")?;
+        writeln!(input, "{line}")
+            .and_then(|()| input.flush())
+            .map_err(|err| format!("telling the drive of music CDs to {line}: {err}"))
+    }
+
+    /// Whether the machine locked the disc in.
+    fn locked(&mut self) -> Result<bool, String> {
+        self.say("locked")?;
+        let mut answer = String::new();
+        self.output
+            .read_line(&mut answer)
+            .map_err(|err| format!("reading the drive of music CDs: {err}"))?;
+        match answer.trim() {
+            "locked yes" => Ok(true),
+            "locked no" => Ok(false),
+            other => Err(format!("the drive of music CDs answered {other:?} to locked")),
+        }
+    }
+}
+
+impl Drop for MusicDrive {
+    /// Unplugs the drive: the end of its input ends it, or else it is
+    /// killed a second later.
+    fn drop(&mut self) {
+        self.input = None;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Whether the disc in `image` is a music CD: a cue sheet, which only the
+/// drive of music CDs takes.
+fn is_music(image: &Path) -> bool {
+    image.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
 }
 
 impl Qemu {
@@ -267,6 +351,23 @@ impl Qemu {
 
     fn qmp_socket(&self) -> PathBuf {
         self.setup.sockets.join("qmp.sock")
+    }
+
+    /// The socket the drive of music CDs plugs in through.
+    fn music_socket(&self) -> PathBuf {
+        self.setup.sockets.join("music.sock")
+    }
+
+    /// The drive of music CDs, if this boot has one running.
+    fn music_drive(&mut self) -> Result<&mut MusicDrive, String> {
+        if !self.is_on() {
+            return Err("the machine is off".into());
+        }
+        let running = self.running.as_mut().expect("is_on said so");
+        running.music.as_mut().ok_or_else(|| {
+            "this boot has no drive for music CDs: the run needs Dukovo's ob, which `ob lab` gives with --ob"
+                .to_string()
+        })
     }
 
     /// Runs `qemu-img create -q` with `arguments`, which make `what`.
@@ -406,6 +507,17 @@ impl Qemu {
             args.push("-device".into());
             let first = if self.boot_disc.is_some() { ",bootindex=0" } else { "" };
             args.push(format!("ide-cd,drive={DISC_DRIVE},bus=ide.1,id=dvd-drive{first}"));
+            // The drive of music CDs, which `ob disc-drive` serves once
+            // QEMU listens on its socket.
+            if self.setup.ob.is_some() {
+                args.push("-chardev".into());
+                args.push(format!(
+                    "socket,id={MUSIC_DRIVE},path={},server=on,wait=off",
+                    option_value(&self.music_socket())
+                ));
+                args.push("-device".into());
+                args.push(format!("usb-redir,chardev={MUSIC_DRIVE},bus=xhci.0,id=music-cd-drive"));
+            }
         }
         // A floppy drive, empty: a 3.5-inch 1.44 MB one, which reads 720
         // KB disks too, as drive 0 of an ISA floppy disk controller, which
@@ -478,7 +590,25 @@ impl Qemu {
                 return Err(format!("{err}; QEMU's messages are in {}", self.qemu_log().display()));
             }
         };
-        self.running = Some(Running { child, qmp });
+        let music = match (&self.setup.ob, self.want_disc_drive) {
+            (Some(ob), true) => {
+                let started = OpenOptions::new()
+                    .append(true)
+                    .open(self.qemu_log())
+                    .map_err(|err| format!("opening {}: {err}", self.qemu_log().display()))
+                    .and_then(|log| MusicDrive::start(ob, &self.music_socket(), log));
+                match started {
+                    Ok(drive) => Some(drive),
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(err);
+                    }
+                }
+            }
+            _ => None,
+        };
+        self.running = Some(Running { child, qmp, music });
         // A stick plugged in while it ran is gone with the old QEMU; the
         // install stick, given on its command line, is still in. So is a
         // card, and the new reader is empty: a card in the old one counts
@@ -767,6 +897,13 @@ impl Qemu {
                 disc.display()
             ));
         }
+        if is_music(image) {
+            let image =
+                std::path::absolute(image).map_err(|err| format!("{}: {err}", image.display()))?;
+            self.music_drive()?.say(&format!("insert {}", image.display()))?;
+            self.disc = Some(image);
+            return Ok(());
+        }
         self.qmp()?.execute(
             "blockdev-change-medium",
             &json!({
@@ -1052,6 +1189,16 @@ impl Driver for Qemu {
 
     fn eject_disc(&mut self) -> Result<(), String> {
         let disc = self.disc.take().ok_or("no disc is in the optical drive")?;
+        // By force here too: the drive lets go of a disc the machine
+        // locked in.
+        if is_music(&disc) {
+            if let Err(err) = self.music_drive().and_then(|drive| drive.say("take-out")) {
+                self.disc = Some(disc);
+                return Err(err);
+            }
+            self.disc_out = Some(disc);
+            return Ok(());
+        }
         // By force: the tray opens whether or not the machine locked the
         // disc in, as a paper clip in the drive's hole opens it.
         if let Err(err) = self
@@ -1075,8 +1222,19 @@ impl Driver for Qemu {
     }
 
     fn press_disc_button(&mut self) -> Result<(), String> {
-        if self.disc.is_none() {
+        let Some(disc) = &self.disc else {
             return Err("no disc is in the optical drive".into());
+        };
+        // A locked music CD stays in, and its drive asks the machine to let
+        // it go; one not locked comes out.
+        if is_music(disc) {
+            let drive = self.music_drive()?;
+            let locked = drive.locked()?;
+            drive.say("button")?;
+            if !locked {
+                self.disc_out = self.disc.take();
+            }
+            return Ok(());
         }
         // Not by force: QEMU refuses to open a drive the machine locked,
         // and has the drive report an eject request (GET EVENT STATUS
@@ -1285,7 +1443,7 @@ impl Driver for Qemu {
                 ));
             }
         };
-        self.attacker = Some(Attacker { running: Running { child, qmp }, ssh_port });
+        self.attacker = Some(Attacker { running: Running { child, qmp, music: None }, ssh_port });
         // Wait until the attacker answers SSH, so commands can run on it.
         let target = self.attacker_target(ssh_port, key);
         loop {
@@ -1485,6 +1643,7 @@ mod tests {
             work: dir.path().join("work"),
             sockets: dir.path().join("s"),
             key: None,
+            ob: None,
             stop: crate::stop::Stop::default(),
         };
         Qemu::new(settings, setup).unwrap()
@@ -1619,6 +1778,38 @@ mod tests {
         qemu.reinsert_disc().unwrap();
         qemu.eject_disc().unwrap();
         assert_eq!(fs::metadata(&disc).unwrap().len(), 1 << 20);
+        // A music CD, on a boot whose run has Dukovo's ob, goes in the drive
+        // `ob disc-drive` serves: here a stand-in that keeps what it is
+        // told and says the disc is not locked.
+        let music = dir.write("music.cue", "FILE \"music.bin\" BINARY\n");
+        assert!(qemu.insert_disc(&music).unwrap_err().contains("needs Dukovo's ob"));
+        let told = dir.path().join("told.txt");
+        let ob = dir.write(
+            "ob",
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = disc-drive ] || exit 2\n\
+                 while read -r line; do echo \"$line\" >> {}; \
+                 [ \"$line\" = locked ] && echo 'locked no'; done\n",
+                told.display()
+            ),
+        );
+        fs::set_permissions(&ob, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        qemu.setup.ob = Some(ob);
+        qemu.boot_fresh().unwrap();
+        assert!(qemu.is_on(), "QEMU takes the drive's usb-redir device");
+        qemu.insert_disc(&music).unwrap();
+        qemu.press_disc_button().unwrap();
+        qemu.reinsert_disc().unwrap();
+        qemu.eject_disc().unwrap();
+        assert!(qemu.eject_disc().unwrap_err().contains("no disc"));
+        qemu.shut_off();
+        let told = fs::read_to_string(&told).unwrap();
+        let inserted = format!("insert {}", music.display());
+        assert_eq!(
+            told.lines().collect::<Vec<_>>(),
+            [inserted.as_str(), "locked", "button", inserted.as_str(), "take-out"]
+        );
+        qemu.setup.ob = None;
         qemu.want_disc_drive(false);
         // A floppy drive, on a boot that asks for one: disks go in, a
         // write-protected one read-only, and come out; the one taken out
@@ -1695,7 +1886,7 @@ mod tests {
         File::options().write(true).open(&install).unwrap().set_len(1 << 20).unwrap();
         qemu.boot_stick(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-8.qcow2").is_file());
+        assert!(dir.path().join("work/disk-9.qcow2").is_file());
         assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
 
@@ -1706,7 +1897,7 @@ mod tests {
         qemu.want_disc_drive(true);
         qemu.boot_dvd(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-9.qcow2").is_file());
+        assert!(dir.path().join("work/disk-10.qcow2").is_file());
         assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
         qemu.power(PowerAction::Cut, soon()).unwrap();
         qemu.power(PowerAction::On, soon()).unwrap();
