@@ -42,7 +42,8 @@ A control is a way the lab acts on a machine: `power`, `cord` (pulling
 the power cord), `serial`, `link` (the network cable), `usb` (a USB
 stick), `card` (a memory card in a card reader), `sd` (a memory card in
 the machine's own SD card slot), `disc` (a disc in an
-optical drive), `floppy` (a floppy disk in a floppy drive), `cf` (a
+optical drive), `burner` (a blank disc in an optical drive that writes
+them, for a test to burn), `floppy` (a floppy disk in a floppy drive), `cf` (a
 CompactFlash card in an IDE adapter, which tests format), `keys`,
 `mouse` (moving the pointer and pressing its buttons), `screen`, `ssh`,
 `linux` (booting the machine's Linux twin, which performance tests

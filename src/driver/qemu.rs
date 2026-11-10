@@ -35,7 +35,9 @@
 //! usbredir to a `usb-redir` device on the xhci controller, which the
 //! driver tells to put the disc in, take it out or press its button, a
 //! line on its standard input each (Dukovo's ADR 0447). It is there on a
-//! boot with an optical drive when the run was given `--ob`.
+//! boot with an optical drive when the run was given `--ob`. A blank disc
+//! goes in that drive too, as QEMU has no burner: it records the commands
+//! a burner takes (Dukovo's ADR 0449).
 //!
 //! A test that asks for a CompactFlash card has its boot give the machine
 //! a blank one: an `ide-cf` on a `piix3-ide` controller of its own, as
@@ -64,7 +66,7 @@ use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
 use crate::screen::Image;
 use crate::ssh;
-use crate::suite::{Button, Floppy, PowerAction, Reader, Stick};
+use crate::suite::{BlankDisc, Button, Floppy, PowerAction, Reader, Stick};
 
 /// The QEMU binary.
 const QEMU: &str = "qemu-system-x86_64";
@@ -149,11 +151,12 @@ pub struct Qemu {
     /// The empty card reader the next fresh boot gives the machine, if
     /// any, set by [`Driver::want_card_reader`].
     want_card_reader: Option<Reader>,
-    /// The image of the disc in the optical drive now, and of the one
-    /// taken out last, to go back in. The guest never writes a disc, so
-    /// it is the test's own file, opened read-only.
-    disc: Option<PathBuf>,
-    disc_out: Option<PathBuf>,
+    /// The disc in the optical drive now, and the one taken out last, to
+    /// go back in. The guest never writes a disc of an image, so it is
+    /// the test's own file, opened read-only; a blank disc is the drive
+    /// of music CDs' own, which records.
+    disc: Option<InDrive>,
+    disc_out: Option<InDrive>,
     /// Whether the next fresh boot gives the machine an empty optical
     /// drive, set by [`Driver::want_disc_drive`].
     want_disc_drive: bool,
@@ -275,6 +278,34 @@ impl Drop for MusicDrive {
 /// drive of music CDs takes.
 fn is_music(image: &Path) -> bool {
     image.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("cue"))
+}
+
+/// A disc in the optical drive, or taken out of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InDrive {
+    /// A disc holding this image.
+    Image(PathBuf),
+    /// A blank disc of this kind, and what the machine burned on it.
+    Blank(BlankDisc),
+}
+
+impl InDrive {
+    /// Whether it goes in the drive of music CDs: a music CD, or a blank
+    /// disc, which only that drive records (Dukovo's `ob disc-drive`).
+    fn in_music_drive(&self) -> bool {
+        match self {
+            InDrive::Image(image) => is_music(image),
+            InDrive::Blank(_) => true,
+        }
+    }
+
+    /// It, in words.
+    fn describe(&self) -> String {
+        match self {
+            InDrive::Image(image) => format!("a disc holding {}", image.display()),
+            InDrive::Blank(disc) => format!("a {} put in blank", disc.name()),
+        }
+    }
 }
 
 impl Qemu {
@@ -623,13 +654,13 @@ impl Qemu {
             self.floppy_out = Some(floppy);
         }
         if let Some(disc) = self.disc.take()
-            && self.boot_disc.as_ref() != Some(&disc)
+            && !matches!((&disc, &self.boot_disc), (InDrive::Image(image), Some(dvd)) if image == dvd)
         {
             self.disc_out = Some(disc);
         }
         // The install DVD, given on its command line, is still in.
-        if self.boot_disc.is_some() {
-            self.disc.clone_from(&self.boot_disc);
+        if let Some(dvd) = &self.boot_disc {
+            self.disc = Some(InDrive::Image(dvd.clone()));
         }
         Ok(())
     }
@@ -886,22 +917,31 @@ impl Qemu {
         Ok(())
     }
 
-    /// Puts a disc holding `image` in the optical drive, read-only.
-    fn put_disc_in(&mut self, image: &Path) -> Result<(), String> {
+    /// Puts `disc` in the optical drive: an image read-only, or a blank
+    /// disc in the drive of music CDs, which records.
+    fn put_disc_in(&mut self, disc: &InDrive) -> Result<(), String> {
         if !self.want_disc_drive {
             return Err("this boot has no optical drive".into());
         }
         if let Some(disc) = &self.disc {
             return Err(format!(
-                "a disc holding {} is still in the optical drive; take it out first",
-                disc.display()
+                "{} is still in the optical drive; take it out first",
+                disc.describe()
             ));
         }
+        let image = match disc {
+            InDrive::Blank(kind) => {
+                self.music_drive()?.say(&format!("blank {}", kind.key()))?;
+                self.disc = Some(disc.clone());
+                return Ok(());
+            }
+            InDrive::Image(image) => image,
+        };
         if is_music(image) {
             let image =
                 std::path::absolute(image).map_err(|err| format!("{}: {err}", image.display()))?;
             self.music_drive()?.say(&format!("insert {}", image.display()))?;
-            self.disc = Some(image);
+            self.disc = Some(InDrive::Image(image));
             return Ok(());
         }
         self.qmp()?.execute(
@@ -913,7 +953,7 @@ impl Qemu {
                 "read-only-mode": "read-only",
             }),
         )?;
-        self.disc = Some(image.to_path_buf());
+        self.disc = Some(disc.clone());
         Ok(())
     }
 
@@ -1184,14 +1224,18 @@ impl Driver for Qemu {
     }
 
     fn insert_disc(&mut self, image: &Path) -> Result<(), String> {
-        self.put_disc_in(image)
+        self.put_disc_in(&InDrive::Image(image.to_path_buf()))
+    }
+
+    fn insert_blank_disc(&mut self, disc: BlankDisc) -> Result<(), String> {
+        self.put_disc_in(&InDrive::Blank(disc))
     }
 
     fn eject_disc(&mut self) -> Result<(), String> {
         let disc = self.disc.take().ok_or("no disc is in the optical drive")?;
         // By force here too: the drive lets go of a disc the machine
         // locked in.
-        if is_music(&disc) {
+        if disc.in_music_drive() {
             if let Err(err) = self.music_drive().and_then(|drive| drive.say("take-out")) {
                 self.disc = Some(disc);
                 return Err(err);
@@ -1216,6 +1260,14 @@ impl Driver for Qemu {
 
     fn reinsert_disc(&mut self) -> Result<(), String> {
         let disc = self.disc_out.clone().ok_or("no disc was taken out to put back")?;
+        // The drive keeps no disc it let go of, so what was burned on one
+        // is gone.
+        if let InDrive::Blank(kind) = disc {
+            return Err(format!(
+                "the {} taken out cannot go back in: QEMU's burner keeps no disc it let go of",
+                kind.name()
+            ));
+        }
         self.put_disc_in(&disc)?;
         self.disc_out = None;
         Ok(())
@@ -1227,7 +1279,7 @@ impl Driver for Qemu {
         };
         // A locked music CD stays in, and its drive asks the machine to let
         // it go; one not locked comes out.
-        if is_music(disc) {
+        if disc.in_music_drive() {
             let drive = self.music_drive()?;
             let locked = drive.locked()?;
             drive.say("button")?;
