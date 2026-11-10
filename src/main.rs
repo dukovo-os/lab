@@ -107,6 +107,9 @@ Options for run:
                    lab` builds it with `ob image`)
   --dvd <file>     The install DVD's ISO, for tests that boot it (`ob lab`
                    builds it with `ob image --iso`)
+  --ob <file>      Dukovo's ob, whose `ob disc-drive` holds a music CD in a
+                   QEMU machine's emulated USB CD drive (`ob lab` gives its
+                   own)
   --machine <a,b>  The machines to run on (default: qemu)
   --build <text>   The build's name for the bundle, such as \"0.13.0 fd2a9e8\"
   --all            Every test
@@ -178,6 +181,8 @@ struct Arguments {
     stick: Option<PathBuf>,
     /// The install DVD's ISO.
     dvd: Option<PathBuf>,
+    /// Dukovo's ob, for music CDs in QEMU.
+    ob: Option<PathBuf>,
     machine: Option<String>,
     build: Option<String>,
     preset: Option<String>,
@@ -253,6 +258,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--fonts" => arguments.fonts = Some(value("--fonts")?.into()),
             "--stick" => arguments.stick = Some(value("--stick")?.into()),
             "--dvd" => arguments.dvd = Some(value("--dvd")?.into()),
+            "--ob" => arguments.ob = Some(value("--ob")?.into()),
             "--machine" => arguments.machine = Some(value("--machine")?),
             "--build" => arguments.build = Some(value("--build")?),
             "--preset" => arguments.preset = Some(value("--preset")?),
@@ -618,6 +624,11 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     {
         return Err(Error::Usage(format!("the install DVD {} does not exist", dvd.display())));
     }
+    if let Some(ob) = &arguments.ob
+        && !ob.is_file()
+    {
+        return Err(Error::Usage(format!("Dukovo's ob {} does not exist", ob.display())));
+    }
     let store = arguments.store_dir()?;
     if arguments.detach {
         return detach(arguments, &store, &machines);
@@ -640,6 +651,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         fonts,
         stick: arguments.stick.clone(),
         dvd: arguments.dvd.clone(),
+        ob: arguments.ob.clone(),
         preset: arguments.preset.clone(),
         schedule: arguments.schedule.clone(),
         id: arguments.run_id.clone(),

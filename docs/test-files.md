@@ -83,7 +83,7 @@ Each step has exactly one action key, and only the options that go with it.
 | `card = "remove"` | | Takes the card out of the reader, whether or not the machine let go of it. | card |
 | `card = "reinsert"` | | Puts the card taken out last back in, holding what the machine wrote on it. | card |
 | `sd = "insert"`, `"remove"`, `"reinsert"` | as `card` | As `card`, in the machine's own SD card slot, on PCI as a laptop's is, instead of a USB card reader. See [SD card slot tests](#sd-card-slot-tests). | sd |
-| `disc = "insert"` | `image` | Puts a disc in the optical drive: `image`, a disc image (an ISO) in the test's folder, which the machine only reads. See [Optical drive tests](#optical-drive-tests). | disc |
+| `disc = "insert"` | `image` | Puts a disc in the optical drive: `image`, a disc image (an ISO) in the test's folder, which the machine only reads, or a music CD's cue sheet. See [Optical drive tests](#optical-drive-tests). | disc |
 | `disc = "eject"` | | Opens the drive's tray and takes the disc out, whether or not the machine let go of it. | disc |
 | `disc = "reinsert"` | | Puts the disc taken out last back in. | disc |
 | `disc = "button"` | | Presses the drive's eject button: a drive whose disc the machine locked in keeps it and asks the machine to let it go; one the machine did not lock opens, and the disc is taken out. | disc |
@@ -478,6 +478,16 @@ disc = "eject"
   which unmounts the disc and opens the tray; the disc stays in the open
   tray until a `disc = "eject"` takes it out. A drive the machine did not
   lock opens at once, and the disc is out.
+- A music CD is a cue sheet in the test's folder, with the files it
+  names beside it (ADR 0447 in Dukovo's repository). QEMU's drives hold
+  no music CD, so in QEMU it goes in a second drive: an emulated USB CD
+  drive that Dukovo's `ob disc-drive` serves, plugged in through a
+  `usb-redir` device. It is there on a boot with an optical drive when
+  the run was given Dukovo's ob with `--ob`, as `ob lab` does; without
+  it, a music CD's `disc = "insert"` fails and says so. The `eject`,
+  `reinsert` and `button` steps work it as they work the other drive.
+  On a real machine, a person puts in a CD-R burned from the cue sheet,
+  with its CD-Text.
 - On a real machine a person puts the disc in and takes it out, so disc
   tests are Needs you tests there.
 

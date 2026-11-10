@@ -262,6 +262,9 @@ pub struct Setup {
     pub sockets: PathBuf,
     /// The lab key, for machines with an SSH channel.
     pub key: Option<PathBuf>,
+    /// Dukovo's ob, whose `ob disc-drive` is a QEMU machine's drive of
+    /// music CDs, when the run was given it.
+    pub ob: Option<PathBuf>,
     /// Set when the run is stopped: long waits end early.
     pub stop: Stop,
 }

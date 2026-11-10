@@ -147,6 +147,9 @@ pub struct Request<'a> {
     pub stick: Option<PathBuf>,
     /// The install DVD's ISO, for tests that boot it, when given.
     pub dvd: Option<PathBuf>,
+    /// Dukovo's ob, whose `ob disc-drive` holds a test's music CD in a
+    /// QEMU machine, when given.
+    pub ob: Option<PathBuf>,
     /// The preset the tests came from, for run.json.
     pub preset: Option<String>,
     /// The schedule that started the run, for run.json.
@@ -280,6 +283,7 @@ pub fn run(
                     // By number, not name: socket paths must stay short.
                     sockets: sockets.join(index.to_string()),
                     key: request.key.clone(),
+                    ob: request.ob.clone(),
                     stop: stop.clone(),
                 };
                 let shared = &shared;

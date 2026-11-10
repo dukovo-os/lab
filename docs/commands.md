@@ -78,7 +78,8 @@ Each machine, its file and who does each control. With `--json`:
 ```
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
                [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
-               [--stick <file>] [--dvd <file>] [--with-person] [--detach]
+               [--stick <file>] [--dvd <file>] [--ob <file>] [--with-person]
+               [--detach]
 ```
 
 Runs the tests on each machine (default `qemu`), the machines side by
@@ -122,6 +123,10 @@ screen are skipped.
 and `--dvd` the install DVD's ISO, for tests with `boot = "dvd"`. `ob
 lab` builds both beside the lab image and passes them. Without one, its
 tests are skipped.
+
+`--ob` names Dukovo's `ob`, whose `ob disc-drive` holds a test's music
+CD in a QEMU machine's emulated USB CD drive (see [test
+files](test-files.md#optical-drive-tests)). `ob lab` passes its own.
 
 Without `--json` it prints a line as each test starts and ends. With
 `--json` it prints one JSON object per line as things happen, each with
@@ -329,7 +334,8 @@ and with the runner page closed. See [Schedules](schedules.md).
 
 ```
 dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--fonts <dir>]
-              [--stick <file>] [--dvd <file>] [--port <n>] [--no-open]
+              [--stick <file>] [--dvd <file>] [--ob <file>] [--port <n>]
+              [--no-open]
 ```
 
 Serves the runner page to a browser on this PC, at
@@ -339,7 +345,7 @@ open, which carries a key made anew each time; without it the page does
 not open. Ctrl+C closes the page; runs started from it carry on. Without
 `--image` the page shows tests and runs but cannot start runs; `ob lab
 ui` gives the image. Runs started from the page get `--linux`,
-`--fonts`, `--stick` and `--dvd` when they were given. See [the runner page](runner-page.md).
+`--fonts`, `--stick`, `--dvd` and `--ob` when they were given. See [the runner page](runner-page.md).
 
 ## key
 
