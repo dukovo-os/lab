@@ -141,6 +141,9 @@ pub struct Test {
     /// Programs the lab PC must have for the test's host steps; without
     /// one, the test is skipped.
     pub host_needs: Vec<String>,
+    /// The size of the CompactFlash card in an IDE adapter the test
+    /// formats, if it asks for one: a blank one on QEMU.
+    pub cf: Option<u64>,
 }
 
 /// The card reader a test's memory cards go in.
@@ -585,6 +588,9 @@ impl Test {
             }
             Boot::Image => {}
         }
+        if self.cf.is_some() {
+            controls.insert(Control::Cf);
+        }
         controls.insert(Control::Power);
         controls.insert(Control::Serial);
         controls
@@ -663,9 +669,14 @@ struct TestFile {
     disk: Option<String>,
     #[serde(default)]
     host_needs: Vec<String>,
+    cf: Option<String>,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
+
+/// The largest CompactFlash card a test may ask for: what 28-bit
+/// addresses reach, as many cards' do.
+const CF_MAX: u64 = 128 << 30;
 
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -864,6 +875,17 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             "host_needs: {bad_name:?} is not a program's name, as krb5kdc or smbd"
         )));
     }
+    let cf = match file.cf {
+        None => None,
+        Some(size) => match parse_size(&size) {
+            Some(bytes) if (1 << 20..=CF_MAX).contains(&bytes) => Some(bytes),
+            _ => {
+                return Err(bad(format!(
+                    "cf = \"{size}\": a size from 1M to 128G, as a number and M or G, such as \"64M\""
+                )));
+            }
+        },
+    };
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut steps = Vec::new();
     for (index, step) in file.steps.into_iter().enumerate() {
@@ -936,6 +958,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         boot,
         steps,
         host_needs: file.host_needs,
+        cf,
     })
 }
 
@@ -1851,6 +1874,31 @@ expect = "1 received"
             );
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
             assert!(why.contains(complaint), "{step}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_test_asks_for_a_compactflash_card() {
+        let dir = TempDir::new("suite-cf");
+        dir.write(
+            "features/cf.toml",
+            "about = \"x\"\ntime = \"1m\"\ncf = \"64M\"\n[[step]]\nrun = \"ls\"\n",
+        );
+        dir.write("features/plain.toml", "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"ls\"\n");
+        let tests = load(dir.path()).unwrap();
+        let cf = tests.iter().find(|test| test.id == "features/cf").unwrap();
+        assert_eq!(cf.cf, Some(64 << 20));
+        assert!(cf.controls().contains(&Control::Cf));
+        let plain = tests.iter().find(|test| test.id == "features/plain").unwrap();
+        assert_eq!(plain.cf, None);
+        assert!(!plain.controls().contains(&Control::Cf));
+        for size in ["0M", "256G", "64K", "big"] {
+            dir.write(
+                "features/cf.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\ncf = \"{size}\"\n[[step]]\nrun = \"ls\"\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("cf = {size} loaded") };
+            assert!(why.contains("a size from 1M to 128G"), "{size}: {why}");
         }
     }
 

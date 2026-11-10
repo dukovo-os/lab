@@ -129,6 +129,12 @@ pub trait Driver: Send {
     /// as [`Driver::want_card_reader`] says of a card reader.
     fn want_floppy_drive(&mut self, _yes: bool) {}
 
+    /// Says whether the next [`Driver::boot_fresh`] gives the machine a
+    /// blank CompactFlash card of this many bytes in an IDE adapter, as
+    /// [`Driver::want_card_reader`] says of a card reader. A real
+    /// machine's card is in its adapter already.
+    fn want_cf_card(&mut self, _bytes: Option<u64>) {}
+
     /// Puts a floppy disk in the floppy drive: a copy of an image, or a
     /// blank one, write-protected or not.
     fn insert_floppy(&mut self, _floppy: &Floppy) -> Result<(), String> {

@@ -48,6 +48,10 @@ pub enum Control {
     /// Putting a floppy disk in the machine's floppy drive and taking it
     /// out.
     Floppy,
+    /// A CompactFlash card in an IDE adapter, which tests may format: a
+    /// blank one QEMU gives a boot for a test that asks for one, or the
+    /// card a real machine has in its adapter.
+    Cf,
     /// Pressing keys on the machine's keyboard.
     Keys,
     /// Moving the pointer and pressing its buttons.
@@ -71,7 +75,7 @@ pub enum Control {
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 16] = [
+    pub const ALL: [Control; 17] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -81,6 +85,7 @@ impl Control {
         Control::Sd,
         Control::Disc,
         Control::Floppy,
+        Control::Cf,
         Control::Keys,
         Control::Mouse,
         Control::Screen,
@@ -102,6 +107,7 @@ impl Control {
             Control::Sd => "sd",
             Control::Disc => "disc",
             Control::Floppy => "floppy",
+            Control::Cf => "cf",
             Control::Keys => "keys",
             Control::Mouse => "mouse",
             Control::Screen => "screen",
