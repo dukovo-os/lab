@@ -38,6 +38,7 @@ expect_not = "NO-CARRIER"
 | `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk, and `"dvd"` the install DVD in the optical drive: see [Installer tests](#installer-tests). |
 | `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
 | `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
+| `cf` | no | A CompactFlash card in an IDE adapter for the test to format, of this size, from `1M` to `128G`: see [CompactFlash tests](#compactflash-tests). |
 | `[[step]]` | at least one | The steps, in order. |
 
 ## Categories
@@ -481,6 +482,31 @@ disc = "eject"
   tests are Needs you tests there.
 
 Optical drive tests live under `lab/tests/storage/` too.
+
+## CompactFlash tests
+
+A test with `cf = "64M"` formats a CompactFlash card in an IDE adapter,
+which the kernel drives by PIO (ADR 0446 in Dukovo's repository). The
+card is in for the whole boot, as True IDE mode has no hot-plug, so the
+test's steps only run commands; the kernel's log names the card.
+
+```toml
+about = "A CompactFlash card in an IDE adapter is formatted"
+time = "3m"
+cf = "64M"
+
+[[step]]
+run = '''sh -c 'dmesg | grep -o "sd[a-z]* is a CompactFlash card" | cut -d" " -f1' '''
+expect = "sd"
+```
+
+- On QEMU, the test's boot gives the machine a blank card of that size:
+  an `ide-cf` on a PIIX3 IDE controller of its own. No other test's
+  boot has it, as it would show up in a disk test.
+- A real machine with a card in an IDE adapter lists the `cf` control
+  as `driver`; its card is formatted whatever its size.
+
+CompactFlash tests live under `lab/tests/storage/`.
 
 ## Floppy drive tests
 

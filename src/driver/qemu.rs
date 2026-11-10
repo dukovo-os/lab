@@ -29,6 +29,11 @@
 //! `send-key`, the pointer (a USB tablet) to `input-send-event`, the
 //! screen to `screendump`.
 //!
+//! A test that asks for a CompactFlash card has its boot give the machine
+//! a blank one: an `ide-cf` on a `piix3-ide` controller of its own, as
+//! the q35 chipset has no parallel IDE. A card stays in for the boot, as
+//! True IDE mode has no hot-plug.
+//!
 //! The lab PC is the guest's peer on QEMU's user network, where the guest
 //! reaches the lab PC's loopback at 10.0.2.2 (`{peer}`); a guest's port
 //! the lab PC's clients need is forwarded from a free port of the lab
@@ -67,6 +72,10 @@ const CARD_DRIVE: &str = "card-reader";
 
 /// The optical drive's drive, which a disc goes in and comes out of.
 const DISC_DRIVE: &str = "optical-drive";
+
+/// The IDE controller a CompactFlash card is on, and the card's drive.
+const CF_ADAPTER: &str = "cf-adapter";
+const CF_DRIVE: &str = "cf-card";
 
 /// The floppy drive's drive, which a floppy disk goes in and comes out of.
 const FLOPPY_DRIVE: &str = "floppy-drive";
@@ -146,6 +155,11 @@ pub struct Qemu {
     /// Whether the next fresh boot gives the machine an empty floppy
     /// drive, set by [`Driver::want_floppy_drive`].
     want_floppy_drive: bool,
+    /// The size of the blank CompactFlash card the next fresh boot gives
+    /// the machine, if any, set by [`Driver::want_cf_card`]; and the file
+    /// of this boot's card.
+    want_cf_card: Option<u64>,
+    cf_card: Option<PathBuf>,
     /// The install stick this boot started from, while it is still in:
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
@@ -228,6 +242,8 @@ impl Qemu {
             floppy: None,
             floppy_out: None,
             want_floppy_drive: false,
+            want_cf_card: None,
+            cf_card: None,
             boot_stick: None,
             boot_disc: None,
             want_attacker: false,
@@ -404,6 +420,18 @@ impl Qemu {
             args.push(format!(
                 "floppy,bus=fdc.0,drive={FLOPPY_DRIVE},unit=0,drive-type=144,id=floppy-drive0"
             ));
+        }
+        // A CompactFlash card in an IDE adapter: QEMU's `ide-cf`, the
+        // master of the first channel of a PIIX3 IDE controller. Only on a
+        // boot for a test that asks for one, as it would show up in a disk
+        // test.
+        if let Some(card) = &self.cf_card {
+            args.push("-device".into());
+            args.push(format!("piix3-ide,id={CF_ADAPTER}"));
+            args.push("-drive".into());
+            args.push(format!("if=none,id={CF_DRIVE},format=raw,file={}", option_value(card)));
+            args.push("-device".into());
+            args.push(format!("ide-cf,drive={CF_DRIVE},bus={CF_ADAPTER}.0,unit=0,id=cf"));
         }
         // The install stick, named as a stick plugged in later is, so that
         // pulling it works the same way.
@@ -594,6 +622,9 @@ impl Qemu {
         let _ = fs::remove_file(self.disk());
         if let Some((_, overlay)) = self.boot_stick.take() {
             let _ = fs::remove_file(overlay);
+        }
+        if let Some(card) = self.cf_card.take() {
+            let _ = fs::remove_file(card);
         }
         self.stick = None;
         self.boot_disc = None;
@@ -804,6 +835,12 @@ impl Driver for Qemu {
     fn boot_fresh(&mut self) -> Result<(), String> {
         self.next_boot()?;
         self.make_disk()?;
+        // A blank card, as one fresh from the shop: zeros.
+        if let Some(bytes) = self.want_cf_card {
+            let card = self.setup.work.join(format!("cf-{}.img", self.boot));
+            make_medium(&Stick::Blank(bytes), &card)?;
+            self.cf_card = Some(card);
+        }
         self.power_on()
     }
 
@@ -1055,6 +1092,10 @@ impl Driver for Qemu {
             Err(err) if err.contains("is locked") => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn want_cf_card(&mut self, bytes: Option<u64>) {
+        self.want_cf_card = bytes;
     }
 
     fn want_floppy_drive(&mut self, yes: bool) {
@@ -1635,13 +1676,26 @@ mod tests {
         assert_eq!(read_only(&mut qemu), Some(true));
         qemu.want_floppy_drive(false);
 
+        // A blank CompactFlash card in an IDE adapter, on a boot that asks
+        // for one, gone with the boot.
+        qemu.want_cf_card(Some(4 << 20));
+        qemu.boot_fresh().unwrap();
+        let card = qemu.cf_card.clone().unwrap();
+        assert_eq!(fs::metadata(&card).unwrap().len(), 4 << 20);
+        let devices = qemu.qmp().unwrap().execute("query-block", &json!({})).unwrap();
+        let cf = devices.as_array().unwrap().iter().find(|device| device["device"] == CF_DRIVE);
+        assert!(cf.unwrap()["inserted"].is_object(), "the card is in its adapter");
+        qemu.want_cf_card(None);
+        qemu.boot_fresh().unwrap();
+        assert!(!card.exists() && qemu.cf_card.is_none());
+
         // The install stick, with a blank disk of the size asked for; the
         // stick's own file is never written.
         let install = dir.write("install.img", "");
         File::options().write(true).open(&install).unwrap().set_len(1 << 20).unwrap();
         qemu.boot_stick(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-6.qcow2").is_file());
+        assert!(dir.path().join("work/disk-8.qcow2").is_file());
         assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
 
@@ -1652,7 +1706,7 @@ mod tests {
         qemu.want_disc_drive(true);
         qemu.boot_dvd(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-7.qcow2").is_file());
+        assert!(dir.path().join("work/disk-9.qcow2").is_file());
         assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
         qemu.power(PowerAction::Cut, soon()).unwrap();
         qemu.power(PowerAction::On, soon()).unwrap();

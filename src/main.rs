@@ -490,9 +490,9 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
     println!("{}: {}", test.id, test.about);
     println!("File: {}", test.file.display());
     // An attack test's boot has the private network, a card test's the
-    // card reader (USB or SD), a disc test's the optical drive and a
-    // floppy test's the floppy drive, that no other test may find: never
-    // shared.
+    // card reader (USB or SD), a disc test's the optical drive, a floppy
+    // test's the floppy drive and a CompactFlash test's the card, that no
+    // other test may find: never shared.
     let controls = test.controls();
     let alone = [
         machines::Control::Attack,
@@ -500,6 +500,7 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
         machines::Control::Sd,
         machines::Control::Disc,
         machines::Control::Floppy,
+        machines::Control::Cf,
     ]
     .iter()
     .any(|control| controls.contains(control));

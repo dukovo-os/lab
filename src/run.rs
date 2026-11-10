@@ -567,7 +567,9 @@ impl<'a> Worker<'a> {
         self.driver.want_disc_drive(discs);
         let floppies = test.controls().contains(&Control::Floppy);
         self.driver.want_floppy_drive(floppies);
-        let own_boot = attacks || cards || discs || floppies;
+        // And one that formats a CompactFlash card, given one blank.
+        self.driver.want_cf_card(test.cf);
+        let own_boot = attacks || cards || discs || floppies || test.cf.is_some();
 
         let mut failure = None;
         if let Boot::Stick { disk } = test.boot {
@@ -634,8 +636,9 @@ impl<'a> Worker<'a> {
         // After the installer, the disk no longer holds the image under
         // test, so the next test boots afresh. An attack boot has the
         // private network port a later test must not find, a card test's
-        // boot the card reader, a disc test's the optical drive and a
-        // floppy test's the floppy drive, so they are not shared either.
+        // boot the card reader, a disc test's the optical drive, a floppy
+        // test's the floppy drive and a CompactFlash test's the card, so
+        // they are not shared either.
         self.reusable =
             result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !own_boot;
         let log = self.write_log(test, result, reason.as_deref());
