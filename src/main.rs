@@ -505,6 +505,7 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
         machines::Control::Card,
         machines::Control::Sd,
         machines::Control::Disc,
+        machines::Control::Burner,
         machines::Control::Floppy,
         machines::Control::Cf,
     ]

@@ -213,6 +213,10 @@ impl Driver for FakeMachine {
         self.eject_disc()
     }
 
+    fn insert_blank_disc(&mut self, _disc: crate::suite::BlankDisc) -> Result<(), String> {
+        self.eject_disc()
+    }
+
     fn eject_disc(&mut self) -> Result<(), String> {
         if !self.disc_drive {
             return Err("this boot was not given an optical drive".into());

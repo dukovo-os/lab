@@ -565,9 +565,11 @@ impl<'a> Worker<'a> {
         let reader = test.card_reader();
         self.driver.want_card_reader(reader);
         let cards = reader.is_some();
-        // And one that puts discs in an optical drive, as empty, or
-        // floppy disks in a floppy drive.
-        let discs = test.controls().contains(&Control::Disc);
+        // And one that puts discs in an optical drive, as empty, blank
+        // ones to burn among them, or floppy disks in a floppy drive.
+        let discs = [Control::Disc, Control::Burner]
+            .iter()
+            .any(|control| test.controls().contains(control));
         self.driver.want_disc_drive(discs);
         let floppies = test.controls().contains(&Control::Floppy);
         self.driver.want_floppy_drive(floppies);
@@ -893,6 +895,9 @@ impl<'a> Worker<'a> {
             }
             Step::InsertDisc(image) => {
                 self.driver.insert_disc(image).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::InsertBlankDisc(disc) => {
+                self.driver.insert_blank_disc(*disc).map(|()| None).map_err(StepFailure::Error)
             }
             Step::EjectDisc => self.driver.eject_disc().map(|()| None).map_err(StepFailure::Error),
             Step::ReinsertDisc => {

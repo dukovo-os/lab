@@ -238,6 +238,9 @@ pub enum Step {
     EjectDisc,
     /// Puts the disc taken out last back in.
     ReinsertDisc,
+    /// Puts a blank disc of this kind in the machine's optical drive, a
+    /// burner, for the machine to write.
+    InsertBlankDisc(BlankDisc),
     /// Presses the optical drive's eject button: a drive whose disc the
     /// machine locked in keeps it and asks the machine to let it go; one
     /// it did not opens, and the disc is taken out.
@@ -345,6 +348,65 @@ pub enum Stick {
     Blank(u64),
 }
 
+/// A blank disc a `disc = "insert"` step puts in with `blank`, for the
+/// machine to burn (ADR 0449 in Dukovo's repository): a kind of
+/// recordable CD, DVD or Blu-ray disc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlankDisc {
+    CdR,
+    CdRw,
+    DvdR,
+    DvdPlusR,
+    DvdPlusRw,
+    BdR,
+    BdRe,
+}
+
+impl BlankDisc {
+    /// Every kind, in the order lists show them.
+    pub const ALL: [BlankDisc; 7] = [
+        BlankDisc::CdR,
+        BlankDisc::CdRw,
+        BlankDisc::DvdR,
+        BlankDisc::DvdPlusR,
+        BlankDisc::DvdPlusRw,
+        BlankDisc::BdR,
+        BlankDisc::BdRe,
+    ];
+
+    /// Its name in test files, as Dukovo's `ob disc-drive` takes it after
+    /// `blank`.
+    pub fn key(self) -> &'static str {
+        match self {
+            BlankDisc::CdR => "cd-r",
+            BlankDisc::CdRw => "cd-rw",
+            BlankDisc::DvdR => "dvd-r",
+            BlankDisc::DvdPlusR => "dvd+r",
+            BlankDisc::DvdPlusRw => "dvd+rw",
+            BlankDisc::BdR => "bd-r",
+            BlankDisc::BdRe => "bd-re",
+        }
+    }
+
+    /// Its name on the disc's box, for a person.
+    pub fn name(self) -> &'static str {
+        match self {
+            BlankDisc::CdR => "CD-R",
+            BlankDisc::CdRw => "CD-RW",
+            BlankDisc::DvdR => "DVD-R",
+            BlankDisc::DvdPlusR => "DVD+R",
+            BlankDisc::DvdPlusRw => "DVD+RW",
+            BlankDisc::BdR => "BD-R",
+            BlankDisc::BdRe => "BD-RE",
+        }
+    }
+
+    /// The kind `key` names.
+    fn parse(key: &str) -> Option<BlankDisc> {
+        BlankDisc::ALL.into_iter().find(|disc| disc.key() == key)
+    }
+}
+
 /// The floppy disk a `floppy = "insert"` step puts in a floppy drive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Floppy {
@@ -410,6 +472,7 @@ impl Step {
             Step::InsertDisc(_) | Step::EjectDisc | Step::ReinsertDisc | Step::PressDiscButton => {
                 Some(Control::Disc)
             }
+            Step::InsertBlankDisc(_) => Some(Control::Burner),
             Step::InsertFloppy(_) | Step::EjectFloppy | Step::ReinsertFloppy => {
                 Some(Control::Floppy)
             }
@@ -472,6 +535,9 @@ impl Step {
                 } else {
                     format!("put a disc holding {name} in the optical drive")
                 }
+            }
+            Step::InsertBlankDisc(disc) => {
+                format!("put a blank {} in the optical drive, a burner", disc.name())
             }
             Step::EjectDisc => "take the disc out of the optical drive".into(),
             Step::ReinsertDisc => "put the disc back in the optical drive".into(),
@@ -926,7 +992,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             }
             Step::ReinsertCard(_) => card_out = false,
             Step::EjectDisc | Step::PressDiscButton => disc_out = true,
-            Step::InsertDisc(_) => disc_out = false,
+            Step::InsertDisc(_) | Step::InsertBlankDisc(_) => disc_out = false,
             Step::ReinsertDisc if !disc_out => {
                 return Err(bad(format!(
                     "step {}: disc = \"reinsert\" puts back a disc the test took out, and none is out",
@@ -1050,12 +1116,12 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
     // A stick's, a card's, a disc's or a floppy disk's: what it holds. A
-    // disc is never blank: a blank one holds nothing to read.
+    // blank disc is one of a kind, for a burner.
     if step.image.is_some() && !matches!(given[0], "usb" | "card" | "sd" | "disc" | "floppy") {
         return Err("image goes only with usb, card, sd, disc or floppy".into());
     }
-    if step.blank.is_some() && !matches!(given[0], "usb" | "card" | "sd" | "floppy") {
-        return Err("blank goes only with usb, card, sd or floppy".into());
+    if step.blank.is_some() && !matches!(given[0], "usb" | "card" | "sd" | "disc" | "floppy") {
+        return Err("blank goes only with usb, card, sd, disc or floppy".into());
     }
     only_with("protected", step.protected.is_some(), "floppy")?;
 
@@ -1154,20 +1220,33 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         };
     }
     if let Some(action) = step.disc {
-        return match (action, step.image) {
-            (DiscAction::Eject | DiscAction::Reinsert | DiscAction::Button, Some(_)) => {
-                Err("only disc = \"insert\" takes an image".into())
+        return match (action, step.image, step.blank) {
+            (DiscAction::Eject | DiscAction::Reinsert | DiscAction::Button, image, blank)
+                if image.is_some() || blank.is_some() =>
+            {
+                Err("only disc = \"insert\" takes an image or blank".into())
             }
-            (DiscAction::Eject, None) => Ok(Step::EjectDisc),
-            (DiscAction::Reinsert, None) => Ok(Step::ReinsertDisc),
-            (DiscAction::Button, None) => Ok(Step::PressDiscButton),
-            (DiscAction::Insert, None) => {
-                Err("disc = \"insert\" needs image, a disc image beside the test".into())
+            (DiscAction::Eject, ..) => Ok(Step::EjectDisc),
+            (DiscAction::Reinsert, ..) => Ok(Step::ReinsertDisc),
+            (DiscAction::Button, ..) => Ok(Step::PressDiscButton),
+            (DiscAction::Insert, None, None) => Err(
+                "disc = \"insert\" needs image, a disc image beside the test, or blank, a kind of disc such as \"cd-r\""
+                    .into(),
+            ),
+            (DiscAction::Insert, Some(_), Some(_)) => {
+                Err("a disc is an image or blank, not both".into())
             }
-            (DiscAction::Insert, image) => {
+            (DiscAction::Insert, None, Some(kind)) => match BlankDisc::parse(&kind) {
+                Some(disc) => Ok(Step::InsertBlankDisc(disc)),
+                None => Err(format!(
+                    "blank = \"{kind}\": a disc is one of {}",
+                    BlankDisc::ALL.map(BlankDisc::key).join(", ")
+                )),
+            },
+            (DiscAction::Insert, image, None) => {
                 match parse_medium("disc = \"insert\"", "disc", image, None, folder)? {
                     Stick::Image(path) => Ok(Step::InsertDisc(path)),
-                    Stick::Blank(_) => Err("a disc is never blank".into()),
+                    Stick::Blank(_) => unreachable!("no blank was given"),
                 }
             }
         };
@@ -1868,7 +1947,6 @@ expect = "1 received"
         assert!(tests[0].controls().contains(&Control::Disc));
         for (step, complaint) in [
             ("disc = \"insert\"", "disc = \"insert\" needs image"),
-            ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb, card, sd or floppy"),
             ("disc = \"insert\"\nimage = \"none.iso\"", "does not exist"),
             ("disc = \"eject\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
             ("disc = \"button\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
@@ -1881,6 +1959,49 @@ expect = "1 received"
         ] {
             dir.write(
                 "features/disc.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
+            assert!(why.contains(complaint), "{step}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_blank_disc_is_put_in_the_burner() {
+        let dir = TempDir::new("suite-burn");
+        dir.write("features/disc.iso", "");
+        dir.write(
+            "features/burn.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\ndisc = \"insert\"\nblank = \"cd-r\"\n\
+             [[step]]\ndisc = \"eject\"\n[[step]]\ndisc = \"insert\"\nblank = \"dvd+rw\"\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        assert_eq!(tests[0].steps[0], Step::InsertBlankDisc(BlankDisc::CdR));
+        assert_eq!(tests[0].steps[0].describe(), "put a blank CD-R in the optical drive, a burner");
+        assert_eq!(tests[0].steps[2], Step::InsertBlankDisc(BlankDisc::DvdPlusRw));
+        assert_eq!(tests[0].steps[0].control(), Some(Control::Burner));
+        assert_eq!(tests[0].steps[1].control(), Some(Control::Disc));
+        assert!(tests[0].controls().contains(&Control::Burner));
+        for disc in BlankDisc::ALL {
+            assert_eq!(BlankDisc::parse(disc.key()), Some(disc));
+        }
+        for (step, complaint) in [
+            ("disc = \"insert\"\nblank = \"8M\"", "a disc is one of cd-r, cd-rw, dvd-r"),
+            (
+                "disc = \"insert\"\nblank = \"cd-r\"\nimage = \"disc.iso\"",
+                "image or blank, not both",
+            ),
+            (
+                "disc = \"eject\"\nblank = \"cd-r\"",
+                "only disc = \"insert\" takes an image or blank",
+            ),
+            (
+                "run = \"ls\"\nblank = \"cd-r\"",
+                "blank goes only with usb, card, sd, disc or floppy",
+            ),
+        ] {
+            dir.write(
+                "features/burn.toml",
                 &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
             );
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };

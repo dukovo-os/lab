@@ -20,7 +20,7 @@ use crate::bench::Kit;
 use crate::machines::{DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
-use crate::suite::{Button, Floppy, PowerAction, Reader, Stick};
+use crate::suite::{BlankDisc, Button, Floppy, PowerAction, Reader, Stick};
 
 /// The machine under test's address on the private lab network an attack
 /// runs over. An `attack` step's `{target}` becomes this.
@@ -104,6 +104,13 @@ pub trait Driver: Send {
     /// Puts a disc holding `image` in the optical drive.
     fn insert_disc(&mut self, _image: &Path) -> Result<(), String> {
         Err("this machine's driver cannot put a disc in its drive".into())
+    }
+
+    /// Puts a blank disc of the kind `disc` in the optical drive, a
+    /// burner, for the machine to write. It holds what the machine burned
+    /// until it is taken out.
+    fn insert_blank_disc(&mut self, _disc: BlankDisc) -> Result<(), String> {
+        Err("this machine's driver cannot put a blank disc in its drive".into())
     }
 
     /// Takes the disc out of the optical drive, by force: whether or not

@@ -45,6 +45,9 @@ pub enum Control {
     Sd,
     /// Putting a disc in the machine's optical drive and ejecting it.
     Disc,
+    /// Putting a blank CD, DVD or Blu-ray disc in the machine's optical
+    /// drive, which writes them, for a test to burn.
+    Burner,
     /// Putting a floppy disk in the machine's floppy drive and taking it
     /// out.
     Floppy,
@@ -75,7 +78,7 @@ pub enum Control {
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 17] = [
+    pub const ALL: [Control; 18] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -84,6 +87,7 @@ impl Control {
         Control::Card,
         Control::Sd,
         Control::Disc,
+        Control::Burner,
         Control::Floppy,
         Control::Cf,
         Control::Keys,
@@ -106,6 +110,7 @@ impl Control {
             Control::Card => "card",
             Control::Sd => "sd",
             Control::Disc => "disc",
+            Control::Burner => "burner",
             Control::Floppy => "floppy",
             Control::Cf => "cf",
             Control::Keys => "keys",
