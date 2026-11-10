@@ -41,15 +41,15 @@ cord = "person"    # treat pulling the cord as a person's job here
 A control is a way the lab acts on a machine: `power`, `cord` (pulling
 the power cord), `serial`, `link` (the network cable), `usb` (a USB
 stick), `card` (a memory card in a card reader), `disc` (a disc in an
-optical drive), `keys`, `mouse` (moving
-the pointer and pressing its buttons), `screen`, `ssh`, `linux` (booting
-the machine's Linux twin, which performance tests measure against),
-`attack` (standing up an attacker on a private network of the machine's
-own, which security tests probe it from) and `peer` (the lab PC as a
-peer on the machine's network: servers the lab PC runs that the machine
-reaches, such as a Kerberos KDC or a file server, and the machine's
-ports forwarded to the lab PC, so the lab PC's clients reach the
-machine's own servers). Each is done by one of:
+optical drive), `floppy` (a floppy disk in a floppy drive), `keys`,
+`mouse` (moving the pointer and pressing its buttons), `screen`, `ssh`,
+`linux` (booting the machine's Linux twin, which performance tests
+measure against), `attack` (standing up an attacker on a private network
+of the machine's own, which security tests probe it from) and `peer`
+(the lab PC as a peer on the machine's network: servers the lab PC runs
+that the machine reaches, such as a Kerberos KDC or a file server, and
+the machine's ports forwarded to the lab PC, so the lab PC's clients
+reach the machine's own servers). Each is done by one of:
 
 | Value | Meaning |
 | --- | --- |

@@ -560,10 +560,13 @@ impl<'a> Worker<'a> {
         // an empty drive, a disk test must not find either.
         let cards = test.controls().contains(&Control::Card);
         self.driver.want_card_reader(cards);
-        // And one that puts discs in an optical drive, as empty.
+        // And one that puts discs in an optical drive, as empty, or
+        // floppy disks in a floppy drive.
         let discs = test.controls().contains(&Control::Disc);
         self.driver.want_disc_drive(discs);
-        let own_boot = attacks || cards || discs;
+        let floppies = test.controls().contains(&Control::Floppy);
+        self.driver.want_floppy_drive(floppies);
+        let own_boot = attacks || cards || discs || floppies;
 
         let mut failure = None;
         if let Boot::Stick { disk } = test.boot {
@@ -630,8 +633,8 @@ impl<'a> Worker<'a> {
         // After the installer, the disk no longer holds the image under
         // test, so the next test boots afresh. An attack boot has the
         // private network port a later test must not find, a card test's
-        // boot the card reader and a disc test's the optical drive, so
-        // they are not shared either.
+        // boot the card reader, a disc test's the optical drive and a
+        // floppy test's the floppy drive, so they are not shared either.
         self.reusable =
             result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !own_boot;
         let log = self.write_log(test, result, reason.as_deref());
@@ -888,6 +891,15 @@ impl<'a> Worker<'a> {
             }
             Step::PressDiscButton => {
                 self.driver.press_disc_button().map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::InsertFloppy(floppy) => {
+                self.driver.insert_floppy(floppy).map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::EjectFloppy => {
+                self.driver.eject_floppy().map(|()| None).map_err(StepFailure::Error)
+            }
+            Step::ReinsertFloppy => {
+                self.driver.reinsert_floppy().map(|()| None).map_err(StepFailure::Error)
             }
             Step::Keys(keys) => {
                 self.driver.press_keys(keys).map(|()| None).map_err(StepFailure::Error)

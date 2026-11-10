@@ -20,7 +20,10 @@
 //! a card reader (a `usb-storage` whose medium is removable, empty at
 //! boot, there only for a test with card steps), a disc to the same on
 //! an optical drive (an `ide-cd` on the q35 chipset's AHCI controller,
-//! empty at boot, there only for a test with disc steps), keys to
+//! empty at boot, there only for a test with disc steps), a floppy disk
+//! to the same on a floppy drive (a 3.5-inch 1.44 MB `floppy` on an
+//! `isa-fdc` controller, empty at boot, there only for a test with floppy
+//! steps; a write-protected disk goes in read-only), keys to
 //! `send-key`, the pointer (a USB tablet) to `input-send-event`, the
 //! screen to `screendump`.
 //!
@@ -46,7 +49,7 @@ use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
 use crate::screen::Image;
 use crate::ssh;
-use crate::suite::{Button, PowerAction, Stick};
+use crate::suite::{Button, Floppy, PowerAction, Stick};
 
 /// The QEMU binary.
 const QEMU: &str = "qemu-system-x86_64";
@@ -59,6 +62,9 @@ const CARD_DRIVE: &str = "card-reader";
 
 /// The optical drive's drive, which a disc goes in and comes out of.
 const DISC_DRIVE: &str = "optical-drive";
+
+/// The floppy drive's drive, which a floppy disk goes in and comes out of.
+const FLOPPY_DRIVE: &str = "floppy-drive";
 
 /// The lab PC's address on QEMU's user network, as the guest sees it.
 const HOST_ON_USER_NET: &str = "10.0.2.2";
@@ -126,6 +132,15 @@ pub struct Qemu {
     /// Whether the next fresh boot gives the machine an empty optical
     /// drive, set by [`Driver::want_disc_drive`].
     want_disc_drive: bool,
+    /// Floppy disks put in so far, to name the next; the one in now; and
+    /// the one taken out last, kept to go back in, as with cards. Each
+    /// with whether it is write-protected.
+    floppies: u32,
+    floppy: Option<(u32, bool)>,
+    floppy_out: Option<(u32, bool)>,
+    /// Whether the next fresh boot gives the machine an empty floppy
+    /// drive, set by [`Driver::want_floppy_drive`].
+    want_floppy_drive: bool,
     /// The install stick this boot started from, while it is still in:
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
@@ -204,6 +219,10 @@ impl Qemu {
             disc: None,
             disc_out: None,
             want_disc_drive: false,
+            floppies: 0,
+            floppy: None,
+            floppy_out: None,
+            want_floppy_drive: false,
             boot_stick: None,
             boot_disc: None,
             want_attacker: false,
@@ -358,6 +377,20 @@ impl Qemu {
             let first = if self.boot_disc.is_some() { ",bootindex=0" } else { "" };
             args.push(format!("ide-cd,drive={DISC_DRIVE},bus=ide.1,id=dvd-drive{first}"));
         }
+        // A floppy drive, empty: a 3.5-inch 1.44 MB one, which reads 720
+        // KB disks too, as drive 0 of an ISA floppy disk controller, which
+        // the q35 chipset does not have of its own. Only on a boot for a
+        // test with floppy steps, for the same reason.
+        if self.want_floppy_drive {
+            args.push("-device".into());
+            args.push("isa-fdc,id=fdc".into());
+            args.push("-drive".into());
+            args.push(format!("if=none,id={FLOPPY_DRIVE}"));
+            args.push("-device".into());
+            args.push(format!(
+                "floppy,bus=fdc.0,drive={FLOPPY_DRIVE},unit=0,drive-type=144,id=floppy-drive0"
+            ));
+        }
         // The install stick, named as a stick plugged in later is, so that
         // pulling it works the same way.
         if let Some((number, overlay)) = &self.boot_stick {
@@ -412,6 +445,10 @@ impl Qemu {
         if let Some(card) = self.card.take() {
             self.forget_card_out();
             self.card_out = Some(card);
+        }
+        if let Some(floppy) = self.floppy.take() {
+            self.forget_floppy_out();
+            self.floppy_out = Some(floppy);
         }
         if let Some(disc) = self.disc.take()
             && self.boot_disc.as_ref() != Some(&disc)
@@ -705,6 +742,48 @@ impl Qemu {
             let _ = fs::remove_file(self.card_file(number));
         }
     }
+
+    /// The file that floppy disk `number` holds.
+    fn floppy_file(&self, number: u32) -> PathBuf {
+        self.setup.work.join(format!("floppy-{number}.img"))
+    }
+
+    /// Puts floppy disk `number`, whose file is made, in the floppy drive:
+    /// read-only when it is write-protected, which the drive reports to
+    /// the machine as a real one does a disk's open tab.
+    fn put_floppy_in(&mut self, number: u32, protected: bool) -> Result<(), String> {
+        if !self.want_floppy_drive {
+            return Err("this boot has no floppy drive".into());
+        }
+        if let Some((floppy, _)) = self.floppy {
+            return Err(format!(
+                "floppy disk {floppy} is still in the floppy drive; take it out first"
+            ));
+        }
+        let file = self.floppy_file(number);
+        // Said either way, as QEMU otherwise keeps the mode of the disk
+        // before.
+        let mode = if protected { "read-only" } else { "read-write" };
+        self.qmp()?.execute(
+            "blockdev-change-medium",
+            &json!({
+                "device": FLOPPY_DRIVE,
+                "filename": file,
+                "format": "raw",
+                "read-only-mode": mode,
+            }),
+        )?;
+        self.floppy = Some((number, protected));
+        Ok(())
+    }
+
+    /// Deletes the file of the floppy disk taken out last, which will not
+    /// go back in.
+    fn forget_floppy_out(&mut self) {
+        if let Some((number, _)) = self.floppy_out.take() {
+            let _ = fs::remove_file(self.floppy_file(number));
+        }
+    }
 }
 
 impl Driver for Qemu {
@@ -958,6 +1037,47 @@ impl Driver for Qemu {
             Err(err) if err.contains("is locked") => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    fn want_floppy_drive(&mut self, yes: bool) {
+        self.want_floppy_drive = yes;
+    }
+
+    fn insert_floppy(&mut self, floppy: &Floppy) -> Result<(), String> {
+        if !self.want_floppy_drive {
+            return Err("this boot has no floppy drive".into());
+        }
+        if let Some((number, _)) = self.floppy {
+            return Err(format!(
+                "floppy disk {number} is still in the floppy drive; take it out first"
+            ));
+        }
+        // Running, before a file is made for the disk.
+        self.qmp()?;
+        self.floppies += 1;
+        let number = self.floppies;
+        make_medium(&floppy.holds, &self.floppy_file(number))?;
+        self.put_floppy_in(number, floppy.protected)
+    }
+
+    fn eject_floppy(&mut self) -> Result<(), String> {
+        let floppy = self.floppy.ok_or("no floppy disk is in the floppy drive")?;
+        // A floppy drive has no lock: its button lets the disk out
+        // whatever the machine is doing. By force all the same, as a card.
+        self.qmp()?.execute("eject", &json!({ "device": FLOPPY_DRIVE, "force": true }))?;
+        self.floppy = None;
+        // Only the last disk out is kept, to go back in.
+        self.forget_floppy_out();
+        self.floppy_out = Some(floppy);
+        Ok(())
+    }
+
+    fn reinsert_floppy(&mut self) -> Result<(), String> {
+        let (number, protected) =
+            self.floppy_out.ok_or("no floppy disk was taken out to put back")?;
+        self.put_floppy_in(number, protected)?;
+        self.floppy_out = None;
+        Ok(())
     }
 
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
@@ -1277,6 +1397,7 @@ fn make_medium(medium: &Stick, copy: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::machines::Firmware;
+    use crate::suite::FLOPPY_SIZES;
     use crate::testing::TempDir;
 
     fn wanted() -> bool {
@@ -1418,6 +1539,61 @@ mod tests {
         qemu.eject_disc().unwrap();
         assert_eq!(fs::metadata(&disc).unwrap().len(), 1 << 20);
         qemu.want_disc_drive(false);
+        // A floppy drive, on a boot that asks for one: disks go in, a
+        // write-protected one read-only, and come out; the one taken out
+        // last goes back in as it was.
+        let floppy = |holds, protected| Floppy { holds, protected };
+        let (small, large) = (FLOPPY_SIZES[0].1, FLOPPY_SIZES[1].1);
+        assert!(
+            qemu.insert_floppy(&floppy(Stick::Blank(large), false))
+                .unwrap_err()
+                .contains("no floppy drive")
+        );
+        qemu.want_floppy_drive(true);
+        qemu.boot_fresh().unwrap();
+        assert!(qemu.eject_floppy().unwrap_err().contains("no floppy disk"));
+        assert!(qemu.reinsert_floppy().unwrap_err().contains("no floppy disk was taken out"));
+        qemu.insert_floppy(&floppy(Stick::Blank(large), false)).unwrap();
+        assert!(
+            qemu.insert_floppy(&floppy(Stick::Blank(large), false))
+                .unwrap_err()
+                .contains("still in the floppy drive")
+        );
+        let read_only = |qemu: &mut Qemu| {
+            let devices = qemu.qmp().unwrap().execute("query-block", &json!({})).unwrap();
+            devices
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|device| device["device"] == FLOPPY_DRIVE)
+                .unwrap()["inserted"]["ro"]
+                .as_bool()
+        };
+        assert_eq!(read_only(&mut qemu), Some(false));
+        qemu.eject_floppy().unwrap();
+        assert_eq!(read_only(&mut qemu), None, "the drive is empty");
+        qemu.insert_floppy(&floppy(Stick::Blank(small), true)).unwrap();
+        let disk = dir.path().join("work/floppy-2.img");
+        assert_eq!(fs::metadata(&disk).unwrap().len(), small);
+        assert_eq!(read_only(&mut qemu), Some(true));
+        qemu.eject_floppy().unwrap();
+        qemu.reinsert_floppy().unwrap();
+        assert_eq!(read_only(&mut qemu), Some(true), "still write-protected");
+        qemu.eject_floppy().unwrap();
+        qemu.insert_floppy(&floppy(Stick::Image(disk.clone()), false)).unwrap();
+        assert_eq!(read_only(&mut qemu), Some(false));
+        qemu.eject_floppy().unwrap();
+        assert!(!disk.exists(), "only the floppy disk taken out last is kept");
+        // A disk in the drive at a power cut is out when the machine comes
+        // back, its drive empty, and goes back in as it was.
+        qemu.insert_floppy(&floppy(Stick::Blank(large), true)).unwrap();
+        qemu.power(PowerAction::Cut, soon()).unwrap();
+        qemu.power(PowerAction::On, soon()).unwrap();
+        assert_eq!(read_only(&mut qemu), None, "the new drive is empty");
+        assert!(qemu.eject_floppy().unwrap_err().contains("no floppy disk"));
+        qemu.reinsert_floppy().unwrap();
+        assert_eq!(read_only(&mut qemu), Some(true));
+        qemu.want_floppy_drive(false);
 
         // The install stick, with a blank disk of the size asked for; the
         // stick's own file is never written.
@@ -1425,7 +1601,7 @@ mod tests {
         File::options().write(true).open(&install).unwrap().set_len(1 << 20).unwrap();
         qemu.boot_stick(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-4.qcow2").is_file());
+        assert!(dir.path().join("work/disk-5.qcow2").is_file());
         assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
 
@@ -1436,7 +1612,7 @@ mod tests {
         qemu.want_disc_drive(true);
         qemu.boot_dvd(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-5.qcow2").is_file());
+        assert!(dir.path().join("work/disk-6.qcow2").is_file());
         assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
         qemu.power(PowerAction::Cut, soon()).unwrap();
         qemu.power(PowerAction::On, soon()).unwrap();

@@ -85,6 +85,9 @@ Each step has exactly one action key, and only the options that go with it.
 | `disc = "eject"` | | Opens the drive's tray and takes the disc out, whether or not the machine let go of it. | disc |
 | `disc = "reinsert"` | | Puts the disc taken out last back in. | disc |
 | `disc = "button"` | | Presses the drive's eject button: a drive whose disc the machine locked in keeps it and asks the machine to let it go; one the machine did not lock opens, and the disc is taken out. | disc |
+| `floppy = "insert"` | `image` or `blank`, `protected` | Puts a floppy disk in the floppy drive: a copy of `image`, a 720 KB or 1.44 MB disk image in the test's folder, or with `blank = "720K"` or `"1.44M"` an unformatted disk of that size. With `protected = true` its write-protect tab is open, and the drive writes nothing to it. See [Floppy drive tests](#floppy-drive-tests). | floppy |
+| `floppy = "eject"` | | Takes the disk out of the drive, whether or not the machine let go of it. | floppy |
+| `floppy = "reinsert"` | | Puts the disk taken out last back in, holding what the machine wrote on it, its tab as it was. | floppy |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
 | `type = "<text>"` | | Types the text on a US keyboard: `\n` is Enter, and `{password}` types the lab password, which is never shown or kept. A character with no key on a US keyboard is an error when the suite loads. | keys |
 | `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. An error if the screen is smaller. | mouse |
@@ -447,6 +450,58 @@ disc = "eject"
   tests are Needs you tests there.
 
 Optical drive tests live under `lab/tests/storage/` too.
+
+## Floppy drive tests
+
+A test with a `floppy` step uses a floppy drive, whose disk comes and
+goes while the drive stays (ADR 0435 in Dukovo's repository). Its
+`floppy = "insert"`, `floppy = "eject"` and `floppy = "reinsert"` steps
+put a floppy disk in, take it out and put it back.
+
+```toml
+about = "A write-protected floppy disk is mounted read-only at its label"
+time = "3m"
+
+[[step]]
+floppy = "insert"
+image = "floppy.img"
+protected = true
+# The drive is never polled: have the machine look in it.
+[[step]]
+run = "rdisk --reread /devices/fd0"
+root = true
+[[step]]
+wait = "3s"
+[[step]]
+run = "findmnt /volumes/LABFLOPPY"
+expect = ["vfat", "ro"]
+```
+
+- A disk is a 720 KB (737280 bytes) or 1.44 MB (1474560 bytes) image in
+  the test's folder, such as `mkfs.fat -C -n LABFLOPPY floppy.img 1440`
+  makes, copied for each `insert` so the test's file is never written;
+  an image of another size is an error when the suite loads. A `blank`
+  disk is all zeros, as a disk never formatted reads.
+- On QEMU the drive is a 3.5-inch 1.44 MB drive, which reads 720 KB
+  disks too, on an ISA floppy disk controller, with no disk in it at
+  boot. It is there only on a boot for a test with `floppy` steps, so
+  that its empty drive never shows up in another test's disks: a floppy
+  test always boots afresh, and its boot is never shared with the test
+  after it.
+- A floppy drive cannot tell the machine a disk went in, so Dukovo never
+  polls it: it looks in the drive at boot and when asked, as
+  `rdisk --reread` above does, and finds a disk taken out at the next
+  read. Give a step that reads the disk a moment after the look.
+- `protected = true` opens the disk's write-protect tab: the drive
+  reports the disk write-protected and refuses writes, as a real one
+  does. `floppy = "reinsert"` puts the disk back with its tab as it was.
+- `floppy = "eject"` takes the disk out at once, as the drive's button
+  does: a floppy drive has no lock, so whether the machine let go of the
+  disk first is for the test's own steps to check, as with `eject`.
+- On a real machine a person puts the disk in and takes it out, so
+  floppy tests are Needs you tests there.
+
+Floppy drive tests live under `lab/tests/storage/` too.
 
 ## How a test runs
 
