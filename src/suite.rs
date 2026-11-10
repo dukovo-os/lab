@@ -143,6 +143,43 @@ pub struct Test {
     pub host_needs: Vec<String>,
 }
 
+/// The card reader a test's memory cards go in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reader {
+    /// A card reader on USB, which any machine can have plugged in:
+    /// `card` steps.
+    Usb,
+    /// The machine's own SD card reader, on PCI, as a laptop's is: `sd`
+    /// steps.
+    Sd,
+}
+
+impl Reader {
+    /// The control its steps need.
+    pub fn control(self) -> Control {
+        match self {
+            Reader::Usb => Control::Card,
+            Reader::Sd => Control::Sd,
+        }
+    }
+
+    /// What the steps call it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Reader::Usb => "card reader",
+            Reader::Sd => "SD card slot",
+        }
+    }
+
+    /// Its action key in a test file.
+    fn key(self) -> &'static str {
+        match self {
+            Reader::Usb => "card",
+            Reader::Sd => "sd",
+        }
+    }
+}
+
 /// What a test's machine boots from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Boot {
@@ -181,15 +218,15 @@ pub enum Step {
     PlugUsb(Stick),
     /// Pulls the USB stick out.
     UnplugUsb,
-    /// Puts a memory card in the machine's card reader: the image or
-    /// blank a [`Stick`] says, on a card.
-    InsertCard(Stick),
+    /// Puts a memory card in the machine's card reader of this kind: the
+    /// image or blank a [`Stick`] says, on a card.
+    InsertCard(Reader, Stick),
     /// Takes the memory card out of the card reader, whether or not the
     /// machine let it go.
-    RemoveCard,
+    RemoveCard(Reader),
     /// Puts the memory card taken out last back in, holding what the
     /// machine wrote on it.
-    ReinsertCard,
+    ReinsertCard(Reader),
     /// Puts a disc holding this image, beside the test, in the machine's
     /// optical drive.
     InsertDisc(PathBuf),
@@ -364,7 +401,9 @@ impl Step {
             Step::Power(_) | Step::WaitOff => Some(Control::Power),
             Step::Link(_) => Some(Control::Link),
             Step::PlugUsb(_) | Step::UnplugUsb => Some(Control::Usb),
-            Step::InsertCard(_) | Step::RemoveCard | Step::ReinsertCard => Some(Control::Card),
+            Step::InsertCard(reader, _) | Step::RemoveCard(reader) | Step::ReinsertCard(reader) => {
+                Some(reader.control())
+            }
             Step::InsertDisc(_) | Step::EjectDisc | Step::ReinsertDisc | Step::PressDiscButton => {
                 Some(Control::Disc)
             }
@@ -404,15 +443,23 @@ impl Step {
                 format!("plug in a blank USB stick of {}", format_size(*bytes))
             }
             Step::UnplugUsb => "pull the USB stick".into(),
-            Step::InsertCard(Stick::Image(image)) => {
+            Step::InsertCard(reader, Stick::Image(image)) => {
                 let name = image.file_name().unwrap_or_default().to_string_lossy();
-                format!("put a memory card holding {name} in the card reader")
+                format!("put a memory card holding {name} in the {}", reader.name())
             }
-            Step::InsertCard(Stick::Blank(bytes)) => {
-                format!("put a blank memory card of {} in the card reader", format_size(*bytes))
+            Step::InsertCard(reader, Stick::Blank(bytes)) => {
+                format!(
+                    "put a blank memory card of {} in the {}",
+                    format_size(*bytes),
+                    reader.name()
+                )
             }
-            Step::RemoveCard => "take the memory card out of the card reader".into(),
-            Step::ReinsertCard => "put the memory card back in the card reader".into(),
+            Step::RemoveCard(reader) => {
+                format!("take the memory card out of the {}", reader.name())
+            }
+            Step::ReinsertCard(reader) => {
+                format!("put the memory card back in the {}", reader.name())
+            }
             Step::InsertDisc(image) => {
                 let name = image.file_name().unwrap_or_default().to_string_lossy();
                 format!("put a disc holding {name} in the optical drive")
@@ -493,6 +540,17 @@ fn describe_command(command: &Command) -> String {
 }
 
 impl Test {
+    /// The card reader its card or sd steps put cards in, which its boot
+    /// gives the machine, if it has any: one kind, as loading checked.
+    pub fn card_reader(&self) -> Option<Reader> {
+        self.steps.iter().find_map(|step| match step {
+            Step::InsertCard(reader, _) | Step::RemoveCard(reader) | Step::ReinsertCard(reader) => {
+                Some(*reader)
+            }
+            _ => None,
+        })
+    }
+
     /// Every control the test needs: its steps', and power and serial for
     /// the boot every test starts with.
     pub fn controls(&self) -> BTreeSet<Control> {
@@ -638,6 +696,7 @@ struct StepFile {
     link: Option<LinkState>,
     usb: Option<UsbAction>,
     card: Option<CardAction>,
+    sd: Option<CardAction>,
     disc: Option<DiscAction>,
     floppy: Option<FloppyAction>,
     image: Option<String>,
@@ -813,19 +872,31 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         steps.push(step);
     }
     // A card, disc or floppy disk is put back only once one was taken
-    // out.
+    // out. A test's cards all go in one reader, the one its boot has.
     let (mut card_out, mut disc_out, mut floppy_out) = (false, false, false);
+    let mut readers = steps.iter().filter_map(|step| match step {
+        Step::InsertCard(reader, _) | Step::RemoveCard(reader) | Step::ReinsertCard(reader) => {
+            Some(*reader)
+        }
+        _ => None,
+    });
+    if let Some(first) = readers.next()
+        && readers.any(|reader| reader != first)
+    {
+        return Err(bad("its cards go in one reader: card steps or sd steps, not both".into()));
+    }
     for (index, step) in steps.iter().enumerate() {
         match step {
-            Step::RemoveCard => card_out = true,
-            Step::InsertCard(_) => card_out = false,
-            Step::ReinsertCard if !card_out => {
+            Step::RemoveCard(_) => card_out = true,
+            Step::InsertCard(..) => card_out = false,
+            Step::ReinsertCard(reader) if !card_out => {
                 return Err(bad(format!(
-                    "step {}: card = \"reinsert\" puts back a card the test took out, and none is out",
-                    index + 1
+                    "step {}: {} = \"reinsert\" puts back a card the test took out, and none is out",
+                    index + 1,
+                    reader.key()
                 )));
             }
-            Step::ReinsertCard => card_out = false,
+            Step::ReinsertCard(_) => card_out = false,
             Step::EjectDisc | Step::PressDiscButton => disc_out = true,
             Step::InsertDisc(_) => disc_out = false,
             Step::ReinsertDisc if !disc_out => {
@@ -878,6 +949,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("link", step.link.is_some()),
         ("usb", step.usb.is_some()),
         ("card", step.card.is_some()),
+        ("sd", step.sd.is_some()),
         ("disc", step.disc.is_some()),
         ("floppy", step.floppy.is_some()),
         ("keys", step.keys.is_some()),
@@ -896,7 +968,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, attack, host, serial, power, link, usb, card, disc, floppy, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, host, serial, power, link, usb, card, sd, disc, floppy, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -950,11 +1022,11 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     only_with("limit", step.limit.is_some(), "bench")?;
     // A stick's, a card's, a disc's or a floppy disk's: what it holds. A
     // disc is never blank: a blank one holds nothing to read.
-    if step.image.is_some() && !matches!(given[0], "usb" | "card" | "disc" | "floppy") {
-        return Err("image goes only with usb, card, disc or floppy".into());
+    if step.image.is_some() && !matches!(given[0], "usb" | "card" | "sd" | "disc" | "floppy") {
+        return Err("image goes only with usb, card, sd, disc or floppy".into());
     }
-    if step.blank.is_some() && !matches!(given[0], "usb" | "card" | "floppy") {
-        return Err("blank goes only with usb, card or floppy".into());
+    if step.blank.is_some() && !matches!(given[0], "usb" | "card" | "sd" | "floppy") {
+        return Err("blank goes only with usb, card, sd or floppy".into());
     }
     only_with("protected", step.protected.is_some(), "floppy")?;
 
@@ -1031,18 +1103,24 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
             }
         };
     }
-    if let Some(action) = step.card {
+    let card = match (step.card, step.sd) {
+        (Some(action), _) => Some((Reader::Usb, action)),
+        (None, Some(action)) => Some((Reader::Sd, action)),
+        (None, None) => None,
+    };
+    if let Some((reader, action)) = card {
+        let key = reader.key();
         return match action {
             CardAction::Remove | CardAction::Reinsert
                 if step.image.is_some() || step.blank.is_some() =>
             {
-                Err("only card = \"insert\" takes an image or blank".into())
+                Err(format!("only {key} = \"insert\" takes an image or blank"))
             }
-            CardAction::Remove => Ok(Step::RemoveCard),
-            CardAction::Reinsert => Ok(Step::ReinsertCard),
+            CardAction::Remove => Ok(Step::RemoveCard(reader)),
+            CardAction::Reinsert => Ok(Step::ReinsertCard(reader)),
             CardAction::Insert => {
-                parse_medium("card = \"insert\"", "card", step.image, step.blank, folder)
-                    .map(Step::InsertCard)
+                parse_medium(&format!("{key} = \"insert\""), "card", step.image, step.blank, folder)
+                    .map(|card| Step::InsertCard(reader, card))
             }
         };
     }
@@ -1650,18 +1728,19 @@ expect = "1 received"
         );
         let tests = load(dir.path()).unwrap();
         let image = dir.path().join("features/card.img");
-        assert_eq!(tests[0].steps[0], Step::InsertCard(Stick::Image(image)));
+        assert_eq!(tests[0].steps[0], Step::InsertCard(Reader::Usb, Stick::Image(image)));
         assert_eq!(
             tests[0].steps[0].describe(),
             "put a memory card holding card.img in the card reader"
         );
-        assert_eq!(tests[0].steps[1], Step::RemoveCard);
+        assert_eq!(tests[0].steps[1], Step::RemoveCard(Reader::Usb));
         assert_eq!(tests[0].steps[1].describe(), "take the memory card out of the card reader");
-        assert_eq!(tests[0].steps[2], Step::InsertCard(Stick::Blank(32 << 20)));
-        assert_eq!(tests[0].steps[4], Step::ReinsertCard);
+        assert_eq!(tests[0].steps[2], Step::InsertCard(Reader::Usb, Stick::Blank(32 << 20)));
+        assert_eq!(tests[0].steps[4], Step::ReinsertCard(Reader::Usb));
         assert_eq!(tests[0].steps[4].describe(), "put the memory card back in the card reader");
         assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Card)));
         assert!(tests[0].controls().contains(&Control::Card));
+        assert_eq!(tests[0].card_reader(), Some(Reader::Usb));
         for (step, complaint) in [
             ("card = \"insert\"", "card = \"insert\" needs image"),
             ("card = \"remove\"\nblank = \"8M\"", "only card = \"insert\" takes an image or blank"),
@@ -1677,6 +1756,50 @@ expect = "1 received"
         ] {
             dir.write(
                 "features/card.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
+            assert!(why.contains(complaint), "{step}: {why}");
+        }
+    }
+
+    #[test]
+    fn an_sd_card_is_put_in_and_taken_out_of_the_sd_card_slot() {
+        let dir = TempDir::new("suite-sd");
+        dir.write("features/card.img", "");
+        dir.write(
+            "features/sd.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nsd = \"insert\"\nimage = \"card.img\"\n\
+             [[step]]\nsd = \"remove\"\n[[step]]\nsd = \"reinsert\"\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        let image = dir.path().join("features/card.img");
+        assert_eq!(tests[0].steps[0], Step::InsertCard(Reader::Sd, Stick::Image(image)));
+        assert_eq!(
+            tests[0].steps[0].describe(),
+            "put a memory card holding card.img in the SD card slot"
+        );
+        assert_eq!(tests[0].steps[1], Step::RemoveCard(Reader::Sd));
+        assert_eq!(tests[0].steps[1].describe(), "take the memory card out of the SD card slot");
+        assert_eq!(tests[0].steps[2], Step::ReinsertCard(Reader::Sd));
+        assert!(tests[0].steps.iter().all(|step| step.control() == Some(Control::Sd)));
+        assert!(tests[0].controls().contains(&Control::Sd));
+        assert!(!tests[0].controls().contains(&Control::Card));
+        assert_eq!(tests[0].card_reader(), Some(Reader::Sd));
+        for (step, complaint) in [
+            ("sd = \"insert\"", "sd = \"insert\" needs image"),
+            ("sd = \"remove\"\nblank = \"8M\"", "only sd = \"insert\" takes an image or blank"),
+            ("sd = \"reinsert\"", "sd = \"reinsert\" puts back a card"),
+            ("sd = \"insert\"\nblank = \"8G\"", "a size from 1M to 4G"),
+            ("sd = \"insert\"\ncard = \"insert\"\nblank = \"8M\"", "one action per step"),
+            (
+                "sd = \"insert\"\nblank = \"8M\"\n[[step]]\ncard = \"remove\"",
+                "its cards go in one reader",
+            ),
+            ("sd = \"open\"", "sd"),
+        ] {
+            dir.write(
+                "features/sd.toml",
                 &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
             );
             let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
@@ -1711,7 +1834,7 @@ expect = "1 received"
         assert!(tests[0].controls().contains(&Control::Disc));
         for (step, complaint) in [
             ("disc = \"insert\"", "disc = \"insert\" needs image"),
-            ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb, card or floppy"),
+            ("disc = \"insert\"\nblank = \"8M\"", "blank goes only with usb, card, sd or floppy"),
             ("disc = \"insert\"\nimage = \"none.iso\"", "does not exist"),
             ("disc = \"eject\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
             ("disc = \"button\"\nimage = \"disc.iso\"", "only disc = \"insert\" takes an image"),
@@ -1719,7 +1842,7 @@ expect = "1 received"
             ("disc = \"open\"", "disc"),
             (
                 "run = \"ls\"\nimage = \"disc.iso\"",
-                "image goes only with usb, card, disc or floppy",
+                "image goes only with usb, card, sd, disc or floppy",
             ),
         ] {
             dir.write(

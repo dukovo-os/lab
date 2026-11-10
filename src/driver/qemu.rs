@@ -17,8 +17,10 @@
 //! `system_reset` and `quit` (the cord), the network cable to `set_link`,
 //! a USB stick to `blockdev-add` and `device_add usb-storage` on an xhci
 //! controller, a memory card to `blockdev-change-medium` and `eject` on
-//! a card reader (a `usb-storage` whose medium is removable, empty at
-//! boot, there only for a test with card steps), a disc to the same on
+//! a card reader (a `usb-storage` whose medium is removable for card
+//! steps, or an `sd-card` in an `sdhci-pci` SD card reader for sd steps,
+//! empty at boot, there only for a test with such steps), a disc to the
+//! same on
 //! an optical drive (an `ide-cd` on the q35 chipset's AHCI controller,
 //! empty at boot, there only for a test with disc steps), a floppy disk
 //! to the same on a floppy drive (a 3.5-inch 1.44 MB `floppy` on an
@@ -49,13 +51,16 @@ use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
 use crate::screen::Image;
 use crate::ssh;
-use crate::suite::{Button, Floppy, PowerAction, Stick};
+use crate::suite::{Button, Floppy, PowerAction, Reader, Stick};
 
 /// The QEMU binary.
 const QEMU: &str = "qemu-system-x86_64";
 
 /// The network device's id, which `set_link` and `hostfwd_add` name.
 const NETDEV: &str = "lab0";
+
+/// The SD card reader of a test with sd steps, on PCI.
+const SD_READER: &str = "sd-card-reader";
 
 /// The card reader's drive, which a card goes in and comes out of.
 const CARD_DRIVE: &str = "card-reader";
@@ -121,9 +126,9 @@ pub struct Qemu {
     cards: u32,
     card: Option<u32>,
     card_out: Option<u32>,
-    /// Whether the next fresh boot gives the machine an empty card reader,
-    /// set by [`Driver::want_card_reader`].
-    want_card_reader: bool,
+    /// The empty card reader the next fresh boot gives the machine, if
+    /// any, set by [`Driver::want_card_reader`].
+    want_card_reader: Option<Reader>,
     /// The image of the disc in the optical drive now, and of the one
     /// taken out last, to go back in. The guest never writes a disc, so
     /// it is the test's own file, opened read-only.
@@ -215,7 +220,7 @@ impl Qemu {
             cards: 0,
             card: None,
             card_out: None,
-            want_card_reader: false,
+            want_card_reader: None,
             disc: None,
             disc_out: None,
             want_disc_drive: false,
@@ -348,17 +353,26 @@ impl Qemu {
         // test points at a pixel rather than moving by guesswork.
         args.push("-device".into());
         args.push("usb-tablet,bus=xhci.0,id=pointer".into());
-        // A card reader, empty: a USB one, as QEMU has no other a card
-        // can be put in and taken out of while it runs. Only on a boot for
-        // a test with card steps, as its drive would show up in a disk
+        // A card reader, empty: a USB one, or an SD card reader on PCI,
+        // whose slot holds an SD card with no medium. Only on a boot for a
+        // test with card or sd steps, as its drive would show up in a disk
         // test.
-        if self.want_card_reader {
+        if let Some(reader) = self.want_card_reader {
             args.push("-drive".into());
             args.push(format!("if=none,id={CARD_DRIVE}"));
             args.push("-device".into());
-            args.push(format!(
-                "usb-storage,bus=xhci.0,drive={CARD_DRIVE},id=usb-card-reader,removable=on"
-            ));
+            match reader {
+                Reader::Usb => args.push(format!(
+                    "usb-storage,bus=xhci.0,drive={CARD_DRIVE},id=usb-card-reader,removable=on"
+                )),
+                Reader::Sd => {
+                    args.push(format!("sdhci-pci,id={SD_READER}"));
+                    args.push("-device".into());
+                    args.push(format!(
+                        "sd-card,drive={CARD_DRIVE},bus=pcie.0/{SD_READER}/sd-bus,id=sd-slot"
+                    ));
+                }
+            }
         }
         // An optical drive: a DVD drive on the chipset's AHCI controller's
         // second port, after a SATA disk's first. Only on a boot for a
@@ -939,14 +953,14 @@ impl Driver for Qemu {
         Ok(())
     }
 
-    fn want_card_reader(&mut self, yes: bool) {
-        self.want_card_reader = yes;
+    fn want_card_reader(&mut self, reader: Option<Reader>) {
+        self.want_card_reader = reader;
     }
 
     fn insert_card(&mut self, card: &Stick) -> Result<(), String> {
-        if !self.want_card_reader {
+        let Some(reader) = self.want_card_reader else {
             return Err("this boot has no card reader".into());
-        }
+        };
         if let Some(card) = self.card {
             return Err(format!(
                 "memory card {card} is still in the card reader; take it out first"
@@ -956,7 +970,11 @@ impl Driver for Qemu {
         self.qmp()?;
         self.cards += 1;
         let number = self.cards;
-        make_medium(card, &self.card_file(number))?;
+        let file = self.card_file(number);
+        make_medium(card, &file)?;
+        if reader == Reader::Sd {
+            sd_size(&file)?;
+        }
         self.put_card_in(number)
     }
 
@@ -973,7 +991,7 @@ impl Driver for Qemu {
     }
 
     fn reinsert_card(&mut self) -> Result<(), String> {
-        if !self.want_card_reader {
+        if self.want_card_reader.is_none() {
             return Err("this boot has no card reader".into());
         }
         if let Some(card) = self.card {
@@ -1376,6 +1394,17 @@ fn option_value(path: &Path) -> String {
     path.display().to_string().replace(',', ",,")
 }
 
+/// Pads the SD card at `card` to a power of two in size, as QEMU's SD
+/// cards must be; a card of another size is never put in.
+fn sd_size(card: &Path) -> Result<(), String> {
+    let pad = || {
+        let file = OpenOptions::new().write(true).open(card)?;
+        let size = file.metadata()?.len();
+        file.set_len(size.next_power_of_two())
+    };
+    pad().map_err(|err| format!("padding the SD card {}: {err}", card.display()))
+}
+
 /// Makes what a stick or card holds at `copy`: a copy of its image, so
 /// the test's own file stays as it is whatever the guest writes, or
 /// zeros, as one fresh from the shop holds.
@@ -1497,7 +1526,7 @@ mod tests {
         assert!(qemu.power(PowerAction::On, soon()).unwrap_err().contains("already on"));
         // A card reader, on a boot that asks for one: cards go in and come
         // out, by force, while the reader stays.
-        qemu.want_card_reader(true);
+        qemu.want_card_reader(Some(Reader::Usb));
         qemu.boot_fresh().unwrap();
         assert!(!dir.path().join("work/disk-1.qcow2").exists(), "the old boot's disk is gone");
         assert!(qemu.remove_card().unwrap_err().contains("no memory card"));
@@ -1517,7 +1546,18 @@ mod tests {
         qemu.insert_card(&Stick::Blank(1 << 20)).unwrap();
         qemu.remove_card().unwrap();
         assert!(!card.exists(), "only the card taken out last is kept");
-        qemu.want_card_reader(false);
+        // An SD card reader on PCI: an SD card goes in, padded to a power
+        // of two as QEMU's must be, comes out by force and goes back in.
+        qemu.want_card_reader(Some(Reader::Sd));
+        qemu.boot_fresh().unwrap();
+        assert!(qemu.remove_card().unwrap_err().contains("no memory card"));
+        qemu.insert_card(&Stick::Blank(3 << 20)).unwrap();
+        let sd = dir.path().join("work/card-4.img");
+        assert_eq!(fs::metadata(&sd).unwrap().len(), 4 << 20);
+        qemu.remove_card().unwrap();
+        qemu.reinsert_card().unwrap();
+        qemu.remove_card().unwrap();
+        qemu.want_card_reader(None);
         // An optical drive, on a boot that asks for one: a disc goes in,
         // is ejected by force, and goes back in; its file is never
         // written.
@@ -1601,7 +1641,7 @@ mod tests {
         File::options().write(true).open(&install).unwrap().set_len(1 << 20).unwrap();
         qemu.boot_stick(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-5.qcow2").is_file());
+        assert!(dir.path().join("work/disk-6.qcow2").is_file());
         assert!(qemu.unplug_usb().is_ok(), "the install stick pulls as any stick does");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
 
@@ -1612,7 +1652,7 @@ mod tests {
         qemu.want_disc_drive(true);
         qemu.boot_dvd(&install, 1 << 30).unwrap();
         assert!(qemu.is_on());
-        assert!(dir.path().join("work/disk-6.qcow2").is_file());
+        assert!(dir.path().join("work/disk-7.qcow2").is_file());
         assert!(qemu.insert_disc(&disc).unwrap_err().contains("still in the optical drive"));
         qemu.power(PowerAction::Cut, soon()).unwrap();
         qemu.power(PowerAction::On, soon()).unwrap();

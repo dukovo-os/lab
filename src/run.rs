@@ -558,8 +558,9 @@ impl<'a> Worker<'a> {
         self.driver.want_attacker(attacks);
         // So does a test that puts cards in a card reader, whose reader,
         // an empty drive, a disk test must not find either.
-        let cards = test.controls().contains(&Control::Card);
-        self.driver.want_card_reader(cards);
+        let reader = test.card_reader();
+        self.driver.want_card_reader(reader);
+        let cards = reader.is_some();
         // And one that puts discs in an optical drive, as empty, or
         // floppy disks in a floppy drive.
         let discs = test.controls().contains(&Control::Disc);
@@ -873,13 +874,14 @@ impl<'a> Worker<'a> {
                 self.driver.plug_usb(stick).map(|()| None).map_err(StepFailure::Error)
             }
             Step::UnplugUsb => self.driver.unplug_usb().map(|()| None).map_err(StepFailure::Error),
-            Step::InsertCard(card) => {
+            // The boot gave the machine the reader the test's steps name.
+            Step::InsertCard(_, card) => {
                 self.driver.insert_card(card).map(|()| None).map_err(StepFailure::Error)
             }
-            Step::RemoveCard => {
+            Step::RemoveCard(_) => {
                 self.driver.remove_card().map(|()| None).map_err(StepFailure::Error)
             }
-            Step::ReinsertCard => {
+            Step::ReinsertCard(_) => {
                 self.driver.reinsert_card().map(|()| None).map_err(StepFailure::Error)
             }
             Step::InsertDisc(image) => {
