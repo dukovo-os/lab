@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: 2026 The Dukovo contributors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Just enough HTTP/1.1 for the runner page: one request per connection,
-//! read with hard limits, answered and closed.
+//! Just enough HTTP/1.1 for the runner page and real machines: one
+//! request per connection, read with hard limits, answered and closed.
 //!
-//! The page is served to a browser on the same PC (see ui.rs), so this
-//! needs none of what a public web server does; it saves a dependency and
-//! keeps everything the page can reach in one short file.
+//! The page is served to a browser on the same PC (see ui.rs), and the
+//! net-boot server to a machine on the lab's own network (see
+//! netboot.rs), so this needs none of what a public web server does; it
+//! saves a dependency and keeps everything they can reach in one short
+//! file. [`send`] is the other side, for talking to Intel AMT (see
+//! wsman.rs).
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// The most a request's line and headers may hold.
@@ -166,28 +169,178 @@ fn decode(text: &str) -> String {
 
 /// Writes `response` to `stream` and closes the connection.
 pub fn write_response(mut stream: &TcpStream, response: &Response) {
-    let reason = match response.status {
-        200 => "OK",
-        303 => "See Other",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        421 => "Misdirected Request",
-        _ => "Error",
-    };
-    let mut head = format!(
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
-        response.content_type,
-        response.body.len()
-    );
+    let mut head = head(response.status, response.content_type, response.body.len() as u64);
     for (name, value) in &response.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(&response.body));
     let _ = stream.flush();
+}
+
+/// Writes an answer's head, for a body of `length` bytes the caller
+/// writes after it, as it reads them: a file too big to hold at once.
+pub fn write_head(
+    mut stream: &TcpStream,
+    status: u16,
+    content_type: &str,
+    length: u64,
+) -> std::io::Result<()> {
+    let mut head = head(status, content_type, length);
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())
+}
+
+/// An answer's status line and the headers every answer has.
+fn head(status: u16, content_type: &str, length: u64) -> String {
+    let reason = match status {
+        200 => "OK",
+        303 => "See Other",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        421 => "Misdirected Request",
+        _ => "Error",
+    };
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {length}\r\nConnection: close\r\n"
+    )
+}
+
+/// The most an answer to [`send`] may hold: AMT's longest, a list of its
+/// firmware's parts, is tens of kilobytes.
+const ANSWER_LIMIT: usize = 4 << 20;
+
+/// What a server answered to [`send`].
+#[derive(Debug)]
+pub struct Answer {
+    pub status: u16,
+    /// Header names in lower case.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Answer {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str())
+    }
+}
+
+/// Sends one request to `address` (`host:port`) and reads the whole
+/// answer, giving up when connecting or any read takes longer than
+/// `time`.
+pub fn send(
+    address: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+    time: Duration,
+) -> Result<Answer, String> {
+    let to = address
+        .to_socket_addrs()
+        .map_err(|err| format!("{address}: {err}"))?
+        .next()
+        .ok_or_else(|| format!("{address}: no address"))?;
+    let mut stream = TcpStream::connect_timeout(&to, time)
+        .map_err(|err| format!("connecting to {address}: {err}"))?;
+    stream.set_read_timeout(Some(time)).map_err(|err| err.to_string())?;
+    stream.set_write_timeout(Some(time)).map_err(|err| err.to_string())?;
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .map_err(|err| format!("sending to {address}: {err}"))?;
+    read_answer(&mut BufReader::new(stream.take(ANSWER_LIMIT as u64 + 64 * 1024)))
+        .map_err(|err| format!("reading {address}'s answer: {err}"))
+}
+
+/// Reads an answer: its head, then a body of Content-Length bytes, in
+/// chunks, or up to the end of the connection.
+fn read_answer(reader: &mut impl BufRead) -> Result<Answer, String> {
+    let mut line = String::new();
+    let mut next_line = |line: &mut String| -> Result<(), String> {
+        line.clear();
+        let read = reader.read_line(line).map_err(|err| err.to_string())?;
+        if read == 0 || line.len() > HEAD_LIMIT {
+            return Err("the answer is cut short".into());
+        }
+        Ok(())
+    };
+    next_line(&mut line)?;
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .ok_or_else(|| format!("a bad status line: {}", line.trim()))?;
+    let mut headers = Vec::new();
+    loop {
+        next_line(&mut line)?;
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':').ok_or("a bad header line")?;
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+    }
+    let mut answer = Answer { status, headers, body: Vec::new() };
+    let chunked = answer
+        .header("transfer-encoding")
+        .is_some_and(|coding| coding.to_ascii_lowercase().contains("chunked"));
+    if chunked {
+        answer.body = read_chunks(reader)?;
+    } else if let Some(length) = answer.header("content-length") {
+        let length: usize = length.parse().map_err(|_| "a bad Content-Length")?;
+        if length > ANSWER_LIMIT {
+            return Err("the answer is too long".into());
+        }
+        answer.body = vec![0; length];
+        reader.read_exact(&mut answer.body).map_err(|err| err.to_string())?;
+    } else {
+        reader.read_to_end(&mut answer.body).map_err(|err| err.to_string())?;
+    }
+    Ok(answer)
+}
+
+/// Reads a chunked body, and the trailer after it.
+fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        let size = line.trim().split(';').next().unwrap_or_default();
+        let size = usize::from_str_radix(size, 16)
+            .map_err(|_| format!("a bad chunk size: {}", line.trim()))?;
+        if size == 0 {
+            break;
+        }
+        if body.len() + size > ANSWER_LIMIT {
+            return Err("the answer is too long".into());
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..]).map_err(|err| err.to_string())?;
+        line.clear();
+        reader.read_line(&mut line).map_err(|err| err.to_string())?;
+    }
+    // The trailer, ended by an empty line.
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        if read == 0 || line.trim().is_empty() {
+            return Ok(body);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +369,24 @@ mod tests {
         assert!(parse(&mut big.as_bytes()).is_err());
         assert_eq!(decode("%2e%2E%2fx%"), "../x%");
         assert_eq!(decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn reads_answers_of_each_kind() {
+        let sized = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-A: b\r\n\r\nhello and more";
+        let answer = read_answer(&mut sized.as_bytes()).unwrap();
+        assert_eq!((answer.status, answer.body.as_slice()), (200, &b"hello"[..]));
+        assert_eq!(answer.header("x-a"), Some("b"));
+        let chunked = "HTTP/1.1 401 Unauthorized\r\nTransfer-Encoding: chunked\r\n\r\n\
+                       4\r\nWiki\r\n6;x=y\r\npedia \r\n0\r\nX-T: 1\r\n\r\n";
+        let answer = read_answer(&mut chunked.as_bytes()).unwrap();
+        assert_eq!((answer.status, answer.body.as_slice()), (401, &b"Wikipedia "[..]));
+        let to_close = "HTTP/1.0 200 OK\r\n\r\nall of it";
+        assert_eq!(read_answer(&mut to_close.as_bytes()).unwrap().body, b"all of it");
+        assert!(
+            read_answer(&mut "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort".as_bytes())
+                .is_err()
+        );
+        assert!(read_answer(&mut "nonsense\r\n\r\n".as_bytes()).is_err());
     }
 }

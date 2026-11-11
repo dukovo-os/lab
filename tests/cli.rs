@@ -547,3 +547,57 @@ fn install_puts_the_timer_in_place_and_turns_it_on() {
     assert!(answer["error"].as_str().unwrap().contains("Failed to connect to bus"), "{answer}");
     assert!(!units.join("dukovo-lab-schedules.timer").exists());
 }
+
+#[test]
+fn machines_check_says_what_a_real_machine_lacks() {
+    let setting = Setting::new("check");
+    // A real machine whose AMT is not there: nothing listens on AMT's
+    // port on this PC, and there is no serial cable or writer.
+    let password = setting.dir.join("config/machines/amt-password");
+    fs::write(&password, "not-the-password\n").unwrap();
+    fs::set_permissions(&password, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(
+        setting.dir.join("config/machines/box.toml"),
+        format!(
+            "about = \"a real machine\"\ndriver = \"amt\"\n[amt]\naddress = \"127.0.0.1\"\n\
+             password_file = \"amt-password\"\nmac = \"aa:bb:cc:00:11:22\"\ndisk = \"TESTDISK\"\n\
+             serial = \"{}\"\nlab_address = \"127.0.0.1\"\nboot_port = 0\ntftp = \"{}\"\n\
+             writer = \"{}\"\n",
+            setting.dir.join("ttyUSB9").display(),
+            setting.dir.join("tftp").display(),
+            setting.dir.join("writer").display(),
+        ),
+    )
+    .unwrap();
+    let (status, answer) = setting.run(&["machines", "check"]);
+    assert_eq!(status, Some(3), "{answer}");
+    let machines = answer["machines"].as_array().unwrap();
+    let verdicts = |name: &str| -> Vec<(String, String)> {
+        let machine = machines.iter().find(|machine| machine["name"] == name).unwrap();
+        machine["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| {
+                (check["check"].as_str().unwrap().into(), check["verdict"].as_str().unwrap().into())
+            })
+            .collect()
+    };
+    let real = verdicts("box");
+    let verdict = |name: &str| real.iter().find(|(check, _)| check == name).map(|(_, v)| v.clone());
+    assert_eq!(verdict("password").as_deref(), Some("ok"));
+    assert_eq!(verdict("amt").as_deref(), Some("problem"));
+    assert_eq!(verdict("serial port").as_deref(), Some("problem"));
+    assert_eq!(verdict("lab network").as_deref(), Some("ok"));
+    assert_eq!(verdict("tftp").as_deref(), Some("ok"));
+    assert_eq!(verdict("writer").as_deref(), Some("problem"));
+    // QEMU machines have nothing to check.
+    assert!(verdicts("qemu").is_empty());
+    // One machine by name; an unknown one is a usage error.
+    let (status, _) = setting.run(&["machines", "check", "qemu"]);
+    assert_eq!(status, Some(0));
+    let (status, _) = setting.run(&["machines", "check", "nowhere"]);
+    assert_eq!(status, Some(2));
+    let (status, _) = setting.run(&["machines", "nonsense"]);
+    assert_eq!(status, Some(2));
+}

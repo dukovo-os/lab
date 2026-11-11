@@ -148,6 +148,10 @@ pub enum Who {
 pub enum DriverKind {
     /// A QEMU virtual machine on the lab PC.
     Qemu,
+    /// A real machine with Intel AMT, on the lab network: power and the
+    /// next boot through AMT, a fresh disk for each test through net
+    /// boot, its console through a serial cable to the lab PC.
+    Amt,
 }
 
 /// Firmware a QEMU machine boots through.
@@ -244,6 +248,78 @@ impl Default for QemuSettings {
     }
 }
 
+/// How the lab reaches a real machine with Intel AMT, and boots it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AmtSettings {
+    /// AMT's address on the lab network, as set in the machine's MEBx.
+    pub address: String,
+    /// AMT's user.
+    #[serde(default = "default_amt_user")]
+    pub user: String,
+    /// A file holding AMT's password, and nothing else, readable by this
+    /// user alone. A relative path is from the machine file's folder.
+    pub password_file: PathBuf,
+    /// The MAC address of the machine's network card on the lab network,
+    /// which it boots from the network with.
+    pub mac: String,
+    /// The serial number of the disk the image is written to, the only
+    /// disk the writer may write (`lsblk -o NAME,SERIAL` shows it).
+    pub disk: String,
+    /// The lab PC's serial port that the machine's console is cabled to.
+    pub serial: PathBuf,
+    /// The serial console's speed.
+    #[serde(default = "default_baud")]
+    pub baud: u32,
+    /// The machine's address on the lab network, for SSH and the lab
+    /// PC's clients (`{machine}`).
+    #[serde(default = "default_machine_address")]
+    pub machine_address: String,
+    /// The lab PC's address on the lab network: the net-boot server
+    /// listens on it, and tests reach the lab PC there (`{peer}`).
+    #[serde(default = "default_lab_address")]
+    pub lab_address: String,
+    /// The net-boot server's port.
+    #[serde(default = "default_boot_port")]
+    pub boot_port: u16,
+    /// dnsmasq's TFTP folder, which boot scripts are written into.
+    #[serde(default = "default_tftp")]
+    pub tftp: PathBuf,
+    /// The writer's kit: its kernel, initrd and command line, as `ob lab`
+    /// installs it.
+    #[serde(default = "default_writer")]
+    pub writer: PathBuf,
+    /// The serial console as Linux names it, for the writer and the Linux
+    /// twin: `console=` gets this.
+    #[serde(default = "default_console")]
+    pub console: String,
+}
+
+fn default_amt_user() -> String {
+    "admin".into()
+}
+fn default_baud() -> u32 {
+    115_200
+}
+fn default_machine_address() -> String {
+    "10.77.0.2".into()
+}
+fn default_lab_address() -> String {
+    "10.77.0.1".into()
+}
+fn default_boot_port() -> u16 {
+    7431
+}
+fn default_tftp() -> PathBuf {
+    "/srv/dukovo-lab/tftp".into()
+}
+fn default_writer() -> PathBuf {
+    "/srv/dukovo-lab/writer".into()
+}
+fn default_console() -> String {
+    "ttyS0,115200".into()
+}
+
 /// The serial console line that says a machine has finished booting,
 /// unless its file names another.
 pub const DEFAULT_READY: &str = "Boot complete.";
@@ -263,6 +339,9 @@ pub struct Machine {
     /// For a QEMU machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qemu: Option<QemuSettings>,
+    /// For a real machine with AMT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amt: Option<AmtSettings>,
 }
 
 impl Machine {
@@ -281,6 +360,7 @@ impl Machine {
             ready: DEFAULT_READY.into(),
             controls: driver_controls(&DriverKind::Qemu),
             qemu: Some(QemuSettings::default()),
+            amt: None,
         }
     }
 }
@@ -291,6 +371,21 @@ fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
         // QMP does all of them, and SSH reaches the guest through QEMU's
         // port forwarding.
         DriverKind::Qemu => Control::ALL.iter().map(|&control| (control, Who::Driver)).collect(),
+        // AMT does power and the power cut (its hard off, which the system
+        // gets no warning of), the serial cable the console, the lab
+        // network SSH and the lab PC's side, and net boot the Linux twin.
+        // Cables, sticks, cards and discs are a person's to handle.
+        DriverKind::Amt => [
+            Control::Power,
+            Control::Cord,
+            Control::Serial,
+            Control::Ssh,
+            Control::Linux,
+            Control::Peer,
+        ]
+        .into_iter()
+        .map(|control| (control, Who::Driver))
+        .collect(),
     }
 }
 
@@ -304,6 +399,7 @@ struct MachineFile {
     #[serde(default)]
     controls: BTreeMap<Control, Who>,
     qemu: Option<QemuSettings>,
+    amt: Option<AmtSettings>,
 }
 
 /// Reads every machine file in `dir`, and adds the built-in `qemu` unless
@@ -371,11 +467,31 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         }
         controls.insert(control, who);
     }
-    let qemu = match file.driver {
-        DriverKind::Qemu => Some(file.qemu.unwrap_or_default()),
+    let (qemu, amt) = match file.driver {
+        DriverKind::Qemu if file.amt.is_some() => {
+            return Err(bad("[amt] is for machines whose driver is amt".into()));
+        }
+        DriverKind::Amt if file.qemu.is_some() => {
+            return Err(bad("[qemu] is for machines whose driver is qemu".into()));
+        }
+        DriverKind::Qemu => (Some(file.qemu.unwrap_or_default()), None),
+        DriverKind::Amt => {
+            let mut settings = file.amt.ok_or_else(|| {
+                bad("a machine whose driver is amt needs an [amt] section".into())
+            })?;
+            if settings.password_file.is_relative()
+                && let Some(folder) = path.parent()
+            {
+                settings.password_file = folder.join(&settings.password_file);
+            }
+            (None, Some(settings))
+        }
     };
     if let Some(settings) = &qemu {
         check_qemu(settings).map_err(bad)?;
+    }
+    if let Some(settings) = &amt {
+        check_amt(settings).map_err(bad)?;
     }
     Ok(Machine {
         name,
@@ -385,6 +501,7 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         ready: file.ready.unwrap_or_else(|| DEFAULT_READY.into()),
         controls,
         qemu,
+        amt,
     })
 }
 
@@ -402,6 +519,44 @@ fn check_qemu(settings: &QemuSettings) -> Result<(), String> {
     }
     if settings.tcg_slowdown == 0 {
         return Err("qemu.tcg_slowdown must be 1 or more".into());
+    }
+    Ok(())
+}
+
+/// Catches AMT settings that could only fail on the machine.
+fn check_amt(settings: &AmtSettings) -> Result<(), String> {
+    for (key, address) in [
+        ("amt.address", &settings.address),
+        ("amt.machine_address", &settings.machine_address),
+        ("amt.lab_address", &settings.lab_address),
+    ] {
+        if address.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!(
+                "{key} must be an IPv4 address on the lab network, such as 10.77.0.2"
+            ));
+        }
+    }
+    let pairs: Vec<&str> = settings.mac.split(':').collect();
+    if pairs.len() != 6
+        || !pairs.iter().all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err("amt.mac must be a MAC address written aa:bb:cc:dd:ee:ff".into());
+    }
+    let serial = settings.disk.trim();
+    if serial.is_empty() || serial != settings.disk || !serial.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(
+            "amt.disk must be the disk's serial number, as `lsblk -o NAME,SERIAL` shows it".into(),
+        );
+    }
+    if settings.user.is_empty() {
+        return Err("amt.user must name AMT's user, admin as a rule".into());
+    }
+    if ![9600, 19_200, 38_400, 57_600, 115_200].contains(&settings.baud) {
+        return Err("amt.baud must be 9600, 19200, 38400, 57600 or 115200".into());
+    }
+    if settings.console.is_empty() || settings.console.contains(char::is_whitespace) {
+        return Err("amt.console must be one Linux console name, such as ttyS4,115200".into());
     }
     Ok(())
 }
@@ -509,10 +664,87 @@ mod tests {
     }
 
     #[test]
-    fn the_example_machine_file_loads() {
-        let machines = load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/machines"))).unwrap();
+    fn the_example_machine_files_load() {
+        let folder = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/machines"));
+        let machines = load(folder).unwrap();
         let example = machines.iter().find(|machine| machine.name == "qemu-bios").unwrap();
         assert_eq!(example.qemu.as_ref().unwrap().firmware, Firmware::Bios);
+        let real = machines.iter().find(|machine| machine.name == "optiplex").unwrap();
+        let amt = real.amt.as_ref().unwrap();
+        assert_eq!(amt.password_file, folder.join("optiplex-amt-password"));
+        assert_eq!(real.who(Control::Usb), Who::Person);
+    }
+
+    #[test]
+    fn a_real_machine_has_amt_s_controls_and_settings() {
+        let dir = TempDir::new("machines-amt");
+        dir.write(
+            "box.toml",
+            "about = \"a box\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\n\
+             password_file = \"box-password\"\nmac = \"AA:bb:cc:00:11:22\"\ndisk = \"S3Z5NB0K\"\n\
+             serial = \"/dev/ttyUSB0\"\n[controls]\nlink = \"person\"\n",
+        );
+        let machines = load(dir.path()).unwrap();
+        let real = machines.iter().find(|machine| machine.name == "box").unwrap();
+        assert_eq!(real.driver, DriverKind::Amt);
+        assert!(real.qemu.is_none());
+        for control in [Control::Power, Control::Cord, Control::Serial, Control::Ssh, Control::Peer]
+        {
+            assert_eq!(real.who(control), Who::Driver, "{control}");
+        }
+        assert_eq!(real.who(Control::Linux), Who::Driver);
+        assert_eq!(real.who(Control::Link), Who::Person);
+        for control in
+            [Control::Usb, Control::Card, Control::Keys, Control::Screen, Control::Attack]
+        {
+            assert_eq!(real.who(control), Who::None, "{control}");
+        }
+        let amt = real.amt.as_ref().unwrap();
+        assert_eq!(amt.password_file, dir.path().join("box-password"));
+        assert_eq!((amt.user.as_str(), amt.baud, amt.boot_port), ("admin", 115_200, 7431));
+        assert_eq!(amt.machine_address, "10.77.0.2");
+        assert_eq!(amt.lab_address, "10.77.0.1");
+        assert_eq!(amt.tftp, Path::new("/srv/dukovo-lab/tftp"));
+    }
+
+    #[test]
+    fn bad_amt_settings_say_what_is_wrong() {
+        let amt = |extra: &str| {
+            format!(
+                "about = \"x\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\n\
+                 password_file = \"p\"\nserial = \"/dev/ttyUSB0\"\n{extra}"
+            )
+        };
+        for (text, complaint) in [
+            ("about = \"x\"\ndriver = \"amt\"\n".to_string(), "needs an [amt] section"),
+            (amt("mac = \"aa:bb\"\ndisk = \"D\"\n"), "amt.mac"),
+            (amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \" D\"\n"), "amt.disk"),
+            (
+                amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nlab_address = \"lab\"\n"),
+                "amt.lab_address",
+            ),
+            (amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nbaud = 1\n"), "amt.baud"),
+            (amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nconsole = \"a b\"\n"), "amt.console"),
+            (
+                amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nsmell = 1\n"),
+                "unknown field `smell`",
+            ),
+            (
+                amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n[controls]\nusb = \"driver\"\n"),
+                "cannot do usb",
+            ),
+            (
+                amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n").replace("\"amt\"", "\"qemu\""),
+                "[amt] is for machines whose driver is amt",
+            ),
+        ] {
+            let dir = TempDir::new("machines-amt-bad");
+            dir.write("box.toml", &text);
+            let Err(Error::Usage(message)) = load(dir.path()) else {
+                panic!("{text} should not load");
+            };
+            assert!(message.contains(complaint), "{message}");
+        }
     }
 
     #[test]

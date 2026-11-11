@@ -12,13 +12,16 @@
 //! [`HELP`]), so scripts and agents drive it as a person does; the runner
 //! page itself works by running these commands. docs/ holds the manual.
 
+mod amt;
 mod bench;
 mod bundle;
 mod clock;
 mod driver;
 mod findings;
+mod hash;
 mod http;
 mod machines;
+mod netboot;
 mod output;
 mod peer;
 mod qmp;
@@ -26,6 +29,7 @@ mod run;
 mod schedule;
 mod screen;
 mod send;
+mod serial;
 mod ssh;
 mod status;
 mod stop;
@@ -33,6 +37,7 @@ mod store;
 mod suite;
 mod ui;
 mod units;
+mod wsman;
 mod zone;
 
 #[cfg(test)]
@@ -59,6 +64,9 @@ Commands:
                    The tests by category, and how each fits each machine
   show <test>      What a test checks, its steps, its time limit, its file
   machines         The machines and who does each of their controls
+  machines check [<machine>...]
+                   Checks what runs on real machines need: AMT, the
+                   serial port, the lab network, net boot and the key
   run <test or category>... | --all | --preset <name>
                    Runs tests on one or more machines at once, and writes
                    a results bundle
@@ -533,6 +541,15 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
 
 /// `machines`: each machine and its controls.
 fn list_machines(arguments: &Arguments) -> Result<u8, Error> {
+    match arguments.names.split_first() {
+        Some((first, names)) if first == "check" => return check_machines(arguments, names),
+        Some((other, _)) => {
+            return Err(Error::Usage(format!(
+                "no machines command \"{other}\"; see `dukovo-lab help`"
+            )));
+        }
+        None => {}
+    }
     let machines = arguments.load_machines()?;
     if arguments.json {
         println!("{}", json!({ "machines": machines }));
@@ -560,6 +577,54 @@ fn list_machines(arguments: &Arguments) -> Result<u8, Error> {
         }
     }
     Ok(0)
+}
+
+/// `machines check`: what a run on each real machine (or those named)
+/// needs, checked without changing anything.
+fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> {
+    let all_machines = arguments.load_machines()?;
+    let machines: Vec<&Machine> = if names.is_empty() {
+        all_machines.iter().collect()
+    } else {
+        machines::select(&all_machines, &names.join(","))?
+    };
+    let key = ssh::key_path(&arguments.config_dir()?);
+    let mut results = Vec::new();
+    for machine in &machines {
+        let checks = match &machine.amt {
+            Some(settings) => driver::amt::check(settings, Some(&key)),
+            None => Vec::new(),
+        };
+        results.push((machine, checks));
+    }
+    let problems = results
+        .iter()
+        .flat_map(|(_, checks)| checks)
+        .any(|check| check.verdict == driver::amt::Verdict::Problem);
+    if arguments.json {
+        let machines: Vec<Value> = results
+            .iter()
+            .map(|(machine, checks)| json!({ "name": machine.name, "checks": checks }))
+            .collect();
+        println!("{}", json!({ "machines": machines }));
+    } else {
+        for (machine, checks) in &results {
+            if checks.is_empty() {
+                println!("{}: nothing to check; QEMU runs on this PC", machine.name);
+                continue;
+            }
+            println!("{}: {}", machine.name, machine.about);
+            for check in checks {
+                let verdict = match check.verdict {
+                    driver::amt::Verdict::Ok => "ok",
+                    driver::amt::Verdict::Note => "note",
+                    driver::amt::Verdict::Problem => "PROBLEM",
+                };
+                println!("  {verdict:<8} {:<13} {}", check.check, check.detail);
+            }
+        }
+    }
+    Ok(if problems { 3 } else { 0 })
 }
 
 /// `run`: runs tests and writes a bundle.

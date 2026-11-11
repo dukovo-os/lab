@@ -4,17 +4,18 @@
 //! Machine drivers: the one interface every kind of machine offers.
 //!
 //! The runner drives every machine through [`Driver`], so a test written
-//! against QEMU runs unchanged on a real machine once that machine has a
-//! driver (AMT, in PR 9). Each method is one [`Control`] of a machine
-//! file; the runner calls only those the machine file says the driver
-//! does.
+//! against QEMU runs unchanged on a real machine: QEMU's driver is in
+//! qemu.rs, and real machines with Intel AMT have theirs in amt.rs. Each
+//! method is one [`Control`] of a machine file; the runner calls only
+//! those the machine file says the driver does.
 //!
 //! [`Control`]: crate::machines::Control
 
+pub mod amt;
 pub mod qemu;
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::bench::Kit;
 use crate::machines::{DriverKind, Machine};
@@ -239,6 +240,22 @@ pub trait Driver: Send {
     /// How many times longer than on real hardware tests may take here.
     fn slowdown(&self) -> u32;
 
+    /// How much longer than booting the image a fresh boot may take here:
+    /// a real machine's disk is written first. The runner adds it to the
+    /// time limit of a test that boots afresh, so a test's limit is for
+    /// the test, wherever it runs.
+    fn boot_time(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Whether [`Driver::linux_twin`] boots Linux on the machine itself,
+    /// ending the boot the test was in, so the runner boots afresh after
+    /// it. A machine that can set its boot aside and come back to it
+    /// (QEMU, which pauses it) says no.
+    fn twin_ends_boot(&self) -> bool {
+        false
+    }
+
     /// Boots Linux from `kit` on a machine set up as this one is, and
     /// returns what it printed on its serial console, which is also kept
     /// in `log`, once it printed the kit's done line. The machine under
@@ -283,6 +300,10 @@ pub fn start(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String>
         DriverKind::Qemu => {
             let settings = machine.qemu.clone().unwrap_or_default();
             Ok(Box::new(qemu::Qemu::new(settings, setup)?))
+        }
+        DriverKind::Amt => {
+            let settings = machine.amt.clone().ok_or("an amt machine has no [amt] settings")?;
+            Ok(Box::new(amt::AmtDriver::new(settings, setup)?))
         }
     }
 }

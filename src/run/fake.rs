@@ -41,6 +41,9 @@ struct FakeMachine {
     disc_drive: bool,
     /// Whether the next boot gives the machine a floppy drive.
     floppy_drive: bool,
+    /// Whether its Linux twin is the machine itself, as a real machine's
+    /// is; the machine named `real`'s is.
+    real: bool,
 }
 
 /// The characters the fake console draws, in the test font.
@@ -406,7 +409,15 @@ impl Driver for FakeMachine {
             kit.done
         );
         fs::write(log, &text).map_err(|err| err.to_string())?;
+        // Linux ran on the machine itself, and the machine is off after.
+        if self.real {
+            self.on = false;
+        }
         Ok(text)
+    }
+
+    fn twin_ends_boot(&self) -> bool {
+        self.real
     }
 
     fn emulated(&self) -> bool {
@@ -439,6 +450,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         disc_drive: false,
         floppy_drive: false,
         attacker_on: false,
+        real: machine.name == "real",
     }))
 }
 
@@ -703,6 +715,19 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
         .filter(|name| name.starts_with("linux-boot-"))
         .collect();
     assert_eq!(logs.len(), 1, "{logs:?}");
+    // A machine whose Linux twin is itself (a real one) goes on in a
+    // fresh boot after Linux, and the results are the same.
+    let mut real = setting.qemu.clone();
+    real.name = "real".into();
+    let on_itself = request(Some(kit.clone()), vec![&real]);
+    let ended = run(&on_itself, &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 2, failed: 2, skipped: 0, errors: 1 });
+    let real_bundle = crate::store::bundle_dir(&on_itself.store, on_itself.id.as_deref().unwrap());
+    // The first test to measure (they run in order of id) booted Linux.
+    let first = fs::read_to_string(real_bundle.join("logs/real/performance-broken.log"))
+        .unwrap_or_default();
+    assert!(first.contains("Linux ran on the machine itself"), "{first}");
+    assert!(first.contains("Boot 2: serial log logs/real/serial-2.log"), "{first}");
     // The finding of a slow row names no number, so it comes back as one.
     assert_eq!(
         crate::findings::signature(&reason),

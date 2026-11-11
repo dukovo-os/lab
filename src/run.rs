@@ -547,7 +547,7 @@ impl<'a> Worker<'a> {
         self.shared.reporter.report(&Event::TestStarted { machine, test: &test.id });
         let started = Instant::now();
         let limit = test.time * self.driver.slowdown();
-        let deadline = started + limit;
+        let mut deadline = started + limit;
         self.log = vec![format!("Test {} on {machine}: {}", test.id, test.about)];
         self.screenshots = Vec::new();
         let mut steps = Vec::new();
@@ -576,6 +576,20 @@ impl<'a> Worker<'a> {
         // And one that formats a CompactFlash card, given one blank.
         self.driver.want_cf_card(test.cf);
         let own_boot = attacks || cards || discs || floppies || test.cf.is_some();
+        let installs = matches!(test.boot, Boot::Stick { .. } | Boot::Dvd { .. });
+        let fresh = !installs && (test.fresh || own_boot || !self.reusable || !self.driver.is_on());
+        // A real machine's disk is written before each fresh boot, and a
+        // bench step there boots Linux on the machine itself and then
+        // boots afresh: that time is the machine's, not the test's.
+        if fresh {
+            deadline += self.driver.boot_time();
+        }
+        if self.driver.twin_ends_boot()
+            && self.linux.is_none()
+            && test.steps.iter().any(|step| matches!(step, Step::Bench(_)))
+        {
+            deadline += self.driver.boot_time() * 2;
+        }
 
         let mut failure = None;
         if let Boot::Stick { disk } = test.boot {
@@ -592,7 +606,7 @@ impl<'a> Worker<'a> {
                 });
             steps.push(record);
             failure = outcome.err();
-        } else if test.fresh || own_boot || !self.reusable || !self.driver.is_on() {
+        } else if fresh {
             let (record, outcome) =
                 self.timed(test, "boot afresh and wait until booted", |worker| {
                     worker.boot_fresh(deadline)
@@ -1353,6 +1367,12 @@ impl<'a> Worker<'a> {
                     .join(format!("linux-boot-{}.log", self.boot));
                 let text =
                     self.driver.linux_twin(kit, &log, deadline).map_err(StepFailure::Error)?;
+                // Linux ran on the machine itself, so the test's boot is
+                // over: it goes on in a fresh one.
+                if self.driver.twin_ends_boot() {
+                    self.log.push("Linux ran on the machine itself; booting afresh.".into());
+                    self.boot_fresh(deadline)?;
+                }
                 bench::parse(&text)
             }
         };

@@ -17,10 +17,10 @@ a feature and its lab test land together and the lab always runs the
 tests that match the build.
 
 **Status:** in progress (item 14f of Dukovo's roadmap). `dukovo-lab`
-runs tests on QEMU machines, writes results bundles, groups failures
-into findings, sends them to the private results repository, runs
-schedules on a systemd timer, and serves the runner page; real machines
-come in the next pull requests.
+runs tests on QEMU machines and on real machines with Intel AMT, writes
+results bundles, groups failures into findings, sends them to the
+private results repository, runs schedules on a systemd timer, and
+serves the runner page. AMT's remote screen comes next.
 
 ## Getting started
 
@@ -62,6 +62,9 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
   or on each new build on main
 - [Test files](docs/test-files.md): writing a lab test
 - [Machine files](docs/machine-files.md): adding a machine
+- [Real machines](docs/real-machines.md): a machine with Intel AMT on
+  the lab network, and [net boot](docs/net-boot.md), which gives it a
+  fresh disk for each test
 - [Driving the lab from an agent](docs/agents.md)
 
 ## What it does and will do
@@ -72,8 +75,8 @@ Each run leaves a results bundle under `~/.local/share/dukovo-lab/runs/`.
   screen: keys typed, the pointer moved and clicked, and the console's
   text read from screenshots, from sign-in to the installer's screens.
 - **Drive each machine through one interface**: QEMU first, then real
-  machines through net boot and Intel AMT (power, boot choice,
-  Serial-over-LAN and the remote screen). A test proven on QEMU runs
+  machines through net boot and Intel AMT (power, boot choice, a fresh
+  disk for each test, the serial console and the remote screen). A test proven on QEMU runs
   unchanged on hardware.
 - **Keep tests that need a person apart** (pulling a power cord, plugging
   in a USB stick), and skip them unless someone asks for them.

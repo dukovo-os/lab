@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# An example machine file for a real machine: a Dell OptiPlex 7040 with
+# Intel AMT on the lab network. Copy it to ~/.config/dukovo-lab/machines/,
+# put in the machine's MAC address and its disk's serial number, and run
+# `dukovo-lab machines check optiplex`. docs/real-machines.md sets the
+# machine and the lab PC up; docs/machine-files.md lists every key.
+
+about = "Dell OptiPlex 7040 SFF, Core i5-6500, Intel AMT"
+driver = "amt"
+
+[amt]
+# AMT's address, set in MEBx (Ctrl+P as the machine starts).
+address = "10.77.0.10"
+# AMT's password alone, in a file beside this one: chmod 600.
+password_file = "optiplex-amt-password"
+# The network card's MAC address, from the firmware setup or `ip link`.
+mac = "00:00:00:00:00:00"
+# The serial number of the disk each test's image is written to, from
+# `lsblk -o NAME,SERIAL`. No other disk is ever written.
+disk = "SERIAL-OF-THE-SSD"
+# The lab PC's end of the serial cable.
+serial = "/dev/ttyUSB0"
+# The machine's serial port as Linux names it, for the writer and the
+# Linux twin: the serial card's first port.
+console = "ttyS4,115200"
+
+[controls]
+# Cables and sticks are handled by a person at the machine.
+link = "person"
+usb = "person"
