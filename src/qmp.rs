@@ -50,7 +50,16 @@ impl Qmp {
         stream.set_read_timeout(Some(REPLY_TIME)).map_err(|err| err.to_string())?;
         let reader = BufReader::new(stream.try_clone().map_err(|err| err.to_string())?);
         let mut qmp = Qmp { stream, reader, events: Vec::new() };
-        let greeting = qmp.read_message()?;
+        // QEMU can send an event ahead of its greeting, when the lab
+        // connects just as QEMU starts the machine: RESUME, as it starts
+        // running. Such an event is kept like any other.
+        let greeting = loop {
+            let message = qmp.read_message()?;
+            if message.get("event").is_none() {
+                break message;
+            }
+            qmp.events.push(message);
+        };
         if greeting.get("QMP").is_none() {
             return Err(format!("QMP did not greet as QMP does: {greeting}"));
         }
@@ -188,5 +197,25 @@ mod tests {
         let sent = qemu.join().unwrap();
         assert_eq!(sent[0], r#"{"arguments":{},"execute":"qmp_capabilities"}"#);
         assert_eq!(sent[2], r#"{"arguments":{"id":"x"},"execute":"device_del"}"#);
+    }
+
+    #[test]
+    fn an_event_ahead_of_the_greeting_is_kept() {
+        let dir = TempDir::new("qmp-early");
+        let socket = dir.path().join("qmp.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let qemu = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            writeln!(stream, r#"{{"event": "RESUME", "data": {{}}}}"#).unwrap();
+            writeln!(stream, r#"{{"QMP": {{"version": {{}}, "capabilities": []}}}}"#).unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            writeln!(stream, r#"{{"return": {{}}}}"#).unwrap();
+            line
+        });
+        let mut qmp = Qmp::connect(&socket, Duration::from_secs(5)).unwrap();
+        assert!(qmp.wait_event("RESUME", &json!({}), Duration::from_secs(1)).is_ok());
+        assert!(qemu.join().unwrap().contains("qmp_capabilities"));
     }
 }
