@@ -53,9 +53,17 @@ order or by hand, so goes on to its disk.
 3. The script is removed as the boot ends, before the writer restarts
    the machine, so the boot after goes on to the disk.
 
-The writer's command line is its kit's, then `console=` with the
-machine file's `amt.console`, then `dukovo.lab=` with the boot's base
-URL, such as `http://10.77.0.1:7431/<token>/`. The Linux twin's is its
+The writer's command line is its kit's, then:
+
+| Word | What |
+| --- | --- |
+| `console=` | The machine file's `amt.console`. |
+| `dukovo.lab=` | The boot's base URL, such as `http://10.77.0.1:7431/<token>/`. |
+| `dukovo.lab.ip=` | The machine's address on the lab network, with its prefix: `amt.machine_address` and `/24`, such as `10.77.0.2/24`. |
+| `dukovo.lab.mac=` | The MAC address of the card to give it, `amt.mac` in lower case. |
+
+The writer gives that card that address, with no gateway, and reaches
+the base URL's host directly. The Linux twin's command line is its
 kit's, then `console=`. What either prints on its console goes to the
 bundle: `logs/<machine>/writer-<n>.log` for the writer,
 `linux-boot-<n>.log` for the twin.

@@ -246,9 +246,14 @@ impl AmtDriver {
             disk: self.settings.disk.clone(),
             written,
         };
+        // The writer sets its own address: the card with the machine
+        // file's MAC gets the machine's address on the lab's /24.
         let cmdline = format!(
-            "{} console={} dukovo.lab={{base}}",
-            self.writer.cmdline, self.settings.console
+            "{} console={} dukovo.lab={{base}} dukovo.lab.ip={}/24 dukovo.lab.mac={}",
+            self.writer.cmdline,
+            self.settings.console,
+            self.settings.machine_address,
+            self.settings.mac.to_ascii_lowercase()
         );
         let deadline = Instant::now() + WRITE_TIME;
         let booted = self.net_boot("the writer", offer, &cmdline);
@@ -715,6 +720,9 @@ mod tests {
                         say("BENCH name=spawn ns=120.0\nlinux-bench: done\n");
                         return;
                     };
+                    // Kept for the test to read: the boot script is
+                    // gone once the boot ends.
+                    fs::write(tftp.with_file_name("writer-script"), &script).unwrap();
                     say("writer: writing\n");
                     if pretend_writer(base, &disk, tamper).unwrap() == "restart" {
                         say("Boot complete.\n");
@@ -776,6 +784,12 @@ mod tests {
         assert!(fs::read_to_string(writer_log).unwrap().contains("writer: writing"));
         assert!(!fs::read_to_string(&serial).unwrap().contains("writer:"));
         assert!(!netboot::script_path(&bench.driver.settings.tftp, MAC).exists());
+        // The writer is told its own address and its card's MAC.
+        let script = fs::read_to_string(bench.dir.path().join("writer-script")).unwrap();
+        assert!(
+            script.contains(&format!("dukovo.lab.ip=127.0.0.1/24 dukovo.lab.mac={MAC}")),
+            "{script}"
+        );
         assert!(bench.driver.is_on());
         assert_eq!(
             bench.fake.calls(),
