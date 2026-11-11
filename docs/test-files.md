@@ -33,7 +33,7 @@ expect_not = "NO-CARRIER"
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `about` | yes | What the test checks, in one line. |
-| `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `24h`. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. |
+| `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `24h`. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. On a real machine, the time to write its disk before a fresh boot is added. |
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
 | `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk, and `"dvd"` the install DVD in the optical drive: see [Installer tests](#installer-tests). |
 | `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
@@ -219,9 +219,11 @@ rows = ["posix_fork_wait", "posix_fork_exec_wait"]
   `limit` goes from 0.1 to 10, for a row with a known gap that is being
   worked on. A row printed more than once keeps its fastest.
 - The twin boots once a run on each machine, the first time a bench step
-  runs there, and its numbers serve every bench step after. The machine
-  under test is paused while the twin runs, so the two never share the
-  host.
+  runs there, and its numbers serve every bench step after. On QEMU the
+  machine under test is paused while the twin runs, so the two never
+  share the host. A real machine is its own twin: it boots Linux from
+  the lab network, then boots afresh to go on with the test, so steps
+  before the first bench step of a run see their boot end there.
 - One machine measures at a time, so machines running side by side do
   not slow each other's numbers.
 - A failing step names the rows over their limit and shows the table of

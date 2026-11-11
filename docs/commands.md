@@ -71,7 +71,24 @@ dukovo-lab machines
 
 Each machine, its file and who does each control. With `--json`:
 `{"machines": [{"name", "about", "file", "driver", "ready", "controls":
-{"power": "driver", ...}, "qemu": {...}}]}`.
+{"power": "driver", ...}, "qemu": {...}, "amt": {...}}]}`.
+
+## machines check
+
+```
+dukovo-lab machines check [<machine>...]
+```
+
+Checks what a run on each real machine needs (default: every machine),
+without changing anything: AMT's password file, AMT itself (its version,
+Admin Control Mode, the machine's power, whether it can ask the system
+to shut down), the serial port, the lab PC's address on the lab network,
+the net-boot server's port, the TFTP folder, the network GRUB, the
+writer's kit and the lab key. QEMU machines have nothing to check. Each
+check is `ok`, a `note`, or a `problem`; the command exits 3 while any
+check is a problem. With `--json`:
+`{"machines": [{"name", "checks": [{"check", "verdict", "detail"}]}]}`.
+See [Real machines](real-machines.md).
 
 ## run
 

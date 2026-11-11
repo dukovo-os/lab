@@ -24,17 +24,20 @@ disk = "nvme"
 cord = "person"    # treat pulling the cord as a person's job here
 ```
 
-[machines/qemu-bios.toml](../machines/qemu-bios.toml) is an example to copy.
+[machines/qemu-bios.toml](../machines/qemu-bios.toml) is an example to copy,
+and [machines/optiplex.toml](../machines/optiplex.toml) one for a real
+machine with Intel AMT (see [Real machines](real-machines.md)).
 
 ## Keys
 
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `about` | yes | What the machine is, in one line. |
-| `driver` | yes | How the lab controls it: `qemu`. Real machines through Intel AMT come in lab PR 9. |
+| `driver` | yes | How the lab controls it: `qemu`, or `amt` for a real machine with Intel AMT. |
 | `ready` | no | The serial console line that says the machine has booted. Default `Boot complete.` |
 | `[controls]` | no | Who does each control (below). |
 | `[qemu]` | no | A QEMU machine's hardware (below). |
+| `[amt]` | for `amt` | How the lab reaches a real machine and boots it (below). |
 
 ## Controls
 
@@ -66,8 +69,15 @@ it away, but cannot make a driver do what it cannot. `linux`, `attack`
 and `peer` are `driver` or `none`: a person cannot measure Linux, run the
 attacker or stand in for the lab PC's side.
 
-So one test file serves every machine: pulling the cord is automatic on
-QEMU, a Needs you step on a real machine until it has a smart plug.
+So one test file serves every machine: plugging in a USB stick is
+automatic on QEMU, a Needs you step on a real machine.
+
+What each driver does by itself:
+
+| Driver | Controls |
+| --- | --- |
+| `qemu` | All of them. |
+| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial`, `ssh`, `linux` and `peer`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `keys`, `mouse`, `screen` and `attack` are not done on real machines yet. |
 
 ## QEMU hardware
 
@@ -85,3 +95,24 @@ QEMU needs `qemu-system-x86`, `qemu-utils` and, for UEFI, `ovmf` (the
 Mint and Ubuntu package names). OVMF is looked for where distributions
 install it; `DUKOVO_LAB_OVMF_CODE` and `DUKOVO_LAB_OVMF_VARS` name other
 files.
+
+## AMT settings
+
+A machine whose driver is `amt` is a real machine with Intel AMT on the
+lab network. [Real machines](real-machines.md) sets one up.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `address` | (required) | AMT's address on the lab network, as set in the machine's MEBx. |
+| `user` | `admin` | AMT's user. |
+| `password_file` | (required) | A file holding AMT's password alone, readable by this user alone (`chmod 600`). A relative path is from the machine file's folder. |
+| `mac` | (required) | The MAC address of the machine's network card on the lab network, written `aa:bb:cc:dd:ee:ff`. |
+| `disk` | (required) | The serial number of the disk each fresh boot writes the image to, as `lsblk -o NAME,SERIAL` shows it. No other disk is ever written. |
+| `serial` | (required) | The lab PC's serial port the machine's console is cabled to, such as `/dev/ttyUSB0`. |
+| `baud` | `115200` | The serial console's speed. |
+| `machine_address` | `10.77.0.2` | The machine's address on the lab network, for SSH and `{machine}`. |
+| `lab_address` | `10.77.0.1` | The lab PC's address on the lab network: the net-boot server listens there, and tests reach the lab PC there as `{peer}`. |
+| `boot_port` | `7431` | The net-boot server's port. Machines in the same run need ports of their own. |
+| `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
+| `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
+| `console` | `ttyS0,115200` | The machine's serial port as Linux names it, for the writer and the Linux twin. |

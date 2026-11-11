@@ -27,7 +27,7 @@
         "properties": {
           "name": { "type": "string" },
           "about": { "type": "string" },
-          "driver": { "enum": ["qemu"] }
+          "driver": { "enum": ["qemu", "amt"] }
         }
       }
     },
