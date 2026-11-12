@@ -11,9 +11,9 @@
 //! file. [`send`] is the other side, for talking to Intel AMT (see
 //! wsman.rs).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The most a request's line and headers may hold.
 const HEAD_LIMIT: usize = 16 * 1024;
@@ -21,6 +21,8 @@ const HEAD_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 64 * 1024;
 /// How long a browser may take to send its request.
 const READ_TIME: Duration = Duration::from_secs(10);
+/// How long [`send`] waits between tries while a server refuses.
+const REFUSED_GAP: Duration = Duration::from_millis(500);
 
 /// A request, read.
 #[derive(Debug, Default)]
@@ -230,7 +232,10 @@ impl Answer {
 
 /// Sends one request to `address` (`host:port`) and reads the whole
 /// answer, giving up when connecting or any read takes longer than
-/// `time`.
+/// `time`. A server that refuses the connection outright is tried again
+/// every half second for up to `patience`: Intel AMT refuses its first
+/// connection for a moment when its engine has dozed off with the
+/// machine powered off, and answers once that connection has woken it.
 pub fn send(
     address: &str,
     method: &str,
@@ -238,14 +243,23 @@ pub fn send(
     headers: &[(&str, String)],
     body: &[u8],
     time: Duration,
+    patience: Duration,
 ) -> Result<Answer, String> {
     let to = address
         .to_socket_addrs()
         .map_err(|err| format!("{address}: {err}"))?
         .next()
         .ok_or_else(|| format!("{address}: no address"))?;
-    let mut stream = TcpStream::connect_timeout(&to, time)
-        .map_err(|err| format!("connecting to {address}: {err}"))?;
+    let deadline = Instant::now() + patience;
+    let mut stream = loop {
+        match TcpStream::connect_timeout(&to, time) {
+            Ok(stream) => break stream,
+            Err(err) if err.kind() == ErrorKind::ConnectionRefused && Instant::now() < deadline => {
+                std::thread::sleep(REFUSED_GAP);
+            }
+            Err(err) => return Err(format!("connecting to {address}: {err}")),
+        }
+    };
     stream.set_read_timeout(Some(time)).map_err(|err| err.to_string())?;
     stream.set_write_timeout(Some(time)).map_err(|err| err.to_string())?;
     let mut head = format!(
@@ -369,6 +383,27 @@ mod tests {
         assert!(parse(&mut big.as_bytes()).is_err());
         assert_eq!(decode("%2e%2E%2fx%"), "../x%");
         assert_eq!(decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn waits_for_a_server_that_refuses_while_it_wakes() {
+        // A port nothing listens on: refused at once.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let address = format!("127.0.0.1:{port}");
+        let time = Duration::from_secs(5);
+        let refused = send(&address, "GET", "/", &[], &[], time, Duration::ZERO).unwrap_err();
+        assert!(refused.starts_with(&format!("connecting to {address}")), "{refused}");
+        // A server that starts listening a moment later is waited for.
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            parse(&mut BufReader::new(&stream)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nup").unwrap();
+        });
+        let answer = send(&address, "GET", "/", &[], &[], time, Duration::from_secs(20)).unwrap();
+        assert_eq!((answer.status, answer.body.as_slice()), (200, &b"up"[..]));
+        server.join().unwrap();
     }
 
     #[test]

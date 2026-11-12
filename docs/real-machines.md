@@ -136,6 +136,15 @@ real machines yet; tests that need them are skipped there.
   each power change, each net boot, each request the writer made, and
   each remote screen session.
 - `logs/<machine>/writer-<n>.log` is the writer's console for boot `n`.
+  When it and `serial-<n>.log` stay empty, or hold only zero bytes,
+  while `amt.log` shows the writer at work, the machine file's
+  `console` names another port than the one cabled: AMT's
+  Serial-over-LAN port takes `ttyS4` when it is on, so a serial card's
+  first port is `ttyS5`.
+- AMT refuses connections for a moment when the machine has been off
+  and AMT left alone for a while: its engine dozes, and the first
+  connection wakes it. The driver keeps trying for 20 seconds before it
+  gives up.
 - `dukovo-lab machines check <machine>` checks AMT, its remote screen,
   the serial port, the lab network, the TFTP folder, the network GRUB,
   the writer and the lab key, without changing anything.

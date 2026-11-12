@@ -921,7 +921,7 @@ mod tests {
             boot_port: 0,
             tftp,
             writer: dir.path().join("writer"),
-            console: "ttyS4,115200".into(),
+            console: "ttyS5,115200".into(),
         };
         let setup = Setup {
             image: make_image(&dir, 400_000),

@@ -26,6 +26,11 @@ pub const PORT: u16 = 16992;
 
 /// How long one message may take: AMT is slow, but not this slow.
 const MESSAGE_TIME: Duration = Duration::from_secs(20);
+/// How long a message keeps trying while AMT refuses to connect. With
+/// the machine powered off and AMT left alone for a while, its engine
+/// dozes, and the first connection is refused while it wakes (seen on an
+/// OptiPlex 7040 with AMT 11.8): a few seconds later it answers again.
+const WAKE_TIME: Duration = Duration::from_secs(20);
 
 pub const ADDRESSING: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
 pub const WSMAN: &str = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd";
@@ -178,9 +183,16 @@ impl Client {
             if let Some(authorization) = self.authorization() {
                 headers.push(("Authorization", authorization));
             }
-            let answer =
-                http::send(&self.address, "POST", "/wsman", &headers, message, MESSAGE_TIME)
-                    .map_err(|err| format!("AMT at {}: {err}", self.address))?;
+            let answer = http::send(
+                &self.address,
+                "POST",
+                "/wsman",
+                &headers,
+                message,
+                MESSAGE_TIME,
+                WAKE_TIME,
+            )
+            .map_err(|err| format!("AMT at {}: {err}", self.address))?;
             if answer.status != 401 {
                 return Ok(answer);
             }
