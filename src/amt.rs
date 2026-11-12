@@ -359,6 +359,14 @@ pub mod fake {
         pub screen_busy: Option<Busy>,
         /// Whether AMT answers: when not, it hangs up on each request.
         pub answering: bool,
+        /// How many power state reads after a turn on still say off, as
+        /// AMT's do while the machine starts.
+        pub off_after_on: u32,
+        /// Reads left that say off.
+        off_reads: u32,
+        /// How many hard offs AMT takes and does nothing with, as it does
+        /// with one asked while the machine is starting.
+        pub ignored_hard_offs: u32,
         /// Nonces handed out, and the highest count used with each.
         nonce: u32,
     }
@@ -413,6 +421,9 @@ pub mod fake {
                 on_boot: None,
                 screen_busy: None,
                 answering: true,
+                off_after_on: 0,
+                off_reads: 0,
+                ignored_hard_offs: 0,
                 screen: Screen {
                     in_mebx: true,
                     consent: 0,
@@ -502,10 +513,15 @@ pub mod fake {
             }
             "Pull" => {
                 let item = match class_name.as_str() {
-                    "CIM_AssociatedPowerManagementService" => format!(
-                        "<h:{class_name}><h:PowerState>{}</h:PowerState></h:{class_name}>",
-                        state_now.power
-                    ),
+                    "CIM_AssociatedPowerManagementService" => {
+                        let power = if state_now.off_reads > 0 {
+                            state_now.off_reads -= 1;
+                            8
+                        } else {
+                            state_now.power
+                        };
+                        format!("<h:{class_name}><h:PowerState>{power}</h:PowerState></h:{class_name}>")
+                    }
                     "CIM_SoftwareIdentity" => "<h:CIM_SoftwareIdentity><h:InstanceID>Flash</h:InstanceID>\
                         <h:VersionString>11.8.50</h:VersionString></h:CIM_SoftwareIdentity>\
                         <h:CIM_SoftwareIdentity><h:InstanceID>AMT</h:InstanceID>\
@@ -605,12 +621,19 @@ pub mod fake {
                     2 if on => 5,
                     10 if !on => 5,
                     12 if !state_now.graceful => 1,
+                    8 if state_now.ignored_hard_offs > 0 => {
+                        state_now.ignored_hard_offs -= 1;
+                        0
+                    }
                     8 | 12 => {
                         state_now.power = 8;
                         0
                     }
                     2 | 10 => {
                         state_now.power = 2;
+                        if wanted == 2 {
+                            state_now.off_reads = state_now.off_after_on;
+                        }
                         let network = std::mem::take(&mut state_now.network_next);
                         let on_boot = state_now.on_boot.take();
                         drop(state_now);
