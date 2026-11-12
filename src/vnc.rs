@@ -663,6 +663,8 @@ pub mod fake {
         pub resize: Option<(u16, u16, Vec<[u8; 3]>)>,
         pub events: Vec<Event>,
         pub sessions: u32,
+        /// Sessions open now.
+        pub live: u32,
         password: Password,
         open: Vec<TcpStream>,
     }
@@ -704,6 +706,7 @@ pub mod fake {
                 resize: None,
                 events: Vec::new(),
                 sessions: 0,
+                live: 0,
                 password,
                 open: Vec::new(),
             }));
@@ -752,6 +755,7 @@ pub mod fake {
         };
         // A closed port: the session ends before it starts.
         let Some(password) = password else { return };
+        let mut counted = false;
         let mut session = || -> std::io::Result<()> {
             stream.write_all(version)?;
             let mut reply = [0u8; 12];
@@ -774,6 +778,8 @@ pub mod fake {
             let mut format = {
                 let mut state = state.lock().unwrap();
                 state.sessions += 1;
+                state.live += 1;
+                counted = true;
                 state.open.push(stream.try_clone()?);
                 let mut init = Vec::new();
                 init.extend_from_slice(&state.width.to_be_bytes());
@@ -829,6 +835,9 @@ pub mod fake {
             }
         };
         let _ = session();
+        if counted {
+            state.lock().unwrap().live -= 1;
+        }
     }
 
     /// Answers a request: a new size when one is waiting, else a bell and

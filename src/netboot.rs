@@ -11,7 +11,11 @@
 //! kernel and initrd from this module's HTTP server: the writer's, or the
 //! Linux twin's. Every path on the server starts with a token new to the
 //! boot, so a machine still running a boot before can never act on this
-//! one's.
+//! one's. The server listens on [`PORTS`] ports, and each boot takes the
+//! next in turn: GRUB opens its connections from the same source port,
+//! with nearly the same sequence number, on every boot, so a connection
+//! from the boot before that the lab PC still remembers (for a minute
+//! after it closes) would turn this boot's away.
 //!
 //! The writer asks for its plan (`plan`: which disk, by serial number,
 //! and where the image has data), streams the data (`data`), writes the
@@ -26,7 +30,7 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -44,6 +48,10 @@ pub const PLAN_VERSION: u32 = 1;
 /// The network GRUB in the TFTP folder, which dnsmasq hands UEFI
 /// machines as their boot file. `ob lab` builds and installs it.
 pub const GRUB_FILE: &str = "dukovo-lab/grubx64.efi";
+
+/// How many ports the server listens on, from the machine file's
+/// `boot_port`: boots take them in turn.
+pub const PORTS: u16 = 4;
 
 /// How finely the image is split into data and zeros: runs of this many
 /// zero bytes are left out of the data and zeroed by the writer.
@@ -144,58 +152,76 @@ struct State {
     token: String,
     offer: Offer,
     outcome: Option<Outcome>,
+    /// Whether this boot's kernel was asked for.
+    loaded: bool,
     /// What the server did, for the driver's log.
     events: Vec<String>,
 }
 
 /// The net-boot server: one per real machine, for the whole run.
 pub struct Server {
-    address: SocketAddr,
+    addresses: Vec<SocketAddr>,
+    /// How many boots have been offered: the next takes the port after.
+    offers: AtomicUsize,
     state: Arc<Mutex<State>>,
     done: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Server {
-    /// Listens on `address`, port `port` (0 for any free one).
+    /// Listens on `address`, on [`PORTS`] ports from `port` (any free
+    /// ones for 0).
     pub fn start(address: IpAddr, port: u16) -> Result<Server, String> {
-        let listener = TcpListener::bind((address, port)).map_err(|err| {
-            format!(
-                "the net-boot server cannot listen on {address} port {port}: {err} (is the lab \
-                 card up with that address, and is no other run using the port?)"
-            )
-        })?;
-        let address = listener.local_addr().map_err(|err| err.to_string())?;
-        listener.set_nonblocking(true).map_err(|err| err.to_string())?;
+        let mut listeners = Vec::new();
+        for port in ports(port)? {
+            let listener = TcpListener::bind((address, port)).map_err(|err| {
+                format!(
+                    "the net-boot server cannot listen on {address} port {port}: {err} (is the \
+                     lab card up with that address, and is no other run using the port?)"
+                )
+            })?;
+            listener.set_nonblocking(true).map_err(|err| err.to_string())?;
+            listeners.push(listener);
+        }
+        let addresses = listeners
+            .iter()
+            .map(TcpListener::local_addr)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?;
         let state = Arc::new(Mutex::new(State {
             token: String::new(),
             offer: Offer::Nothing,
             outcome: None,
+            loaded: false,
             events: Vec::new(),
         }));
         let done = Arc::new(AtomicBool::new(false));
         let thread = {
             let (state, done) = (Arc::clone(&state), Arc::clone(&done));
-            std::thread::spawn(move || accept(&listener, &state, &done))
+            std::thread::spawn(move || accept(&listeners, &state, &done))
         };
-        Ok(Server { address, state, done, thread: Some(thread) })
+        Ok(Server { addresses, offers: AtomicUsize::new(0), state, done, thread: Some(thread) })
     }
 
-    /// Where the machine reaches the server.
-    pub fn address(&self) -> SocketAddr {
-        self.address
+    /// Where the machine reaches the server: the ports boots take in turn.
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
     }
 
     /// Offers `offer` under a new token, which the boot's URLs start
-    /// with, and forgets the last boot's outcome. Gives the boot's base
-    /// URL, `http://<address>/<token>/`.
+    /// with, on the port after the last boot's, and forgets the last
+    /// boot's outcome. Gives the boot's base URL,
+    /// `http://<address>:<port>/<token>/`.
     pub fn offer(&self, offer: Offer) -> Result<String, String> {
         let token = random_hex(16)?;
+        let turn = self.offers.fetch_add(1, Ordering::Relaxed);
+        let address = self.addresses[turn % self.addresses.len()];
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.token.clone_from(&token);
         state.offer = offer;
         state.outcome = None;
-        Ok(format!("http://{}/{token}/", self.address))
+        state.loaded = false;
+        Ok(format!("http://{address}/{token}/"))
     }
 
     /// Takes the offer back: what is asked for after is 404.
@@ -203,6 +229,13 @@ impl Server {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.token.clear();
         state.offer = Offer::Nothing;
+    }
+
+    /// Whether the machine has asked for this boot's kernel: if not, it
+    /// has not loaded the boot's GRUB script, or GRUB could not reach the
+    /// server.
+    pub fn loaded(&self) -> bool {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).loaded
     }
 
     /// The writer's outcome, once it has said.
@@ -225,19 +258,32 @@ impl Drop for Server {
     }
 }
 
-/// Takes connections until `done`, each in a thread of its own: the
-/// data's may take a while.
-fn accept(listener: &TcpListener, state: &Arc<Mutex<State>>, done: &AtomicBool) {
+/// The ports the server listens on, from `first`: [`PORTS`] of them,
+/// any free ones for 0.
+pub fn ports(first: u16) -> Result<Vec<u16>, String> {
+    if first == 0 {
+        return Ok(vec![0; usize::from(PORTS)]);
+    }
+    (0..PORTS)
+        .map(|n| first.checked_add(n))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| format!("the boot port {first} leaves no room for {PORTS} ports"))
+}
+
+/// Takes connections on `listeners` until `done`, each in a thread of
+/// its own: the data's may take a while.
+fn accept(listeners: &[TcpListener], state: &Arc<Mutex<State>>, done: &AtomicBool) {
     while !done.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => {
+        let mut idle = true;
+        for listener in listeners {
+            if let Ok((stream, _)) = listener.accept() {
+                idle = false;
                 let state = Arc::clone(state);
                 std::thread::spawn(move || answer(&stream, &state));
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+        if idle {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -253,16 +299,29 @@ fn answer(stream: &TcpStream, state: &Mutex<State>) {
     // Connections are blocking, whatever the listener is.
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
-    let Ok(request) = http::read_request(stream) else { return };
+    let peer = stream.peer_addr().map_or_else(|_| "?".into(), |peer| peer.to_string());
+    let request = match http::read_request(stream) {
+        Ok(request) => request,
+        Err(err) => {
+            let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.events.push(format!("{peer} sent no request that could be read: {err}"));
+            return;
+        }
+    };
     let mut parts = request.path.trim_start_matches('/').splitn(2, '/');
     let (token, what) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
     let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.token.is_empty() || token != guard.token {
+        // The token is left out: it may be an old boot's, or wrong.
+        guard.events.push(format!("{peer} asked for {what} of no boot going now (404)"));
         drop(guard);
         http::write_response(stream, &Response::text(404, "no such boot\n"));
         return;
     }
     guard.events.push(format!("{} {what}", request.method));
+    if what == "kernel" {
+        guard.loaded = true;
+    }
     match (request.method.as_str(), what, &guard.offer) {
         ("GET", "kernel" | "initrd", Offer::Writer { kit, .. } | Offer::Twin { kit }) => {
             let file = if what == "kernel" { kit.kernel.clone() } else { kit.initrd.clone() };
@@ -597,6 +656,51 @@ pub mod tests {
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(server.outcome(), Some(Outcome::Failed("the writer failed: no disk X".into())));
+    }
+
+    #[test]
+    fn boots_take_the_ports_in_turn() {
+        assert_eq!(ports(7431).unwrap(), [7431, 7432, 7433, 7434]);
+        let err = ports(65_534).unwrap_err();
+        assert!(err.contains("no room for 4 ports"), "{err}");
+
+        let server = Server::start(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
+        let mut ports: Vec<u16> = server.addresses().iter().map(SocketAddr::port).collect();
+        assert_eq!(ports.len(), usize::from(PORTS));
+        let dir = TempDir::new("netboot-ports");
+        let mut bases = Vec::new();
+        for _ in 0..=PORTS {
+            bases.push(server.offer(Offer::Twin { kit: kit(&dir) }).unwrap());
+        }
+        let port_of = |base: &str| -> u16 {
+            let host = base.trim_start_matches("http://").split_once('/').unwrap().0;
+            host.rsplit(':').next().unwrap().parse().unwrap()
+        };
+        ports.push(ports[0]);
+        assert_eq!(bases.iter().map(|base| port_of(base)).collect::<Vec<_>>(), ports);
+
+        // The boot is loaded once its kernel is asked for, and an old
+        // boot's request is noted, without its token.
+        let get = |base: &str, what: &str| {
+            let rest = base.trim_start_matches("http://");
+            let (host, path) = rest.split_once('/').unwrap();
+            let path = format!("/{path}{what}");
+            http::send(host, "GET", &path, &[], &[], Duration::from_secs(5), Duration::ZERO)
+                .unwrap()
+        };
+        assert!(!server.loaded());
+        assert_eq!(get(&bases[0], "kernel").status, 404);
+        assert!(!server.loaded());
+        assert_eq!(get(&bases[PORTS as usize], "kernel").body, b"KERNEL");
+        assert!(server.loaded());
+        let events = server.take_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events[0].ends_with("asked for kernel of no boot going now (404)"), "{events:?}");
+        let old_token = bases[0].trim_end_matches('/').rsplit('/').next().unwrap();
+        assert!(!events[0].contains(old_token), "{events:?}");
+        assert_eq!(events[1], "GET kernel");
+        server.offer(Offer::Twin { kit: kit(&dir) }).unwrap();
+        assert!(!server.loaded());
     }
 
     #[test]

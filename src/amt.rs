@@ -339,6 +339,9 @@ pub mod fake {
     /// it: told whether the boot is from the network.
     pub type OnBoot = Box<dyn Fn(bool) + Send>;
 
+    /// Says whether a remote screen session is open.
+    pub type Busy = Box<dyn Fn() -> bool + Send>;
+
     /// The pretend machine's state.
     pub struct State {
         pub power: u32,
@@ -351,6 +354,11 @@ pub mod fake {
         pub calls: Vec<String>,
         pub on_boot: Option<OnBoot>,
         pub screen: Screen,
+        /// Whether a remote screen session is open: AMT turns power
+        /// changes down then, with ReturnValue 2.
+        pub screen_busy: Option<Busy>,
+        /// Whether AMT answers: when not, it hangs up on each request.
+        pub answering: bool,
         /// Nonces handed out, and the highest count used with each.
         nonce: u32,
     }
@@ -403,6 +411,8 @@ pub mod fake {
                 graceful: false,
                 calls: Vec::new(),
                 on_boot: None,
+                screen_busy: None,
+                answering: true,
                 screen: Screen {
                     in_mebx: true,
                     consent: 0,
@@ -465,6 +475,9 @@ pub mod fake {
         let _ = stream.set_nonblocking(false);
         let Ok(request) = http::read_request(stream) else { return };
         let mut state_now = state.lock().unwrap();
+        if !state_now.answering {
+            return;
+        }
         if request.path != "/wsman" || !signed_in(&request, state_now.nonce) {
             state_now.nonce += 1;
             let challenge = format!(
@@ -580,7 +593,15 @@ pub mod fake {
                 let wanted: u32 = wsman::text(&body, "PowerState").unwrap_or_default().parse().unwrap_or(0);
                 state_now.calls.push(format!("{method} {wanted}"));
                 let on = super::is_on(state_now.power);
+                // Asked with this lock let go: the screen's own lock is
+                // taken before this one when a session opens.
+                let busy = state_now.screen_busy.take();
+                drop(state_now);
+                let screen_open = busy.as_ref().is_some_and(|busy| busy());
+                state_now = state.lock().unwrap();
+                state_now.screen_busy = busy;
                 let value = match wanted {
+                    _ if screen_open => 2,
                     2 if on => 5,
                     10 if !on => 5,
                     12 if !state_now.graceful => 1,

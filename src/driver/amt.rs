@@ -63,6 +63,10 @@ const POWER_FRESH: Duration = Duration::from_secs(1);
 /// The port the machine's SSH server listens on.
 const SSH_PORT: u16 = 22;
 
+/// How long AMT may take to see a remote screen session close, and take
+/// power changes again.
+const SCREEN_CLOSE_TIME: Duration = Duration::from_secs(10);
+
 /// How long the remote screen may take to open a session: AMT may still
 /// be closing the one before.
 const SCREEN_OPEN_TIME: Duration = Duration::from_secs(30);
@@ -159,10 +163,13 @@ impl AmtDriver {
             log,
             started: Instant::now(),
         };
+        let ports: Vec<String> =
+            driver.server.addresses().iter().map(|address| address.port().to_string()).collect();
         driver.note(&format!(
-            "AMT at {}; net-boot server at {}; serial port {}",
+            "AMT at {}; net-boot server at {}, ports {}; serial port {}",
             driver.settings.address,
-            driver.server.address(),
+            driver.settings.lab_address,
+            ports.join(", "),
             driver.settings.serial.display()
         ));
         Ok(driver)
@@ -181,11 +188,26 @@ impl AmtDriver {
         }
     }
 
-    /// Changes the power through AMT, and notes it.
+    /// Changes the power through AMT, and notes it. AMT turns power
+    /// changes down while a remote screen session is open (AMT 11.8 on an
+    /// OptiPlex 7040 answers ReturnValue 2), so the session is closed
+    /// first, and the change tried again while AMT sees it close; the next
+    /// look at the screen opens another.
     fn change(&mut self, change: PowerChange) -> Result<(), String> {
+        let screen_was_open = self.screen.take().is_some();
+        if screen_was_open {
+            self.note("remote screen: session closed for a power change");
+        }
         self.power = None;
         self.note(&format!("power: {change:?}"));
-        let changed = self.amt.change_power(change);
+        let deadline = Instant::now() + SCREEN_CLOSE_TIME;
+        let changed = loop {
+            let changed = self.amt.change_power(change);
+            if changed.is_ok() || !screen_was_open || Instant::now() >= deadline {
+                break changed;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        };
         if let Err(err) = &changed {
             self.note(&format!("power: {err}"));
         }
@@ -305,10 +327,16 @@ impl AmtDriver {
                     break Err("the run was stopped".into());
                 }
                 if Instant::now() >= deadline {
-                    break Err(format!(
-                        "the writer did not finish within {} minutes",
-                        WRITE_TIME.as_secs() / 60
-                    ));
+                    let minutes = WRITE_TIME.as_secs() / 60;
+                    break Err(if self.server.loaded() {
+                        format!("the writer did not finish within {minutes} minutes")
+                    } else {
+                        format!(
+                            "the machine did not load the writer within {minutes} minutes: no \
+                             request for its kernel came, so its firmware or the network GRUB \
+                             may have gone on to the disk"
+                        )
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -531,13 +559,18 @@ pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Ch
     );
     add(
         "boot port",
-        match std::net::TcpListener::bind((lab, settings.boot_port)) {
-            Ok(_) => Ok(format!("port {} is free for the net-boot server", settings.boot_port)),
-            Err(err) => Err((
-                Verdict::Note,
-                format!("port {} is in use ({err}): by a run going now?", settings.boot_port),
-            )),
-        },
+        netboot::ports(settings.boot_port).map_err(problem).and_then(|ports| {
+            ports.iter().try_for_each(|&port| {
+                std::net::TcpListener::bind((lab, port)).map(drop).map_err(|err| {
+                    (Verdict::Note, format!("port {port} is in use ({err}): by a run going now?"))
+                })
+            })?;
+            Ok(format!(
+                "ports {} to {} are free for the net-boot server",
+                ports[0],
+                ports[ports.len() - 1]
+            ))
+        }),
     );
     let script = netboot::script_path(&settings.tftp, &settings.mac);
     add(
@@ -665,9 +698,11 @@ impl Driver for AmtDriver {
         match self.read_power() {
             Ok(on) => on,
             Err(err) => {
-                // As it was last seen: waits go on to their deadlines.
+                // As it was last seen, or on when nothing has been read
+                // since a power change: waits go on to their deadlines, and
+                // only AMT's word ends one as off.
                 self.note(&format!("power state: {err}"));
-                let last = self.power.is_some_and(|(_, on)| on);
+                let last = self.power.is_none_or(|(_, on)| on);
                 self.power = Some((Instant::now(), last));
                 last
             }
@@ -949,6 +984,9 @@ mod tests {
             let state = Arc::clone(&fake.state);
             FakeVnc::start(Box::new(move || state.lock().unwrap().screen.open_password()))
         };
+        let live = Arc::clone(&screen.state);
+        fake.state.lock().unwrap().screen_busy =
+            Some(Box::new(move || live.lock().unwrap().live > 0));
         driver.screen_address = screen.address.to_string();
         Bench { dir, fake, screen, driver }
     }
@@ -1031,6 +1069,24 @@ mod tests {
         assert!(!log.contains(PASSWORD));
         assert_eq!(bench.driver.peer_address().as_deref(), Some("127.0.0.1"));
         assert_eq!(bench.driver.reach(445, false), Ok(445));
+    }
+
+    #[test]
+    fn a_power_state_amt_does_not_give_is_as_last_seen_or_on() {
+        let mut bench = bench("amt-power-unknown", false);
+        let soon = Instant::now() + Duration::from_secs(5);
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        // Nothing read since the change: on, so waits go on.
+        bench.fake.state.lock().unwrap().answering = false;
+        assert!(bench.driver.is_on());
+        // Off as AMT last said.
+        bench.fake.state.lock().unwrap().answering = true;
+        bench.driver.power(PowerAction::Cut, soon).unwrap();
+        bench.fake.state.lock().unwrap().answering = false;
+        std::thread::sleep(POWER_FRESH);
+        assert!(!bench.driver.is_on());
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        assert!(log.contains("power state: AMT at"), "{log}");
     }
 
     #[test]
@@ -1123,8 +1179,18 @@ mod tests {
         bench.driver.screen_dump(&dump).unwrap();
         assert_eq!(bench.screen.events().last(), Some(&Event::Pointer(0, 63, 47)));
 
+        // AMT turns power changes down while a session is open, so the
+        // driver closes it first, and the next look opens another.
+        bench.driver.power(PowerAction::Cut, soon).unwrap();
+        assert!(!bench.driver.is_on());
+        assert_eq!(bench.screen.state.lock().unwrap().live, 0);
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        bench.driver.screen_dump(&dump).unwrap();
+        assert_eq!(bench.screen.state.lock().unwrap().sessions, 3);
+
         let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
         assert!(log.contains("remote screen: session open, 40x30"), "{log}");
+        assert!(log.contains("remote screen: session closed for a power change"), "{log}");
         let password = bench.fake.state.lock().unwrap().screen.password.clone().unwrap();
         assert!(!log.contains(&password), "{log}");
     }
