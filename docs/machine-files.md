@@ -115,4 +115,4 @@ lab network. [Real machines](real-machines.md) sets one up.
 | `boot_port` | `7431` | The net-boot server's port. Machines in the same run need ports of their own. |
 | `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
-| `console` | `ttyS0,115200` | The machine's serial port as Linux names it, for the writer and the Linux twin. |
+| `console` | `ttyS0,115200` | The machine's serial port as Linux names it, for the writer and the Linux twin. A board's own ports are `ttyS0` to `ttyS3`; PCI ports come after, from `ttyS4`, and with Serial-over-LAN on, AMT's own port is the first of them, so a serial card's first port is then `ttyS5`. |

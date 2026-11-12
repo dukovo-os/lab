@@ -435,6 +435,7 @@ pub mod tests {
                 &[],
                 &[],
                 Duration::from_secs(10),
+                Duration::ZERO,
             )?;
             if answer.status != 200 {
                 return Err(format!("GET {what}: {}", answer.status));
@@ -470,6 +471,7 @@ pub mod tests {
             &[],
             body.as_bytes(),
             Duration::from_secs(10),
+            Duration::ZERO,
         )?;
         Ok(String::from_utf8_lossy(&answer.body).trim().to_string())
     }
@@ -540,9 +542,16 @@ pub mod tests {
         // The kernel and initrd are the kit's.
         let rest = base.trim_start_matches("http://");
         let (host, path) = rest.split_once('/').unwrap();
-        let kernel =
-            http::send(host, "GET", &format!("/{path}kernel"), &[], &[], Duration::from_secs(5))
-                .unwrap();
+        let kernel = http::send(
+            host,
+            "GET",
+            &format!("/{path}kernel"),
+            &[],
+            &[],
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .unwrap();
         assert_eq!(kernel.body, b"KERNEL");
 
         // A disk that reads back wrong fails the boot, and the old token
@@ -583,6 +592,7 @@ pub mod tests {
             &[],
             b"no disk X",
             Duration::from_secs(5),
+            Duration::ZERO,
         )
         .unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));

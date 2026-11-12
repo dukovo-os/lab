@@ -286,9 +286,8 @@ impl AmtDriver {
         // The writer sets its own address: the card with the machine
         // file's MAC gets the machine's address on the lab's /24.
         let cmdline = format!(
-            "{} console={} dukovo.lab={{base}} dukovo.lab.ip={}/24 dukovo.lab.mac={}",
-            self.writer.cmdline,
-            self.settings.console,
+            "{} dukovo.lab={{base}} dukovo.lab.ip={}/24 dukovo.lab.mac={}",
+            with_console(&self.writer.cmdline, &self.settings.console),
             self.settings.machine_address,
             self.settings.mac.to_ascii_lowercase()
         );
@@ -595,6 +594,19 @@ fn read_password(path: &Path) -> Result<String, String> {
     Ok(password.to_string())
 }
 
+/// A kit's kernel command line with the machine's console in place of
+/// the kit's own. Kits name `console=ttyS0`, as QEMU's machines have it,
+/// and Linux keeps the options of a console's first mention: a later
+/// `console=ttyS0,115200` would leave the port at its default 9600 baud,
+/// which the lab reads at 115200 as a run of zero bytes.
+fn with_console(cmdline: &str, console: &str) -> String {
+    let mut words: Vec<&str> =
+        cmdline.split_whitespace().filter(|word| !word.starts_with("console=")).collect();
+    let console = format!("console={console}");
+    words.push(&console);
+    words.join(" ")
+}
+
 /// Says that a person does `what` on a real machine.
 fn persons_job(what: &str) -> String {
     format!(
@@ -795,7 +807,7 @@ impl Driver for AmtDriver {
         self.note("Linux twin: booting");
         self.hard_off()?;
         self.serial.switch_to(log)?;
-        let cmdline = format!("{} console={}", kit.cmdline, self.settings.console);
+        let cmdline = with_console(&kit.cmdline, &self.settings.console);
         let booted = self.net_boot("the Linux twin", Offer::Twin { kit: kit.clone() }, &cmdline);
         let measured = booted.and_then(|()| loop {
             let text = fs::read_to_string(log).unwrap_or_default();
@@ -953,6 +965,18 @@ mod tests {
     }
 
     #[test]
+    fn the_machine_console_takes_the_place_of_the_kits() {
+        assert_eq!(
+            with_console("console=ttyS0 loglevel=4", "ttyS0,115200"),
+            "loglevel=4 console=ttyS0,115200"
+        );
+        assert_eq!(
+            with_console("quiet console=ttyS0 console=tty0 rdinit=/writer", "ttyS5,115200"),
+            "quiet rdinit=/writer console=ttyS5,115200"
+        );
+    }
+
+    #[test]
     fn a_fresh_boot_writes_the_image_and_boots_the_disk() {
         let mut bench = bench("amt-fresh", false);
         bench.driver.boot_fresh().unwrap();
@@ -973,6 +997,8 @@ mod tests {
             script.contains(&format!("dukovo.lab.ip=127.0.0.1/24 dukovo.lab.mac={MAC}")),
             "{script}"
         );
+        assert_eq!(script.matches("console=").count(), 1, "{script}");
+        assert!(script.contains("console=ttyS4,115200"), "{script}");
         assert!(bench.driver.is_on());
         assert_eq!(
             bench.fake.calls(),
