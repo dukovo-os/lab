@@ -560,7 +560,7 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
         return Err("amt.baud must be 9600, 19200, 38400, 57600 or 115200".into());
     }
     if settings.console.is_empty() || settings.console.contains(char::is_whitespace) {
-        return Err("amt.console must be one Linux console name, such as ttyS5,115200".into());
+        return Err("amt.console must be one Linux console name, such as ttyS0,115200".into());
     }
     Ok(())
 }

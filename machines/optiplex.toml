@@ -23,10 +23,10 @@ disk = "SERIAL-OF-THE-SSD"
 # The lab PC's end of the serial cable.
 serial = "/dev/ttyUSB0"
 # The machine's serial port as Linux names it, for the writer and the
-# Linux twin: the serial card's first port. The 7040 has no serial port
-# on its board, and with Serial-over-LAN on, AMT's own port comes first
-# as ttyS4, so a PCIe serial card's ports are ttyS5 and ttyS6.
-console = "ttyS5,115200"
+# Linux twin: the board's COM1, at 3F8h. With Serial-over-LAN on, AMT's
+# own port is ttyS4, and a PCIe serial card's ports come after it, from
+# ttyS5.
+console = "ttyS0,115200"
 
 [controls]
 # Cables and sticks are handled by a person at the machine.

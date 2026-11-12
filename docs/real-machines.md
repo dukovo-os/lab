@@ -136,11 +136,14 @@ real machines yet; tests that need them are skipped there.
   each power change, each net boot, each request the writer made, and
   each remote screen session.
 - `logs/<machine>/writer-<n>.log` is the writer's console for boot `n`.
-  When it and `serial-<n>.log` stay empty, or hold only zero bytes,
-  while `amt.log` shows the writer at work, the machine file's
-  `console` names another port than the one cabled: AMT's
-  Serial-over-LAN port takes `ttyS4` when it is on, so a serial card's
-  first port is `ttyS5`.
+  When it and `serial-<n>.log` stay empty while `amt.log` shows the
+  writer at work, the machine file's `console` names another port than
+  the one cabled: with Serial-over-LAN on, AMT's own port is `ttyS4`,
+  and a serial card's ports come after it, from `ttyS5`. When they hold
+  mostly zero bytes, the port runs at another speed than the machine
+  file's `baud`. The lab puts the machine's `console` alone on the
+  writer's and the twin's command lines, in place of the kit's own,
+  because Linux keeps the speed of a port's first `console=`.
 - AMT refuses connections for a moment when the machine has been off
   and AMT left alone for a while: its engine dozes, and the first
   connection wakes it. The driver keeps trying for 20 seconds before it
