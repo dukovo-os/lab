@@ -66,7 +66,7 @@ Each step has exactly one action key, and only the options that go with it.
 
 | Action | Options | Does | Control |
 | --- | --- | --- | --- |
-| `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root`, `input` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. `input` is the command's standard input, at most 16 KiB, where `{password}` is the lab password: a file's text for `cat > file`, or a password a command asks for. | ssh |
+| `run = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root`, `input`, `or_skip` | Runs the command over SSH as the `lab` account, or as root with `root = true` (see below). Passes when it exits with `exit` and its output (standard output and errors together) holds every `expect` text and no `expect_not` text. Each of those is a string or a list of strings. `input` is the command's standard input, at most 16 KiB, where `{password}` is the lab password: a file's text for `cat > file`, or a password a command asks for. With `or_skip`, a command that does not pass skips the test with that reason, not fails it (see [Tests for one kind of machine](#tests-for-one-kind-of-machine)). | ssh |
 | `bench = "<command>"` | `rows` (required), `limit` (default 1.00), `root` | Runs a benchmark program over SSH and holds each of its `rows` to the same row on the machine's Linux twin: passes when Dukovo takes at most `limit` times Linux's time per operation (see [Performance tests](#performance-tests)). | ssh, linux |
 | `attack = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command on the attacker, a second machine on a private network only it and the machine under test share, and holds its output as `run` does. `{target}` in the command, `expect` or `expect_not` becomes the machine's address on that network. See [Attack tests](#attack-tests-the-security-range). | attack |
 | `host = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root`, `input`, or `background` and `ready` | Runs the command on the lab PC, in a folder of the test's own, and holds it as `run` does; with `background = true`, starts a server there that runs until the test ends, waiting until its output holds `ready` when given. See [The lab PC as a peer](#the-lab-pc-as-a-peer). | peer |
@@ -124,6 +124,24 @@ them to a shell: `run = "sh -c 'mkfs-fat /devices/sdb && fsck-fat -n /devices/sd
 run = "service --status-all"
 root = true
 expect = "[ + ]  sshd"
+```
+
+## Tests for one kind of machine
+
+A test of what only some machines have, such as Azure's or VMware's
+devices, starts with a `run` step that checks the machine is of that
+kind, with `or_skip` giving the reason the test is skipped elsewhere. A
+command that ends but does not pass skips the test, with what the check
+found below the reason; one SSH cannot run, or that is still running at
+the time limit, fails as any step does. Put the check first: a test
+skipped at its first step changed nothing, so the next test goes on in
+the same boot.
+
+```toml
+[[step]]
+run = "cat /kernel/class/dmi/id/sys_vendor"
+expect = "VMware"
+or_skip = "needs a VMware machine"
 ```
 
 ## Reading the screen

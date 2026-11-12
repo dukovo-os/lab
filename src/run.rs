@@ -122,6 +122,31 @@ fn check_command(
     Ok(Some(shown))
 }
 
+/// Checks a `run` step's command. An `or_skip` step checks that the
+/// machine is of the kind the test needs: a command that ended but did not
+/// end or print as the step says skips the test, with what the check found
+/// below the step's reason. One SSH could not run, or that was still
+/// running at the time limit, fails as any step's does: it says nothing
+/// about the machine's kind.
+fn check_run(
+    command: &Command,
+    output: &ssh::Output,
+    shown: String,
+) -> Result<Option<String>, StepFailure> {
+    let checked = check_command(command, output, shown, true);
+    let ended = match output.status {
+        None => false,
+        Some(255) => command.exit == 255,
+        Some(_) => true,
+    };
+    match (checked, &command.or_skip) {
+        (Err(StepFailure::Fail(why)), Some(reason)) if ended => {
+            Err(StepFailure::Skip(format!("{reason}\n{why}")))
+        }
+        (checked, _) => checked,
+    }
+}
+
 /// What to run.
 pub struct Request<'a> {
     pub tests: Vec<&'a Test>,
@@ -592,6 +617,9 @@ impl<'a> Worker<'a> {
         }
 
         let mut failure = None;
+        // Whether the test was skipped at its first step, a check that the
+        // machine fits it, which leaves the boot as it found it.
+        let mut unfit = false;
         if let Boot::Stick { disk } = test.boot {
             let (record, outcome) =
                 self.timed(test, "boot from the install stick, with a blank disk", |worker| {
@@ -628,6 +656,9 @@ impl<'a> Worker<'a> {
             let (record, outcome) =
                 self.timed(test, &step.describe(), |worker| worker.run_step(test, step, deadline));
             steps.push(record);
+            unfit = index == 0
+                && matches!(step, Step::Run(command) if command.or_skip.is_some())
+                && matches!(outcome, Err(StepFailure::Skip(_)));
             failure = outcome.err().map(|failure| match failure {
                 StepFailure::Fail(why) => StepFailure::Fail(format!("step {}: {why}", index + 1)),
                 StepFailure::Error(why) => StepFailure::Error(format!("step {}: {why}", index + 1)),
@@ -658,9 +689,12 @@ impl<'a> Worker<'a> {
         // private network port a later test must not find, a card test's
         // boot the card reader, a disc test's the optical drive, a floppy
         // test's the floppy drive and a CompactFlash test's the card, so
-        // they are not shared either.
-        self.reusable =
-            result == Outcome::Pass && self.driver.is_on() && test.boot == Boot::Image && !own_boot;
+        // they are not shared either. A test skipped at its first step, as
+        // the machine does not fit it, changed nothing: its boot goes on.
+        self.reusable = (result == Outcome::Pass || unfit && result == Outcome::Skip)
+            && self.driver.is_on()
+            && test.boot == Boot::Image
+            && !own_boot;
         let log = self.write_log(test, result, reason.as_deref());
         let milliseconds = started.elapsed().as_millis() as u64;
         let boot = (self.boot > 0).then_some(self.boot);
@@ -1011,7 +1045,7 @@ impl<'a> Worker<'a> {
         let input = self.fill_input(&command)?;
         let (output, shown) =
             self.execute(&command.command, command.root, input.as_deref(), deadline)?;
-        check_command(&command, &output, shown, true)
+        check_run(&command, &output, shown)
     }
 
     /// Runs a `host` step's command on the lab PC and checks it as a `run`
@@ -1160,6 +1194,7 @@ impl<'a> Worker<'a> {
                 .collect::<Result<_, _>>()?,
             root: command.root,
             input: command.input.as_deref().map(|input| self.fill(input)).transpose()?,
+            or_skip: command.or_skip.clone(),
         })
     }
 
@@ -1230,6 +1265,7 @@ impl<'a> Worker<'a> {
                 .collect(),
             root: command.root,
             input: None,
+            or_skip: None,
         };
         let (output, shown) = self.execute_attack(&resolved.command, resolved.root, deadline)?;
         check_command(&resolved, &output, shown, true)
@@ -1844,6 +1880,37 @@ mod fake;
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn a_machine_of_another_kind_skips_an_or_skip_test() {
+        let azure = Command {
+            command: "cat /kernel/class/dmi/id/sys_vendor".into(),
+            exit: 0,
+            expect: vec!["Microsoft Corporation".into()],
+            expect_not: vec![],
+            root: false,
+            input: None,
+            or_skip: Some("needs an Azure machine".into()),
+        };
+        let output = |status, text: &str| ssh::Output { status, text: text.into() };
+        let check = |command: &Command, status, text| {
+            check_run(command, &output(status, text), "$ cat".into())
+        };
+        assert!(matches!(check(&azure, Some(0), "Microsoft Corporation\n"), Ok(Some(_))));
+        // Another vendor, or no such file: the test is skipped, and says why.
+        let Err(StepFailure::Skip(why)) = check(&azure, Some(0), "Dell Inc.\n") else {
+            panic!("another vendor did not skip");
+        };
+        assert!(why.starts_with("needs an Azure machine\n"), "{why}");
+        assert!(why.contains("its output lacks \"Microsoft Corporation\""), "{why}");
+        assert!(matches!(check(&azure, Some(1), ""), Err(StepFailure::Skip(_))));
+        // SSH not running it, or the time limit, says nothing of the kind.
+        assert!(matches!(check(&azure, Some(255), ""), Err(StepFailure::Fail(_))));
+        assert!(matches!(check(&azure, None, ""), Err(StepFailure::Fail(_))));
+        // Without or_skip, a check that fails fails the test.
+        let plain = Command { or_skip: None, ..azure.clone() };
+        assert!(matches!(check(&plain, Some(0), "Dell Inc.\n"), Err(StepFailure::Fail(_))));
+    }
 
     #[test]
     fn removes_escapes_the_same_way_as_the_log_grows() {
