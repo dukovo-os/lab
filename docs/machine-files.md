@@ -77,7 +77,7 @@ What each driver does by itself:
 | Driver | Controls |
 | --- | --- |
 | `qemu` | All of them. |
-| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial`, `ssh`, `linux` and `peer`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `keys`, `mouse`, `screen` and `attack` are not done on real machines yet. |
+| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial`, `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux` and `peer`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
 
 ## QEMU hardware
 

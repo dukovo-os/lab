@@ -17,10 +17,10 @@ a feature and its lab test land together and the lab always runs the
 tests that match the build.
 
 **Status:** in progress (item 14f of Dukovo's roadmap). `dukovo-lab`
-runs tests on QEMU machines and on real machines with Intel AMT, writes
-results bundles, groups failures into findings, sends them to the
-private results repository, runs schedules on a systemd timer, and
-serves the runner page. AMT's remote screen comes next.
+runs tests on QEMU machines and on real machines with Intel AMT,
+screen, keyboard and mouse included, writes results bundles, groups
+failures into findings, sends them to the private results repository,
+runs schedules on a systemd timer, and serves the runner page.
 
 ## Getting started
 

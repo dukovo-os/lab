@@ -372,13 +372,17 @@ fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
         // port forwarding.
         DriverKind::Qemu => Control::ALL.iter().map(|&control| (control, Who::Driver)).collect(),
         // AMT does power and the power cut (its hard off, which the system
-        // gets no warning of), the serial cable the console, the lab
-        // network SSH and the lab PC's side, and net boot the Linux twin.
-        // Cables, sticks, cards and discs are a person's to handle.
+        // gets no warning of), and its remote screen the keys, mouse and
+        // screen; the serial cable does the console, the lab network SSH
+        // and the lab PC's side, and net boot the Linux twin. Cables,
+        // sticks, cards and discs are a person's to handle.
         DriverKind::Amt => [
             Control::Power,
             Control::Cord,
             Control::Serial,
+            Control::Keys,
+            Control::Mouse,
+            Control::Screen,
             Control::Ssh,
             Control::Linux,
             Control::Peer,
@@ -688,15 +692,21 @@ mod tests {
         let real = machines.iter().find(|machine| machine.name == "box").unwrap();
         assert_eq!(real.driver, DriverKind::Amt);
         assert!(real.qemu.is_none());
-        for control in [Control::Power, Control::Cord, Control::Serial, Control::Ssh, Control::Peer]
-        {
+        for control in [
+            Control::Power,
+            Control::Cord,
+            Control::Serial,
+            Control::Keys,
+            Control::Mouse,
+            Control::Screen,
+            Control::Ssh,
+            Control::Peer,
+        ] {
             assert_eq!(real.who(control), Who::Driver, "{control}");
         }
         assert_eq!(real.who(Control::Linux), Who::Driver);
         assert_eq!(real.who(Control::Link), Who::Person);
-        for control in
-            [Control::Usb, Control::Card, Control::Keys, Control::Screen, Control::Attack]
-        {
+        for control in [Control::Usb, Control::Card, Control::Disc, Control::Attack] {
             assert_eq!(real.who(control), Who::None, "{control}");
         }
         let amt = real.amt.as_ref().unwrap();

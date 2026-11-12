@@ -11,15 +11,22 @@
 //! nothing it does waits for someone at the machine to agree.
 //!
 //! The classes and methods are AMT's, as Intel's AMT SDK documents them:
-//! `CIM_PowerManagementService.RequestPowerStateChange` for power, and
+//! `CIM_PowerManagementService.RequestPowerStateChange` for power,
 //! `CIM_BootConfigSetting.ChangeBootOrder` with
 //! `CIM_BootService.SetBootConfigRole` for a one-time boot from the
-//! network.
+//! network, and for the remote screen (KVM) on the standard VNC port,
+//! `IPS_KVMRedirectionSettingData`, `AMT_RedirectionService`'s listener and
+//! `CIM_KVMRedirectionSAP.RequestStateChange`.
 
 use crate::wsman::{self, Client, Selector};
 
 const CIM: &str = "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2";
 const IPS: &str = "http://intel.com/wbem/wscim/1/ips-schema/1";
+const AMT: &str = "http://intel.com/wbem/wscim/1/amt-schema/1";
+
+/// The keys of AMT's services, which a Put or a method names them by.
+const SERVICE_KEYS: [&str; 4] =
+    ["CreationClassName", "Name", "SystemCreationClassName", "SystemName"];
 
 /// What the machine's power is to become.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +74,52 @@ pub fn describe(state: u32) -> String {
         _ => "another state",
     };
     format!("{name} ({state})")
+}
+
+/// AMT's remote screen, as `machines check` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteScreen {
+    /// Whether KVM is on in MEBx: nothing on the network turns it on
+    /// otherwise.
+    pub in_mebx: bool,
+    /// Whether AMT asks someone at the machine for a code before each
+    /// session: `IPS_OptInService`'s OptInRequired, 0 for never.
+    pub consent: u32,
+}
+
+/// A password for AMT's remote screen, made afresh for each run: VNC's
+/// passwords are eight characters, and AMT wants an upper-case letter, a
+/// lower-case one, a digit and a mark among them.
+pub fn screen_password() -> Result<String, String> {
+    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const LOWER: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+    const DIGITS: &[u8] = b"23456789";
+    const MARKS: &[u8] = b"!#%*+-=?@^_";
+    const ANY: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!#%*+-=?@^_";
+    let hex = crate::netboot::random_hex(8)?;
+    let random: Vec<u8> =
+        (0..8).map(|n| u8::from_str_radix(&hex[2 * n..2 * n + 2], 16).unwrap_or(0)).collect();
+    let pick = |set: &[u8], byte: u8| char::from(set[usize::from(byte) % set.len()]);
+    let sets = [UPPER, LOWER, DIGITS, MARKS, ANY, ANY, ANY, ANY];
+    Ok(sets.iter().zip(random).map(|(set, byte)| pick(set, byte)).collect())
+}
+
+/// Sets `name` to `value` among `properties`, in its place, or last.
+fn set(properties: &mut Vec<(String, String)>, name: &str, value: &str) {
+    match properties.iter_mut().find(|(property, _)| property == name) {
+        Some((_, old)) => *old = value.to_string(),
+        None => properties.push((name.to_string(), value.to_string())),
+    }
+}
+
+/// The value of `name` among `properties`.
+fn value<'a>(properties: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    properties.iter().find(|(property, _)| property == name).map(|(_, value)| value.as_str())
+}
+
+/// The selectors that pick the instance `properties` describe, by `keys`.
+fn selectors<'a>(properties: &'a [(String, String)], keys: &[&'a str]) -> Vec<Selector<'a>> {
+    keys.iter().filter_map(|&key| value(properties, key).map(|value| (key, value))).collect()
 }
 
 /// AMT on one machine.
@@ -155,6 +208,88 @@ impl Amt {
         mode.parse().map_err(|_| format!("AMT gave the control mode \"{mode}\""))
     }
 
+    /// The remote screen's state in MEBx, and whether it asks for consent.
+    pub fn remote_screen(&self) -> Result<RemoteScreen, String> {
+        let settings = self.client.get(&format!("{IPS}/IPS_KVMRedirectionSettingData"), &[])?;
+        let in_mebx = wsman::text(&settings, "EnabledByMEBx").as_deref() != Some("false");
+        let opt_in = self.client.get(&format!("{IPS}/IPS_OptInService"), &[])?;
+        let consent = wsman::text(&opt_in, "OptInRequired").unwrap_or_default();
+        let consent =
+            consent.parse().map_err(|_| format!("AMT gave the consent setting \"{consent}\""))?;
+        Ok(RemoteScreen { in_mebx, consent })
+    }
+
+    /// Turns AMT's remote screen on for a standard VNC client on port
+    /// 5900, signing in with `password` (as [`screen_password`] makes):
+    /// the port and its password, the redirection listener every remote
+    /// session needs, and KVM itself. What is on already is left as it is.
+    pub fn turn_on_remote_screen(&self, password: &str) -> Result<(), String> {
+        let screen = self.remote_screen()?;
+        if !screen.in_mebx {
+            return Err("KVM is off in MEBx, and only MEBx turns it on: turn on KVM Feature \
+                        Selection there (Ctrl+P as the machine starts)"
+                .into());
+        }
+        if screen.consent != 0 {
+            return Err(format!(
+                "AMT asks someone at the machine for a code before each remote screen session \
+                 (OptInRequired {}): set User Opt-in to None in MEBx",
+                screen.consent
+            ));
+        }
+        let kvm = format!("{IPS}/IPS_KVMRedirectionSettingData");
+        let mut settings = self.instance(&kvm)?;
+        set(&mut settings, "Is5900PortEnabled", "true");
+        if value(&settings, "OptInPolicy").is_some() {
+            set(&mut settings, "OptInPolicy", "false");
+        }
+        set(&mut settings, "RFBPassword", password);
+        self.client
+            .put(&kvm, &selectors(&settings, &["InstanceID"]), &wsman::instance(&kvm, &settings))
+            .map_err(|err| format!("turning on port 5900 for the remote screen: {err}"))?;
+        let redirection = format!("{AMT}/AMT_RedirectionService");
+        let mut service = self.instance(&redirection)?;
+        if value(&service, "ListenerEnabled") != Some("true") {
+            set(&mut service, "ListenerEnabled", "true");
+            self.client
+                .put(
+                    &redirection,
+                    &selectors(&service, &SERVICE_KEYS),
+                    &wsman::instance(&redirection, &service),
+                )
+                .map_err(|err| format!("turning on AMT's redirection listener: {err}"))?;
+        }
+        // KVM itself: 2 is on with a session, 6 on and waiting for one.
+        let point = format!("{CIM}/CIM_KVMRedirectionSAP");
+        let access = self.instance(&point)?;
+        if !matches!(value(&access, "EnabledState"), Some("2" | "6")) {
+            let arguments = format!(
+                "<h:RequestStateChange_INPUT xmlns:h=\"{point}\">\
+                 <h:RequestedState>2</h:RequestedState></h:RequestStateChange_INPUT>"
+            );
+            self.client
+                .invoke(
+                    &point,
+                    "RequestStateChange",
+                    &selectors(&access, &SERVICE_KEYS),
+                    &arguments,
+                )
+                .map_err(|err| format!("turning on KVM: {err}"))?;
+        }
+        Ok(())
+    }
+
+    /// The properties of the one instance of `class`.
+    fn instance(&self, class: &str) -> Result<Vec<(String, String)>, String> {
+        let name = class.rsplit('/').next().unwrap_or(class);
+        let answer = self.client.get(class, &[])?;
+        let inside = wsman::elements(&answer, name)
+            .first()
+            .copied()
+            .ok_or_else(|| format!("AMT's answer holds no {name}"))?;
+        Ok(wsman::properties(inside))
+    }
+
     /// The power states AMT can change the machine to.
     pub fn power_changes(&self) -> Result<Vec<u32>, String> {
         let items = self.client.enumerate(&format!("{CIM}/CIM_PowerManagementCapabilities"))?;
@@ -215,8 +350,39 @@ pub mod fake {
         /// Each method invoked, by name.
         pub calls: Vec<String>,
         pub on_boot: Option<OnBoot>,
+        pub screen: Screen,
         /// Nonces handed out, and the highest count used with each.
         nonce: u32,
+    }
+
+    /// The pretend remote screen's settings.
+    pub struct Screen {
+        pub in_mebx: bool,
+        pub consent: u32,
+        pub port_5900: bool,
+        pub listener: bool,
+        /// CIM_KVMRedirectionSAP's EnabledState: 3 off, 6 on.
+        pub kvm: u32,
+        pub password: Option<String>,
+    }
+
+    impl Screen {
+        /// The password a VNC client signs in with, while the port is on.
+        pub fn open_password(&self) -> Option<String> {
+            let on = self.port_5900 && self.listener && matches!(self.kvm, 2 | 6);
+            self.password.clone().filter(|_| on)
+        }
+    }
+
+    /// Whether AMT would take `password` for the remote screen: eight
+    /// characters, with an upper-case letter, a lower-case one, a digit
+    /// and a mark.
+    pub fn strong(password: &str) -> bool {
+        password.len() == 8
+            && password.bytes().any(|b| b.is_ascii_uppercase())
+            && password.bytes().any(|b| b.is_ascii_lowercase())
+            && password.bytes().any(|b| b.is_ascii_digit())
+            && password.bytes().any(|b| b.is_ascii_punctuation())
     }
 
     /// A pretend AMT, listening until dropped.
@@ -237,6 +403,14 @@ pub mod fake {
                 graceful: false,
                 calls: Vec::new(),
                 on_boot: None,
+                screen: Screen {
+                    in_mebx: true,
+                    consent: 0,
+                    port_5900: false,
+                    listener: false,
+                    kvm: 3,
+                    password: None,
+                },
                 nonce: 0,
             }));
             let done = Arc::new(AtomicBool::new(false));
@@ -337,6 +511,61 @@ pub mod fake {
             }
             "Get" if class_name == "IPS_HostBasedSetupService" => {
                 "<h:IPS_HostBasedSetupService><h:CurrentControlMode>2</h:CurrentControlMode></h:IPS_HostBasedSetupService>".into()
+            }
+            "Get" if class_name == "IPS_KVMRedirectionSettingData" => format!(
+                "<h:IPS_KVMRedirectionSettingData><h:ElementName>Intel(r) KVM Redirection Settings</h:ElementName>\
+                 <h:InstanceID>Intel(r) KVM Redirection Settings</h:InstanceID>\
+                 <h:EnabledByMEBx>{}</h:EnabledByMEBx><h:Is5900PortEnabled>{}</h:Is5900PortEnabled>\
+                 <h:OptInPolicy>true</h:OptInPolicy><h:SessionTimeout>3</h:SessionTimeout>\
+                 </h:IPS_KVMRedirectionSettingData>",
+                state_now.screen.in_mebx, state_now.screen.port_5900
+            ),
+            "Get" if class_name == "IPS_OptInService" => format!(
+                "<h:IPS_OptInService><h:OptInRequired>{}</h:OptInRequired></h:IPS_OptInService>",
+                state_now.screen.consent
+            ),
+            "Get" if class_name == "AMT_RedirectionService" => format!(
+                "<h:AMT_RedirectionService><h:CreationClassName>AMT_RedirectionService</h:CreationClassName>\
+                 <h:ElementName>Intel(r) AMT Redirection Service</h:ElementName>\
+                 <h:EnabledState>32771</h:EnabledState><h:ListenerEnabled>{}</h:ListenerEnabled>\
+                 <h:Name>Intel(r) AMT Redirection Service</h:Name>\
+                 <h:SystemCreationClassName>CIM_ComputerSystem</h:SystemCreationClassName>\
+                 <h:SystemName>Intel(r) AMT</h:SystemName></h:AMT_RedirectionService>",
+                state_now.screen.listener
+            ),
+            "Get" if class_name == "CIM_KVMRedirectionSAP" => format!(
+                "<h:CIM_KVMRedirectionSAP><h:CreationClassName>CIM_KVMRedirectionSAP</h:CreationClassName>\
+                 <h:EnabledState>{}</h:EnabledState><h:Name>KVM Redirection Service Access Point</h:Name>\
+                 <h:SystemCreationClassName>CIM_ComputerSystem</h:SystemCreationClassName>\
+                 <h:SystemName>ManagedSystem</h:SystemName></h:CIM_KVMRedirectionSAP>",
+                state_now.screen.kvm
+            ),
+            // A Put must give the whole instance back, named by its keys.
+            "Put" if class_name == "IPS_KVMRedirectionSettingData"
+                && wsman::text(&body, "Selector").as_deref() == Some("Intel(r) KVM Redirection Settings")
+                && wsman::text(&body, "ElementName").is_some()
+                && wsman::text(&body, "RFBPassword").is_some_and(|password| strong(&password)) =>
+            {
+                state_now.screen.port_5900 = wsman::text(&body, "Is5900PortEnabled").as_deref() == Some("true");
+                state_now.screen.password = wsman::text(&body, "RFBPassword");
+                state_now.calls.push(format!("Put {class_name}"));
+                "<h:IPS_KVMRedirectionSettingData/>".into()
+            }
+            "Put" if class_name == "AMT_RedirectionService"
+                && wsman::texts(&body, "Selector").len() == 4
+                && wsman::text(&body, "EnabledState").is_some() =>
+            {
+                state_now.screen.listener = wsman::text(&body, "ListenerEnabled").as_deref() == Some("true");
+                state_now.calls.push(format!("Put {class_name}"));
+                "<h:AMT_RedirectionService/>".into()
+            }
+            "RequestStateChange" if class_name == "CIM_KVMRedirectionSAP" => {
+                let wanted = wsman::text(&body, "RequestedState").unwrap_or_default();
+                state_now.calls.push(format!("{method} {wanted}"));
+                if wanted == "2" && state_now.screen.in_mebx {
+                    state_now.screen.kvm = 6;
+                }
+                "<h:RequestStateChange_OUTPUT><h:ReturnValue>0</h:ReturnValue></h:RequestStateChange_OUTPUT>".into()
             }
             "ChangeBootOrder" => {
                 state_now.network_next = body.contains("Intel(r) AMT: Force PXE Boot");
@@ -447,6 +676,54 @@ mod tests {
         assert_eq!(amt.version().unwrap(), "11.8.50");
         assert_eq!(amt.control_mode().unwrap(), 2);
         assert_eq!(amt.power_changes().unwrap(), [2, 8, 10]);
+    }
+
+    #[test]
+    fn turns_the_remote_screen_on() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        assert_eq!(amt.remote_screen().unwrap(), RemoteScreen { in_mebx: true, consent: 0 });
+        let password = screen_password().unwrap();
+        amt.turn_on_remote_screen(&password).unwrap();
+        assert_eq!(
+            fake.calls(),
+            [
+                "Put IPS_KVMRedirectionSettingData",
+                "Put AMT_RedirectionService",
+                "RequestStateChange 2"
+            ]
+        );
+        assert_eq!(fake.state.lock().unwrap().screen.open_password(), Some(password.clone()));
+        // Once on, only the password changes.
+        let again = screen_password().unwrap();
+        amt.turn_on_remote_screen(&again).unwrap();
+        assert_eq!(fake.calls().len(), 4);
+        assert_eq!(fake.state.lock().unwrap().screen.open_password(), Some(again));
+    }
+
+    #[test]
+    fn the_remote_screen_needs_mebx_and_no_consent() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        fake.state.lock().unwrap().screen.consent = 1;
+        let err = amt.turn_on_remote_screen("Lk7!pQ2#").unwrap_err();
+        assert!(err.contains("User Opt-in to None"), "{err}");
+        fake.state.lock().unwrap().screen.in_mebx = false;
+        let err = amt.turn_on_remote_screen("Lk7!pQ2#").unwrap_err();
+        assert!(err.contains("KVM Feature Selection"), "{err}");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn screen_passwords_are_strong_and_new() {
+        let passwords: Vec<String> = (0..50).map(|_| screen_password().unwrap()).collect();
+        for password in &passwords {
+            assert!(super::fake::strong(password), "{password}");
+        }
+        let mut unique = passwords.clone();
+        unique.sort();
+        unique.dedup();
+        assert!(unique.len() > 45);
     }
 
     #[test]
