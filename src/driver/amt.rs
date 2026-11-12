@@ -890,6 +890,10 @@ impl Driver for AmtDriver {
         Some(self.settings.machine_address.clone())
     }
 
+    fn amt_address(&self) -> Option<String> {
+        Some(self.settings.address.clone())
+    }
+
     fn reach(&mut self, port: u16, _udp: bool) -> Result<u16, String> {
         // The lab PC is on the machine's network: its ports are its own.
         Ok(port)

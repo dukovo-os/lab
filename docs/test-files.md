@@ -338,6 +338,7 @@ real machine. The runner fills them in, in the command, `input`,
 | `{peer}` | The lab PC's address as the machine sees it: under QEMU, `10.0.2.2`, where the guest reaches the lab PC's own loopback. | run, host |
 | `{port:NAME}` | A port of the lab PC's, free for TCP and UDP when the test first names it and the same for the rest of the test, for one of its servers: `{port:kdc}`, `{port:smb}`. | run, host |
 | `{machine}` | The machine's address as the lab PC reaches it: under QEMU, `127.0.0.1`. | host |
+| `{amt}` | The address of the machine's Intel AMT on the lab network, for its web (16992) and WS-Management ports. A test that names it needs the `amt` control: machines without AMT, as QEMU, skip it. | host |
 | `{machine-port:N}` | The lab PC's port that reaches the machine's TCP port N, so the lab PC's clients reach the machine's servers: under QEMU, a free port forwarded to the guest's port N for the rest of the boot. `{machine-udp-port:N}` for UDP. | host |
 | `{work}` | The test's own folder on the lab PC, where host steps run. It goes when the test ends. | host |
 | `{here}` | The folder the test file is in, for a script beside the test. | host |

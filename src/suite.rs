@@ -656,6 +656,17 @@ impl Test {
         if self.steps.iter().any(|step| matches!(step, Step::Run(command) if names_peer(command))) {
             controls.insert(Control::Peer);
         }
+        // A host step that names the machine's AMT reaches it.
+        let names_amt = |text: &str| peer::uses_amt(text);
+        if self.steps.iter().any(|step| match step {
+            Step::Host(command) => {
+                names_amt(&command.command) || command.input.as_deref().is_some_and(names_amt)
+            }
+            Step::Serve(serve) => names_amt(&serve.command),
+            _ => false,
+        }) {
+            controls.insert(Control::Amt);
+        }
         // The install stick is plugged in as the machine powers on, and
         // the install DVD is in the optical drive.
         match self.boot {
@@ -2267,6 +2278,31 @@ expect = "1 received"
         machine.controls.insert(Control::Ssh, Who::None);
         assert_eq!(test.fit(&machine), Fit::Lacks(vec![Control::Ssh]));
         assert_eq!(test.fit(&machine).skip_reason().unwrap(), "the machine has no ssh");
+    }
+
+    #[test]
+    fn a_test_that_reaches_amt_needs_a_machine_with_it() {
+        let dir = TempDir::new("suite-amt");
+        dir.write(
+            "drivers/amt.toml",
+            "about = \"x\"\ntime = \"1m\"\n\
+             [[step]]\nhost = \"curl -s http://{amt}:16992/\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert!(test.controls().contains(&Control::Amt));
+        // QEMU has no AMT; a machine whose driver is amt reaches it.
+        let mut machine = crate::machines::load(&dir.path().join("none")).unwrap().remove(0);
+        assert_eq!(test.fit(&machine), Fit::Lacks(vec![Control::Amt]));
+        assert_eq!(test.fit(&machine).skip_reason().unwrap(), "the machine has no amt");
+        machine.controls.insert(Control::Amt, Who::Driver);
+        assert_eq!(test.fit(&machine), Fit::Runs);
+        // The machine itself does not reach its own AMT in a test.
+        dir.write(
+            "drivers/amt.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"curl http://{amt}:16992/\"\n",
+        );
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("{amt} names something of the lab PC's"), "{why}");
     }
 
     #[test]

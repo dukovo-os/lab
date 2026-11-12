@@ -55,7 +55,8 @@ of the machine's own, which security tests probe it from) and `peer`
 (the lab PC as a peer on the machine's network: servers the lab PC runs
 that the machine reaches, such as a Kerberos KDC or a file server, and
 the machine's ports forwarded to the lab PC, so the lab PC's clients
-reach the machine's own servers). Each is done by one of:
+reach the machine's own servers) and `amt` (the lab PC reaching the
+machine's Intel AMT, `{amt}`, while the system runs). Each is done by one of:
 
 | Value | Meaning |
 | --- | --- |
@@ -65,9 +66,9 @@ reach the machine's own servers). Each is done by one of:
 
 A machine starts with every control its driver can do (QEMU can do all
 of them) set to `driver`. `[controls]` can hand one to a person or take
-it away, but cannot make a driver do what it cannot. `linux`, `attack`
-and `peer` are `driver` or `none`: a person cannot measure Linux, run the
-attacker or stand in for the lab PC's side.
+it away, but cannot make a driver do what it cannot. `linux`, `attack`,
+`peer` and `amt` are `driver` or `none`: a person cannot measure Linux,
+run the attacker, or stand in for the lab PC's side or for AMT.
 
 So one test file serves every machine: plugging in a USB stick is
 automatic on QEMU, a Needs you step on a real machine.
@@ -76,8 +77,8 @@ What each driver does by itself:
 
 | Driver | Controls |
 | --- | --- |
-| `qemu` | All of them. |
-| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial`, `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux` and `peer`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
+| `qemu` | All of them but `amt`. |
+| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial`, `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
 
 ## QEMU hardware
 
