@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::machines::{Control, Machine, Who, is_plain_name};
-use crate::peer::{self, INPUT_MAX};
+use crate::peer::{self, INPUT_MAX, Token};
 use crate::units::{format_duration, parse_duration};
 
 /// The categories when a tests folder has no `categories.toml`: those
@@ -144,6 +144,9 @@ pub struct Test {
     /// The size of the CompactFlash card in an IDE adapter the test
     /// formats, if it asks for one: a blank one on QEMU.
     pub cf: Option<u64>,
+    /// The virtual machine's devices the test needs, which its boot gives
+    /// the machine: [`Control::GuestAgent`] and [`Control::VirtioScsi`].
+    pub hardware: Vec<Control>,
 }
 
 /// The card reader a test's memory cards go in.
@@ -681,6 +684,7 @@ impl Test {
         if self.cf.is_some() {
             controls.insert(Control::Cf);
         }
+        controls.extend(&self.hardware);
         controls.insert(Control::Power);
         controls.insert(Control::Serial);
         controls
@@ -760,9 +764,15 @@ struct TestFile {
     #[serde(default)]
     host_needs: Vec<String>,
     cf: Option<String>,
+    #[serde(default)]
+    hardware: Vec<String>,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
+
+/// The devices a test may ask a virtual machine's boot for, by the names
+/// `hardware` takes.
+pub const HARDWARE: [Control; 2] = [Control::GuestAgent, Control::VirtioScsi];
 
 /// The largest CompactFlash card a test may ask for: what 28-bit
 /// addresses reach, as many cards' do.
@@ -955,6 +965,16 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         Some(BootFrom::Stick) => Boot::Stick { disk },
         Some(BootFrom::Dvd) => Boot::Dvd { disk },
     };
+    let mut hardware = Vec::new();
+    for name in &file.hardware {
+        let Some(device) = HARDWARE.iter().find(|device| device.name() == name) else {
+            let names: Vec<&str> = HARDWARE.iter().map(|device| device.name()).collect();
+            return Err(bad(format!("hardware: {name:?} is not one of {}", names.join(", "))));
+        };
+        if !hardware.contains(device) {
+            hardware.push(*device);
+        }
+    }
     // A program's name, as the lab PC's PATH finds it: no folders.
     if let Some(bad_name) = file.host_needs.iter().find(|name| {
         name.is_empty()
@@ -1039,6 +1059,21 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             return Err(bad(format!("two screenshots are named \"{shot}\"")));
         }
     }
+    // The guest agent channel's socket is there only on a boot that
+    // has the channel.
+    let names_agent = |text: &str| {
+        peer::scan(text).is_ok_and(|found| found.iter().any(|(_, t)| *t == Token::GuestAgent))
+    };
+    let agent_named = steps.iter().any(|step| match step {
+        Step::Host(command) => {
+            names_agent(&command.command) || command.input.as_deref().is_some_and(names_agent)
+        }
+        Step::Serve(serve) => names_agent(&serve.command),
+        _ => false,
+    });
+    if agent_named && !hardware.contains(&Control::GuestAgent) {
+        return Err(bad("{guest-agent} needs hardware = [\"guest-agent\"]".into()));
+    }
     Ok(Test {
         id: format!("{category}/{name}"),
         category: category.into(),
@@ -1050,6 +1085,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         steps,
         host_needs: file.host_needs,
         cf,
+        hardware,
     })
 }
 
@@ -1823,6 +1859,16 @@ expect = "1 received"
                 &format!("{head}[[step]]\nrun = \"true\"\nor_skip = \" \"\n"),
                 "or_skip needs the reason",
             ),
+            (
+                "boot/v.toml",
+                &format!("{head}hardware = [\"tpm\"]\n[[step]]\nwait = \"ready\"\n"),
+                "hardware: \"tpm\" is not one of guest-agent, virtio-scsi",
+            ),
+            (
+                "boot/w.toml",
+                &format!("{head}[[step]]\nhost = \"nc -U {{guest-agent}}\"\n"),
+                "{guest-agent} needs hardware = [\"guest-agent\"]",
+            ),
         ] {
             let dir = TempDir::new("suite-bad");
             dir.write(file, text);
@@ -2278,6 +2324,24 @@ expect = "1 received"
         machine.controls.insert(Control::Ssh, Who::None);
         assert_eq!(test.fit(&machine), Fit::Lacks(vec![Control::Ssh]));
         assert_eq!(test.fit(&machine).skip_reason().unwrap(), "the machine has no ssh");
+    }
+
+    #[test]
+    fn a_test_asks_for_a_virtual_machine_s_devices() {
+        let dir = TempDir::new("suite-hardware");
+        dir.write(
+            "drivers/agent.toml",
+            "about = \"x\"\ntime = \"1m\"\nhardware = [\"guest-agent\", \"virtio-scsi\"]\n\
+             [[step]]\nhost = \"nc -U {guest-agent}\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert_eq!(test.hardware, [Control::GuestAgent, Control::VirtioScsi]);
+        assert!(test.controls().contains(&Control::GuestAgent));
+        // QEMU gives them; a machine whose driver cannot is skipped.
+        let mut machine = crate::machines::load(&dir.path().join("none")).unwrap().remove(0);
+        assert_eq!(test.fit(&machine), Fit::Runs);
+        machine.controls.insert(Control::VirtioScsi, Who::None);
+        assert_eq!(test.fit(&machine).skip_reason().unwrap(), "the machine has no virtio-scsi");
     }
 
     #[test]

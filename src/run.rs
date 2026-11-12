@@ -598,9 +598,13 @@ impl<'a> Worker<'a> {
         self.driver.want_disc_drive(discs);
         let floppies = test.controls().contains(&Control::Floppy);
         self.driver.want_floppy_drive(floppies);
+        // And one that asks for a virtual machine's devices: a guest agent
+        // channel the agent answers on, or a SCSI disk.
+        self.driver.want_hardware(&test.hardware);
         // And one that formats a CompactFlash card, given one blank.
         self.driver.want_cf_card(test.cf);
-        let own_boot = attacks || cards || discs || floppies || test.cf.is_some();
+        let own_boot =
+            attacks || cards || discs || floppies || test.cf.is_some() || !test.hardware.is_empty();
         let installs = matches!(test.boot, Boot::Stick { .. } | Boot::Dvd { .. });
         let fresh = !installs && (test.fresh || own_boot || !self.reusable || !self.driver.is_on());
         // A real machine's disk is written before each fresh boot, and a
@@ -1171,6 +1175,13 @@ impl<'a> Worker<'a> {
             Token::Amt => self.driver.amt_address().ok_or_else(|| {
                 StepFailure::Error("this machine's driver has no address for its AMT".into())
             }),
+            Token::GuestAgent => self
+                .driver
+                .guest_agent_socket()
+                .map(|socket| socket.display().to_string())
+                .ok_or_else(|| {
+                    StepFailure::Error("this boot has no QEMU guest agent channel".into())
+                }),
             Token::MachinePort { port, udp } => self
                 .driver
                 .reach(*port, *udp)
