@@ -615,6 +615,9 @@ fn describe_command(command: &Command) -> String {
     for expect_not in &command.expect_not {
         text.push_str(&format!(", output lacks \"{expect_not}\""));
     }
+    if let Some(reason) = &command.or_skip {
+        text.push_str(&format!(", or the test is skipped: {reason}"));
+    }
     text
 }
 
@@ -2205,6 +2208,11 @@ expect = "1 received"
         let test = &load(dir.path()).unwrap()[0];
         let Step::Run(command) = &test.steps[0] else { panic!("not a run step") };
         assert_eq!(command.or_skip.as_deref(), Some("needs an Azure machine"));
+        assert!(
+            test.steps[0].describe().ends_with(", or the test is skipped: needs an Azure machine"),
+            "{}",
+            test.steps[0].describe()
+        );
     }
 
     #[test]
