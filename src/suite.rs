@@ -438,6 +438,10 @@ pub struct Command {
     /// Its standard input, where `{password}` is the lab password; none
     /// gives it none.
     pub input: Option<String>,
+    /// A `run` step's reason to skip the test, not fail it, when the
+    /// command does not end or print as the step says: a check that the
+    /// machine is of the kind the test needs.
+    pub or_skip: Option<String>,
 }
 
 /// What a `power` step does.
@@ -794,6 +798,7 @@ struct StepFile {
     limit: Option<f64>,
     screen: Option<OneOrMore>,
     screen_gone: Option<String>,
+    or_skip: Option<String>,
     #[serde(rename = "type")]
     typed: Option<String>,
     point: Option<Vec<u32>>,
@@ -1095,6 +1100,13 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     checks("exit", step.exit.is_some())?;
     checks("expect", step.expect.is_some())?;
     checks("expect_not", step.expect_not.is_some())?;
+    only_with("or_skip", step.or_skip.is_some(), "run")?;
+    if step.or_skip.as_deref().is_some_and(|reason| reason.trim().is_empty()) {
+        return Err(
+            "or_skip needs the reason the test is skipped, such as \"needs an Azure machine\""
+                .into(),
+        );
+    }
     if step.root.is_some() && !matches!(given[0], "run" | "bench" | "attack" | "host") {
         return Err("root goes only with run, bench, attack or host".into());
     }
@@ -1132,6 +1144,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         expect_not: step.expect_not.clone().map(OneOrMore::into_vec).unwrap_or_default(),
         root: step.root.unwrap_or(false),
         input: step.input.clone(),
+        or_skip: step.or_skip.clone(),
     };
     if let Some(text) = step.run.clone() {
         if text.trim().is_empty() {
@@ -1662,6 +1675,7 @@ expect = "1 received"
                 expect_not: vec![],
                 root: false,
                 input: None,
+                or_skip: None,
             })
         );
         let controls: Vec<Control> = test.controls().into_iter().collect();
@@ -1784,6 +1798,16 @@ expect = "1 received"
                 "boot/s.toml",
                 &format!("{head}boot = \"stick\"\ndisk = \"4T\"\n[[step]]\nwait = \"ready\"\n"),
                 "disk",
+            ),
+            (
+                "boot/t.toml",
+                &format!("{head}[[step]]\nhost = \"true\"\nor_skip = \"needs Azure\"\n"),
+                "or_skip goes only with run",
+            ),
+            (
+                "boot/u.toml",
+                &format!("{head}[[step]]\nrun = \"true\"\nor_skip = \" \"\n"),
+                "or_skip needs the reason",
             ),
         ] {
             let dir = TempDir::new("suite-bad");
@@ -2170,6 +2194,20 @@ expect = "1 received"
     }
 
     #[test]
+    fn reads_an_or_skip_step() {
+        let dir = TempDir::new("suite-or-skip");
+        dir.write(
+            "features/azure.toml",
+            "about = \"x\"\ntime = \"1m\"\n\
+             [[step]]\nrun = \"cat /kernel/class/dmi/id/sys_vendor\"\n\
+             expect = \"Microsoft Corporation\"\nor_skip = \"needs an Azure machine\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        let Step::Run(command) = &test.steps[0] else { panic!("not a run step") };
+        assert_eq!(command.or_skip.as_deref(), Some("needs an Azure machine"));
+    }
+
+    #[test]
     fn reads_an_attack_step() {
         let dir = TempDir::new("suite-attack");
         dir.write(
@@ -2187,6 +2225,7 @@ expect = "1 received"
                 expect_not: vec![],
                 root: false,
                 input: None,
+                or_skip: None,
             })
         );
         assert_eq!(
