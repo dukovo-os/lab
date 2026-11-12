@@ -16,6 +16,7 @@ mod amt;
 mod bench;
 mod bundle;
 mod clock;
+mod des;
 mod driver;
 mod findings;
 mod hash;
@@ -24,6 +25,7 @@ mod machines;
 mod netboot;
 mod output;
 mod peer;
+mod png;
 mod qmp;
 mod run;
 mod schedule;
@@ -37,6 +39,7 @@ mod store;
 mod suite;
 mod ui;
 mod units;
+mod vnc;
 mod wsman;
 mod zone;
 
@@ -50,7 +53,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use machines::Machine;
+use machines::{Control, Machine, Who};
 use status::State;
 use suite::{Fit, Preset, Step, Test};
 
@@ -592,7 +595,12 @@ fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> 
     let mut results = Vec::new();
     for machine in &machines {
         let checks = match &machine.amt {
-            Some(settings) => driver::amt::check(settings, Some(&key)),
+            Some(settings) => {
+                let screen = [Control::Keys, Control::Mouse, Control::Screen]
+                    .into_iter()
+                    .any(|control| machine.who(control) == Who::Driver);
+                driver::amt::check(settings, Some(&key), screen)
+            }
             None => Vec::new(),
         };
         results.push((machine, checks));

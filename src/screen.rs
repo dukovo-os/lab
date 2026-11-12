@@ -119,6 +119,32 @@ impl Image {
         Ok(Image { width, height, pixels })
     }
 
+    /// A screenshot of `width` by `height` pixels, given row by row.
+    pub fn new(width: usize, height: usize, pixels: Vec<[u8; 3]>) -> Result<Image, String> {
+        if width.checked_mul(height) != Some(pixels.len()) {
+            return Err(format!(
+                "a screenshot of {width}x{height} pixels cannot hold {} pixels",
+                pixels.len()
+            ));
+        }
+        Ok(Image { width, height, pixels })
+    }
+
+    /// Its pixels, RGB, row by row.
+    pub fn pixels(&self) -> &[[u8; 3]] {
+        &self.pixels
+    }
+
+    /// It as a binary PPM (P6), as QEMU's `screendump` writes one.
+    pub fn to_ppm(&self) -> Vec<u8> {
+        let mut ppm = format!("P6\n{} {}\n255\n", self.width, self.height).into_bytes();
+        ppm.reserve(self.pixels.len() * 3);
+        for pixel in &self.pixels {
+            ppm.extend_from_slice(pixel);
+        }
+        ppm
+    }
+
     fn pixel(&self, x: usize, y: usize) -> [u8; 3] {
         self.pixels[y * self.width + x]
     }

@@ -19,11 +19,16 @@
 //!   are reached as they are.
 //! - **The Linux twin** is the machine itself, net booted into the
 //!   Linux kit; the runner boots afresh after it.
+//! - **The screen, keyboard and mouse** are AMT's remote screen (KVM),
+//!   reached as a VNC server on AMT's port 5900 (see vnc.rs). The driver
+//!   turns it on the first time a test wants it, with a password made for
+//!   the run, and keeps one session open from then on: AMT plugs its
+//!   keyboard and mouse into the machine when a session opens, so a
+//!   session that stays open keeps them there across boots.
 //!
-//! Cables, sticks, cards and discs are a person's to handle, and the
-//! screen, keyboard and mouse come with AMT's remote screen later. What the
+//! Cables, sticks, cards and discs are a person's to handle. What the
 //! driver does goes in the bundle's `logs/<machine>/amt.log`, never with
-//! the password.
+//! the passwords.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -41,6 +46,8 @@ use crate::netboot::{self, Image, Offer, Outcome, Server};
 use crate::serial::SerialReader;
 use crate::ssh;
 use crate::suite::{Button, PowerAction, Stick};
+use crate::vnc::{self, Vnc};
+use crate::{png, screen};
 
 /// The longest a fresh boot's net boot and write may take: the firmware
 /// starting twice, the writer's kernel loading, and a few hundred
@@ -55,6 +62,23 @@ const POWER_FRESH: Duration = Duration::from_secs(1);
 
 /// The port the machine's SSH server listens on.
 const SSH_PORT: u16 = 22;
+
+/// How long the remote screen may take to open a session: AMT may still
+/// be closing the one before.
+const SCREEN_OPEN_TIME: Duration = Duration::from_secs(30);
+
+/// How long the keyboard and mouse AMT plugs in when a session opens are
+/// given to appear to the system before they are used.
+const SCREEN_SETTLE: Duration =
+    if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(2) };
+
+/// How long the whole screen may take to arrive: a few megabytes of raw
+/// pixels.
+const CAPTURE_TIME: Duration = Duration::from_secs(90);
+
+/// How long a key is held, and the pause after each combination.
+const KEY_HOLD: Duration = Duration::from_millis(50);
+const KEY_GAP: Duration = Duration::from_millis(100);
 
 /// A real machine driven through AMT.
 pub struct AmtDriver {
@@ -73,6 +97,13 @@ pub struct AmtDriver {
     boot: u32,
     /// The power state last read, and when.
     power: Option<(Instant, bool)>,
+    /// AMT's remote screen: its address, the password set for this run
+    /// once it is turned on, the session and when it opened, and where
+    /// the pointer was put last.
+    screen_address: String,
+    screen_password: Option<String>,
+    screen: Option<(Vnc, Instant)>,
+    pointer: (u16, u16),
     log: File,
     started: Instant,
 }
@@ -107,6 +138,8 @@ impl AmtDriver {
             .map_err(|err| format!("making amt.log: {err}"))?;
         let script = netboot::script_path(&settings.tftp, &settings.mac);
         let amt = Amt::new(&settings.address, &settings.user, &password);
+        let host = settings.address.split(':').next().unwrap_or_default();
+        let screen_address = format!("{host}:{}", vnc::PORT);
         let mut driver = AmtDriver {
             settings,
             setup,
@@ -119,6 +152,10 @@ impl AmtDriver {
             image: None,
             boot: 0,
             power: None,
+            screen_address,
+            screen_password: None,
+            screen: None,
+            pointer: (0, 0),
             log,
             started: Instant::now(),
         };
@@ -297,6 +334,82 @@ impl AmtDriver {
     }
 }
 
+impl AmtDriver {
+    /// Opens a remote screen session unless one is open, turning AMT's
+    /// remote screen on first the first time.
+    fn open_screen(&mut self) -> Result<(), String> {
+        if let Some((vnc, _)) = &mut self.screen
+            && vnc.is_open()
+        {
+            return Ok(());
+        }
+        self.screen = None;
+        let password = match &self.screen_password {
+            Some(password) => password.clone(),
+            None => {
+                let password = amt::screen_password()?;
+                self.note("remote screen: turning on port 5900, with a password made for this run");
+                if let Err(err) = self.amt.turn_on_remote_screen(&password) {
+                    self.note(&format!("remote screen: {err}"));
+                    return Err(err);
+                }
+                self.screen_password = Some(password.clone());
+                password
+            }
+        };
+        let deadline = Instant::now() + SCREEN_OPEN_TIME;
+        match Vnc::connect(&self.screen_address, &password, deadline) {
+            Ok(vnc) => {
+                let (width, height) = vnc.size();
+                self.note(&format!(
+                    "remote screen: session open, {width}x{height} \"{}\"",
+                    vnc.name
+                ));
+                self.screen = Some((vnc, Instant::now()));
+                Ok(())
+            }
+            Err(err) => {
+                self.note(&format!("remote screen: {err}"));
+                Err(err)
+            }
+        }
+    }
+
+    /// Does `act` in the remote screen session, opening one if need be.
+    /// Keys and the pointer (`input`) wait until the session's keyboard
+    /// and mouse have had time to appear. A session that fails is closed,
+    /// and the next action opens another.
+    fn with_screen<T>(
+        &mut self,
+        input: bool,
+        act: impl FnOnce(&mut Vnc) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !self.is_on() {
+            return Err("the machine is off, so it has no screen".into());
+        }
+        self.open_screen()?;
+        let Some((vnc, opened)) = self.screen.as_mut() else {
+            return Err("the remote screen has no session".into());
+        };
+        if input && let Some(wait) = SCREEN_SETTLE.checked_sub(opened.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        let done = act(vnc);
+        if let Err(err) = &done {
+            self.screen = None;
+            self.note(&format!("remote screen: {err}"));
+        }
+        done
+    }
+
+    /// The whole screen now, with one more try in a new session if the
+    /// one open failed (AMT may end a session when the machine restarts).
+    fn capture(&mut self) -> Result<screen::Image, String> {
+        let take = |vnc: &mut Vnc| vnc.capture(Instant::now() + CAPTURE_TIME);
+        self.with_screen(false, take).or_else(|_| self.with_screen(false, take))
+    }
+}
+
 /// How one of `machines check`'s checks came out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -317,9 +430,10 @@ pub struct Check {
 }
 
 /// Checks what a run on the machine needs, without changing anything:
-/// AMT's password, address and mode, the serial port, the lab network,
-/// the TFTP folder and network GRUB, the writer's kit and the lab key.
-pub fn check(settings: &AmtSettings, key: Option<&Path>) -> Vec<Check> {
+/// AMT's password, address and mode, its remote screen when the driver
+/// does the machine's `screen`, the serial port, the lab network, the TFTP
+/// folder and network GRUB, the writer's kit and the lab key.
+pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut add = |check: &'static str, result: Result<String, (Verdict, String)>| {
         let (verdict, detail) = match result {
@@ -360,6 +474,27 @@ pub fn check(settings: &AmtSettings, key: Option<&Path>) -> Vec<Check> {
                         .map(|state| format!("the machine is {}", amt::describe(state)))
                         .map_err(problem),
                 );
+                if screen {
+                    add(
+                        "remote screen",
+                        match amt.remote_screen() {
+                            Ok(found) if !found.in_mebx => Err(problem(
+                                "KVM is off in MEBx: turn on KVM Feature Selection there, or set \
+                                 keys, mouse and screen to \"none\" in the machine file"
+                                    .into(),
+                            )),
+                            Ok(found) if found.consent != 0 => Err(problem(format!(
+                                "AMT asks someone at the machine for a code before each remote \
+                                 screen session (OptInRequired {}): set User Opt-in to None in MEBx",
+                                found.consent
+                            ))),
+                            Ok(_) => Ok("KVM is on in MEBx and asks for no consent; the driver \
+                                         turns on port 5900 when a test wants the screen"
+                                .into()),
+                            Err(err) => Err(problem(err)),
+                        },
+                    );
+                }
                 add(
                     "power button",
                     match amt.power_changes() {
@@ -468,11 +603,6 @@ fn persons_job(what: &str) -> String {
     )
 }
 
-/// Says the screen, keyboard and mouse wait for AMT's remote screen.
-fn no_screen() -> String {
-    "the AMT driver does not drive the screen, keyboard or mouse yet".into()
-}
-
 impl Driver for AmtDriver {
     fn boot_fresh(&mut self) -> Result<(), String> {
         self.boot += 1;
@@ -548,24 +678,68 @@ impl Driver for AmtDriver {
         Err(persons_job("pull out a USB stick"))
     }
 
-    fn press_keys(&mut self, _combos: &[String]) -> Result<(), String> {
-        Err(no_screen())
+    fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
+        // Every name is checked before any key goes down.
+        let combos =
+            combos.iter().map(|combo| vnc::keysyms(combo)).collect::<Result<Vec<_>, _>>()?;
+        self.with_screen(true, |vnc| {
+            for keys in &combos {
+                for &key in keys {
+                    vnc.key(key, true)?;
+                }
+                std::thread::sleep(KEY_HOLD);
+                for &key in keys.iter().rev() {
+                    vnc.key(key, false)?;
+                }
+                std::thread::sleep(KEY_GAP);
+            }
+            Ok(())
+        })
     }
 
-    fn point(&mut self, _x: u32, _y: u32) -> Result<(), String> {
-        Err(no_screen())
+    fn point(&mut self, x: u32, y: u32) -> Result<(), String> {
+        let (mut width, mut height) = self.with_screen(false, |vnc| Ok(vnc.size()))?;
+        if x >= width || y >= height {
+            // The size known may be from before the screen last changed.
+            let now = self.capture()?;
+            (width, height) = (now.width as u32, now.height as u32);
+        }
+        let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
+            return Err(format!("({x}, {y}) is off the screen"));
+        };
+        if u32::from(x) >= width || u32::from(y) >= height {
+            return Err(format!("({x}, {y}) is off the screen, which is {width}x{height} pixels"));
+        }
+        self.with_screen(true, |vnc| vnc.pointer(0, x, y))?;
+        self.pointer = (x, y);
+        Ok(())
     }
 
-    fn click(&mut self, _button: Button) -> Result<(), String> {
-        Err(no_screen())
+    fn click(&mut self, button: Button) -> Result<(), String> {
+        let held = match button {
+            Button::Left => 1,
+            Button::Middle => 2,
+            Button::Right => 4,
+        };
+        let (x, y) = self.pointer;
+        self.with_screen(true, |vnc| {
+            for buttons in [held, 0] {
+                vnc.pointer(buttons, x, y)?;
+                // As long as a person holds a button.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        })
     }
 
-    fn screenshot(&mut self, _to: &Path) -> Result<(), String> {
-        Err(no_screen())
+    fn screenshot(&mut self, to: &Path) -> Result<(), String> {
+        let image = self.capture()?;
+        fs::write(to, png::encode(&image)).map_err(|err| format!("{}: {err}", to.display()))
     }
 
-    fn screen_dump(&mut self, _to: &Path) -> Result<(), String> {
-        Err(no_screen())
+    fn screen_dump(&mut self, to: &Path) -> Result<(), String> {
+        let image = self.capture()?;
+        fs::write(to, image.to_ppm()).map_err(|err| format!("{}: {err}", to.display()))
     }
 
     fn run_command(
@@ -652,6 +826,7 @@ impl Driver for AmtDriver {
     }
 
     fn shut_off(&mut self) {
+        self.screen = None;
         self.end_net_boot();
         if let Err(err) = self.hard_off() {
             self.note(&format!("shut off: {err}"));
@@ -672,6 +847,7 @@ mod tests {
     use crate::netboot::tests::{make_image, pretend_writer};
     use crate::stop::Stop;
     use crate::testing::TempDir;
+    use crate::vnc::fake::{Event, FakeVnc, pattern};
 
     const MAC: &str = "aa:bb:cc:00:11:22";
 
@@ -681,6 +857,8 @@ mod tests {
     struct Bench {
         dir: TempDir,
         fake: FakeAmt,
+        /// AMT's remote screen, open once the pretend AMT turns it on.
+        screen: FakeVnc,
         driver: AmtDriver,
     }
 
@@ -754,8 +932,13 @@ mod tests {
             ob: None,
             stop: Stop::default(),
         };
-        let driver = AmtDriver::new(settings, setup).unwrap();
-        Bench { dir, fake, driver }
+        let mut driver = AmtDriver::new(settings, setup).unwrap();
+        let screen = {
+            let state = Arc::clone(&fake.state);
+            FakeVnc::start(Box::new(move || state.lock().unwrap().screen.open_password()))
+        };
+        driver.screen_address = screen.address.to_string();
+        Bench { dir, fake, screen, driver }
     }
 
     fn wait_for(path: &Path, text: &str) -> bool {
@@ -855,6 +1038,88 @@ mod tests {
     }
 
     #[test]
+    fn the_remote_screen_shows_the_screen_and_takes_keys_and_the_mouse() {
+        let mut bench = bench("amt-screen", false);
+        let err = bench.driver.press_keys(&["a".into()]).unwrap_err();
+        assert!(err.contains("the machine is off"), "{err}");
+        let soon = Instant::now() + Duration::from_secs(5);
+        bench.driver.power(PowerAction::On, soon).unwrap();
+
+        bench.driver.press_keys(&["shift-a".into(), "ctrl-alt-delete".into()]).unwrap();
+        bench.driver.point(39, 29).unwrap();
+        bench.driver.click(Button::Right).unwrap();
+        // The screen as PPM, for reading its text, and as PNG.
+        let dump = bench.dir.path().join("screen.ppm");
+        bench.driver.screen_dump(&dump).unwrap();
+        let image = screen::Image::parse_ppm(&fs::read(&dump).unwrap()).unwrap();
+        assert_eq!(image.pixels(), pattern(40, 30));
+        let shot = bench.dir.path().join("screen.png");
+        bench.driver.screenshot(&shot).unwrap();
+        assert!(fs::read(&shot).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+        // The screen answers in order, so all that was sent has arrived.
+        let (shift, ctrl, alt, delete) = (0xffe1, 0xffe3, 0xffe9, 0xffff);
+        assert_eq!(
+            bench.screen.events(),
+            [
+                Event::Key(shift, true),
+                Event::Key(0x41, true),
+                Event::Key(0x41, false),
+                Event::Key(shift, false),
+                Event::Key(ctrl, true),
+                Event::Key(alt, true),
+                Event::Key(delete, true),
+                Event::Key(delete, false),
+                Event::Key(alt, false),
+                Event::Key(ctrl, false),
+                Event::Pointer(0, 39, 29),
+                Event::Pointer(4, 39, 29),
+                Event::Pointer(0, 39, 29),
+            ]
+        );
+        // One session for all of it, and AMT set up once.
+        assert_eq!(bench.screen.state.lock().unwrap().sessions, 1);
+        let calls = bench.fake.calls();
+        assert_eq!(calls.iter().filter(|call| call.starts_with("Put IPS_KVM")).count(), 1);
+
+        // Nothing is sent for a key or pixel that is not there.
+        let err = bench.driver.press_keys(&["a".into(), "f13".into()]).unwrap_err();
+        assert!(err.contains("no key named \"f13\""), "{err}");
+        let err = bench.driver.point(40, 10).unwrap_err();
+        assert!(err.contains("off the screen, which is 40x30"), "{err}");
+        assert_eq!(bench.screen.events().len(), 13);
+
+        // A session AMT ends is opened again, and the screen's new size
+        // is seen.
+        bench.screen.close_sessions();
+        bench.screen.state.lock().unwrap().resize = Some((64, 48, pattern(64, 48)));
+        bench.driver.point(63, 47).unwrap();
+        assert_eq!(bench.screen.state.lock().unwrap().sessions, 2);
+        bench.driver.screen_dump(&dump).unwrap();
+        assert_eq!(bench.screen.events().last(), Some(&Event::Pointer(0, 63, 47)));
+
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        assert!(log.contains("remote screen: session open, 40x30"), "{log}");
+        let password = bench.fake.state.lock().unwrap().screen.password.clone().unwrap();
+        assert!(!log.contains(&password), "{log}");
+    }
+
+    #[test]
+    fn a_remote_screen_amt_will_not_open_says_why() {
+        let mut bench = bench("amt-no-screen", false);
+        bench.fake.state.lock().unwrap().screen.consent = 4_294_967_295;
+        let soon = Instant::now() + Duration::from_secs(5);
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        let err = bench.driver.screen_dump(&bench.dir.path().join("x.ppm")).unwrap_err();
+        assert!(err.contains("User Opt-in to None"), "{err}");
+        let checks = check(&bench.driver.settings, None, true);
+        let screen = checks.iter().find(|check| check.check == "remote screen").unwrap();
+        assert_eq!(screen.verdict, Verdict::Problem);
+        // A machine whose screen is no one's is not checked for one.
+        let checks = check(&bench.driver.settings, None, false);
+        assert!(checks.iter().all(|check| check.check != "remote screen"));
+    }
+
+    #[test]
     fn a_password_file_others_can_read_is_refused() {
         let dir = TempDir::new("amt-password");
         let open = dir.write("password", "secret\n");
@@ -868,13 +1133,14 @@ mod tests {
     #[test]
     fn checks_what_a_run_needs() {
         let bench = bench("amt-check", false);
-        let checks = check(&bench.driver.settings, None);
+        let checks = check(&bench.driver.settings, None, true);
         let verdict =
             |name: &str| checks.iter().find(|check| check.check == name).map(|check| check.verdict);
         assert_eq!(verdict("password"), Some(Verdict::Ok));
         assert_eq!(verdict("amt"), Some(Verdict::Ok));
         assert_eq!(verdict("control mode"), Some(Verdict::Ok));
         assert_eq!(verdict("power"), Some(Verdict::Ok));
+        assert_eq!(verdict("remote screen"), Some(Verdict::Ok));
         assert_eq!(verdict("power button"), Some(Verdict::Note));
         assert_eq!(verdict("serial port"), Some(Verdict::Ok));
         assert_eq!(verdict("lab network"), Some(Verdict::Ok));

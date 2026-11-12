@@ -6,10 +6,11 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 # Real machines
 
 The lab runs the same tests on real machines as on QEMU, through the
-`amt` driver: Intel AMT turns the machine on and off and picks its next
-boot, a net boot writes the image under test to its disk before each
-fresh boot, a serial cable brings its console to the lab PC, and the
-lab network carries SSH and the lab PC's side of a test.
+`amt` driver: Intel AMT turns the machine on and off, picks its next
+boot, and shows its screen and works its keyboard and mouse; a net boot
+writes the image under test to its disk before each fresh boot, a serial
+cable brings its console to the lab PC, and the lab network carries SSH
+and the lab PC's side of a test.
 
 ## What a machine needs
 
@@ -18,6 +19,10 @@ lab network carries SSH and the lab PC's side of a test.
   serial port of the lab PC's, such as a USB serial cable.
 - A disk the lab may overwrite: every fresh boot writes the image over
   it.
+- For tests that use the screen, keyboard or mouse: the picture on the
+  board's own Intel graphics, the only one AMT's remote screen sees. Some
+  machines draw it only while a monitor, or a display emulator plug, is
+  on one of the board's ports.
 
 ## The lab network
 
@@ -29,7 +34,7 @@ addresses:
 | --- | --- |
 | `10.77.0.1/24` | The lab PC's lab card. No gateway and no DNS server. |
 | `10.77.0.2` | The machine, handed out by dnsmasq by its MAC address. |
-| `10.77.0.10` | AMT, set in MEBx. AMT shares the machine's network port. |
+| `10.77.0.10` | AMT, set in MEBx. AMT shares the machine's network port, and serves its remote screen on port 5900. |
 
 ## Setting the machine up
 
@@ -42,24 +47,35 @@ Once, at the machine:
    reachable while the machine is off), and power on after a power loss.
 3. In MEBx (Ctrl+P as the machine starts): change the password from
    the default, turn AMT on, give it the static address `10.77.0.10/24`,
-   set Admin Control Mode, set user consent to none, and turn
-   Serial-over-LAN, storage redirection and KVM on.
+   set Admin Control Mode, set User Opt-in (user consent) to none, and
+   turn Serial-over-LAN, storage redirection and KVM Feature Selection
+   on. The driver turns on the remote screen's port 5900 itself.
 4. Note the network card's MAC address and the disk's serial number
    (`lsblk -o NAME,SERIAL` from a Linux live USB) for the machine file.
 
 ## Setting the lab PC up
 
-Once, on the lab PC:
+Once, on the lab PC, in this order: `./ob lab` reads the machine files
+and needs the lab card's address.
 
-1. `./ob lab` in a Dukovo checkout sets up dnsmasq and the TFTP folder
-   on the lab card, and installs the network GRUB and the writer (see
-   [Net boot](net-boot.md)).
-2. Let the lab's user read the serial port, then sign in again:
+1. Give the lab card the lab address, with no gateway, naming the card
+   (`ip link` lists them):
+
+   ```sh
+   nmcli connection add type ethernet ifname <card> con-name dukovo-lab \
+       ipv4.method manual ipv4.addresses 10.77.0.1/24 ipv4.never-default yes \
+       ipv6.method disabled
+   ```
+
+2. Make sure dnsmasq is there: `sudo apt install dnsmasq-base`.
+   NetworkManager brings it on Mint, Ubuntu and Debian; the `dnsmasq`
+   package's own service is not needed.
+3. Let the lab's user read the serial port, then sign in again:
    `sudo usermod -aG dialout $USER`.
-3. Copy [machines/optiplex.toml](../machines/optiplex.toml) to
+4. Copy [machines/optiplex.toml](../machines/optiplex.toml) to
    `~/.config/dukovo-lab/machines/`, and put in the MAC address and the
    disk's serial number.
-4. Put AMT's password in a file of its own beside it, which only you can
+5. Put AMT's password in a file of its own beside it, which only you can
    read:
 
    ```sh
@@ -67,7 +83,10 @@ Once, on the lab PC:
    ${EDITOR:-nano} ~/.config/dukovo-lab/machines/optiplex-amt-password
    ```
 
-5. Check it all: `dukovo-lab machines check optiplex`. Each line is
+6. `./ob lab` in a Dukovo checkout sets up dnsmasq and the TFTP folder
+   on the lab card, and installs the network GRUB and the writer (see
+   [Net boot](net-boot.md)).
+7. Check it all: `dukovo-lab machines check optiplex`. Each line is
    `ok`, a `note`, or a `PROBLEM` that stops runs there, and says how to
    put it right; it exits 3 while there is a problem.
 
@@ -84,17 +103,28 @@ Once, on the lab PC:
 | `ssh` | The machine's own address on the lab network. |
 | `peer` | The lab PC is `{peer}` (`10.77.0.1`) and the machine `{machine}` (`10.77.0.2`); the machine's ports are reached as they are. |
 | `linux` | The machine is its own Linux twin: it boots the Linux kit from the network, then boots afresh to go on with the test. |
+| `screen` | AMT's remote screen, a VNC server on port 5900: `screen` steps read its text and `screenshot` steps save it as a PNG. A failing test's screenshot comes from it too. |
+| `keys` | The remote screen's keyboard, a US layout: `keys` and `type` steps. |
+| `mouse` | The remote screen's mouse, which points at pixels of the screen as it is now: `point` and `click` steps. |
+
+The first test that uses the screen, keyboard or mouse turns AMT's
+remote screen on, with a password made for the run, and its session
+stays open for the rest of the run. AMT plugs a keyboard and mouse into
+the machine when a session opens, so the session staying open keeps
+them there across boots, as a person's would be.
 
 A person handles the network cable, USB sticks, cards and discs: Needs
-you steps, with those controls set to `person` in the machine file. The
-screen, keyboard and mouse, booting the install stick or DVD, and the
-attacker are not done on real machines yet; tests that need them are
-skipped there.
+you steps, with those controls set to `person` in the machine file.
+Booting the install stick or DVD, and the attacker, are not done on
+real machines yet; tests that need them are skipped there.
 
 ## Safety
 
 - AMT's password stays in its file: it is never written to a log, a
   bundle or output, and the lab refuses a password file others can read.
+- The remote screen's password is made afresh for each run and is never
+  written anywhere. VNC signs in with DES, which is weak, so the remote
+  screen, like AMT, is reached on the lab network alone.
 - AMT, dnsmasq and the driver's net-boot server are reached on the lab
   network alone.
 - Only the disk with the machine file's serial number is written, and
@@ -103,8 +133,12 @@ skipped there.
 ## When something goes wrong
 
 - `logs/<machine>/amt.log` in the run's bundle says what the driver did:
-  each power change, each net boot, and each request the writer made.
+  each power change, each net boot, each request the writer made, and
+  each remote screen session.
 - `logs/<machine>/writer-<n>.log` is the writer's console for boot `n`.
-- `dukovo-lab machines check <machine>` checks AMT, the serial port, the
-  lab network, the TFTP folder, the network GRUB, the writer and the
-  lab key, without changing anything.
+- `dukovo-lab machines check <machine>` checks AMT, its remote screen,
+  the serial port, the lab network, the TFTP folder, the network GRUB,
+  the writer and the lab key, without changing anything.
+- A screen that stays black over the remote screen while the machine
+  runs needs a monitor or a display emulator plug on the board's Intel
+  graphics.

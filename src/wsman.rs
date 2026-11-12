@@ -76,6 +76,17 @@ impl Client {
         self.call(class, &format!("{TRANSFER}/Get"), selectors, "")
     }
 
+    /// Puts `instance` (as [`instance`] writes one) in place of the
+    /// instance of `class` that `selectors` pick.
+    pub fn put(
+        &self,
+        class: &str,
+        selectors: &[Selector<'_>],
+        instance: &str,
+    ) -> Result<String, String> {
+        self.call(class, &format!("{TRANSFER}/Put"), selectors, instance)
+    }
+
     /// Lists every instance of `class`: an Enumerate, then Pulls until AMT
     /// says the list has ended. Gives each Pull's items, joined.
     pub fn enumerate(&self, class: &str) -> Result<String, String> {
@@ -360,6 +371,48 @@ pub fn elements<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
     found
 }
 
+/// The properties of one instance, as a Get gives it (the inside of the
+/// class's element): each child element's local name and text, in order.
+/// Only flat instances, whose properties hold text alone, read back
+/// whole, and the ones the lab puts back are flat.
+pub fn properties(instance: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(open) = instance[at..].find('<').map(|offset| at + offset) {
+        let Some(tag_end) = instance[open..].find('>').map(|offset| open + offset) else {
+            break;
+        };
+        let tag = &instance[open + 1..tag_end];
+        at = tag_end + 1;
+        if tag.starts_with(['/', '?', '!']) {
+            continue;
+        }
+        let tag_name = tag.trim_end_matches('/').split_whitespace().next().unwrap_or_default();
+        let local = tag_name.rsplit(':').next().unwrap_or(tag_name).to_string();
+        if tag.ends_with('/') {
+            found.push((local, String::new()));
+            continue;
+        }
+        let close = format!("</{tag_name}>");
+        let Some(offset) = instance[at..].find(&close) else { break };
+        found.push((local, unescape(instance[at..at + offset].trim())));
+        at += offset + close.len();
+    }
+    found
+}
+
+/// An instance of `class` (its resource URI) holding `properties`, in
+/// order, for a Put.
+pub fn instance(class: &str, properties: &[(String, String)]) -> String {
+    let name = class.rsplit('/').next().unwrap_or(class);
+    let mut out = format!("<r:{name} xmlns:r=\"{class}\">");
+    for (property, value) in properties {
+        out.push_str(&format!("<r:{property}>{}</r:{property}>", escape(value)));
+    }
+    out.push_str(&format!("</r:{name}>"));
+    out
+}
+
 /// The text of the first element whose local name is `name`, trimmed
 /// and unescaped.
 pub fn text(xml: &str, name: &str) -> Option<String> {
@@ -424,6 +477,35 @@ mod tests {
         assert_eq!(elements(xml, "EndOfSequence"), [""]);
         assert_eq!(texts(xml, "InstanceID"), ["AMT", "Flash"]);
         assert_eq!(text(xml, "Missing"), None);
+    }
+
+    #[test]
+    fn instances_read_back_and_are_put_whole() {
+        let answer = "<a:Body><g:IPS_KVMRedirectionSettingData>\
+                      <g:ElementName>Intel(r) KVM Redirection Settings</g:ElementName>\
+                      <g:EnabledByMEBx>true</g:EnabledByMEBx><g:DefaultScreen/>\
+                      <g:SessionTimeout> 3 </g:SessionTimeout><g:Note>a &amp; b</g:Note>\
+                      </g:IPS_KVMRedirectionSettingData></a:Body>";
+        let inside = elements(answer, "IPS_KVMRedirectionSettingData")[0];
+        let properties = properties(inside);
+        let names: Vec<&str> = properties.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["ElementName", "EnabledByMEBx", "DefaultScreen", "SessionTimeout", "Note"]
+        );
+        assert_eq!(properties[3].1, "3");
+        assert_eq!(properties[4].1, "a & b");
+        let put = instance("http://x/IPS_KVMRedirectionSettingData", &properties);
+        assert!(put.starts_with(
+            "<r:IPS_KVMRedirectionSettingData xmlns:r=\"http://x/IPS_KVMRedirectionSettingData\">\
+             <r:ElementName>Intel(r) KVM Redirection Settings</r:ElementName>"
+        ));
+        assert!(
+            put.contains(
+                "<r:DefaultScreen></r:DefaultScreen><r:SessionTimeout>3</r:SessionTimeout>"
+            )
+        );
+        assert!(put.ends_with("<r:Note>a &amp; b</r:Note></r:IPS_KVMRedirectionSettingData>"));
     }
 
     #[test]
