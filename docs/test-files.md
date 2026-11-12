@@ -39,6 +39,7 @@ expect_not = "NO-CARRIER"
 | `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
 | `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
 | `cf` | no | A CompactFlash card in an IDE adapter for the test to format, of this size, from `1M` to `128G`: see [CompactFlash tests](#compactflash-tests). |
+| `hardware` | no | A virtual machine's devices the test needs, which its boot gives the machine: `guest-agent` (a QEMU guest agent channel, whose host end a host step reaches as `{guest-agent}`) and `virtio-scsi` (a blank 1 GiB disk on a virtio SCSI adapter). The test boots afresh with them and its boot is not shared. A machine that cannot give them, as a real one, skips the test. |
 | `[[step]]` | at least one | The steps, in order. |
 
 ## Categories
@@ -339,6 +340,7 @@ real machine. The runner fills them in, in the command, `input`,
 | `{port:NAME}` | A port of the lab PC's, free for TCP and UDP when the test first names it and the same for the rest of the test, for one of its servers: `{port:kdc}`, `{port:smb}`. | run, host |
 | `{machine}` | The machine's address as the lab PC reaches it: under QEMU, `127.0.0.1`. | host |
 | `{amt}` | The address of the machine's Intel AMT on the lab network, for its web (16992) and WS-Management ports. A test that names it needs the `amt` control: machines without AMT, as QEMU, skip it. | host |
+| `{guest-agent}` | The lab PC's end of the machine's QEMU guest agent channel, a Unix socket, for a test with `hardware = ["guest-agent"]`: `socat - UNIX-CONNECT:{guest-agent}` speaks to the agent as a hypervisor does. | host |
 | `{machine-port:N}` | The lab PC's port that reaches the machine's TCP port N, so the lab PC's clients reach the machine's servers: under QEMU, a free port forwarded to the guest's port N for the rest of the boot. `{machine-udp-port:N}` for UDP. | host |
 | `{work}` | The test's own folder on the lab PC, where host steps run. It goes when the test ends. | host |
 | `{here}` | The folder the test file is in, for a script beside the test. | host |

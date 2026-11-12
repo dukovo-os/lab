@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::bench::Kit;
-use crate::machines::{DriverKind, Machine};
+use crate::machines::{Control, DriverKind, Machine};
 use crate::ssh;
 use crate::stop::Stop;
 use crate::suite::{BlankDisc, Button, Floppy, PowerAction, Reader, Stick};
@@ -143,6 +143,11 @@ pub trait Driver: Send {
     /// machine's card is in its adapter already.
     fn want_cf_card(&mut self, _bytes: Option<u64>) {}
 
+    /// Says which of a virtual machine's devices ([`crate::suite::HARDWARE`])
+    /// the next [`Driver::boot_fresh`] gives the machine, for a test that
+    /// asks for them; none, for the rest.
+    fn want_hardware(&mut self, _hardware: &[Control]) {}
+
     /// Puts a floppy disk in the floppy drive: a copy of an image, or a
     /// blank one, write-protected or not.
     fn insert_floppy(&mut self, _floppy: &Floppy) -> Result<(), String> {
@@ -230,6 +235,12 @@ pub trait Driver: Send {
     /// The address of the machine's Intel AMT on the lab network
     /// (`{amt}`), on a machine that has it.
     fn amt_address(&self) -> Option<String> {
+        None
+    }
+
+    /// The lab PC's end of the machine's QEMU guest agent channel
+    /// (`{guest-agent}`), a Unix socket, on a boot that has one.
+    fn guest_agent_socket(&self) -> Option<PathBuf> {
         None
     }
 

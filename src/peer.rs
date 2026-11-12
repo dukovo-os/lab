@@ -23,6 +23,8 @@
 //!   under QEMU is a port of the lab PC's forwarded to the guest's;
 //! - `{amt}`: the address of the machine's Intel AMT, on a machine that
 //!   has it, for a host step to reach its web and WS-Management ports;
+//! - `{guest-agent}`: the lab PC's end of the machine's QEMU guest agent
+//!   channel, a Unix socket, for a test that asks for one;
 //! - `{work}`: a folder of the test's own on the lab PC, which host steps
 //!   run in and which goes when the test ends;
 //! - `{here}`: the folder the test file is in, for scripts beside it.
@@ -75,6 +77,9 @@ pub enum Token {
     Port(String),
     /// `{amt}`: the machine's AMT's address, on the lab network.
     Amt,
+    /// `{guest-agent}`: the lab PC's socket for the machine's QEMU guest
+    /// agent channel.
+    GuestAgent,
     /// `{work}`: the test's own folder on the lab PC.
     Work,
     /// `{here}`: the folder the test file is in.
@@ -103,6 +108,7 @@ pub fn scan(text: &str) -> Result<Vec<(Range<usize>, Token)>, String> {
             "peer" => Token::Peer,
             "machine" => Token::Machine,
             "amt" => Token::Amt,
+            "guest-agent" => Token::GuestAgent,
             "work" => Token::Work,
             "here" => Token::Here,
             _ => {

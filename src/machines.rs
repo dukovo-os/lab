@@ -78,11 +78,19 @@ pub enum Control {
     /// lab PC (`{amt}`), as an administrator's console does across the
     /// network while the system runs.
     Amt,
+    /// A QEMU guest agent channel: a virtio console port named
+    /// `org.qemu.guest_agent.0`, as Proxmox's QEMU Guest Agent option and
+    /// virt-manager give a virtual machine, whose host end the lab PC
+    /// holds (`{guest-agent}`).
+    GuestAgent,
+    /// A virtio SCSI adapter with a blank disk on it, as Proxmox and
+    /// Google Cloud attach disks.
+    VirtioScsi,
 }
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 19] = [
+    pub const ALL: [Control; 21] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -102,6 +110,8 @@ impl Control {
         Control::Attack,
         Control::Peer,
         Control::Amt,
+        Control::GuestAgent,
+        Control::VirtioScsi,
     ];
 
     /// Its name in machine files and output.
@@ -126,6 +136,8 @@ impl Control {
             Control::Attack => "attack",
             Control::Peer => "peer",
             Control::Amt => "amt",
+            Control::GuestAgent => "guest-agent",
+            Control::VirtioScsi => "virtio-scsi",
         }
     }
 }
@@ -480,11 +492,17 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
                 "peer is \"driver\" or \"none\": a person does not set up the lab PC's side".into(),
             ));
         }
-        // AMT is reached across the lab network, or not at all.
+        // AMT is reached across the lab network, or not at all, and a
+        // virtual machine's devices are its driver's to give it.
         if control == Control::Amt && who == Who::Person {
             return Err(bad(
                 "amt is \"driver\" or \"none\": a person cannot stand in for AMT".into()
             ));
+        }
+        if matches!(control, Control::GuestAgent | Control::VirtioScsi) && who == Who::Person {
+            return Err(bad(format!(
+                "{control} is \"driver\" or \"none\": a person does not add a virtual machine's devices"
+            )));
         }
         controls.insert(control, who);
     }
@@ -728,7 +746,14 @@ mod tests {
         }
         assert_eq!(real.who(Control::Linux), Who::Driver);
         assert_eq!(real.who(Control::Link), Who::Person);
-        for control in [Control::Usb, Control::Card, Control::Disc, Control::Attack] {
+        for control in [
+            Control::Usb,
+            Control::Card,
+            Control::Disc,
+            Control::Attack,
+            Control::GuestAgent,
+            Control::VirtioScsi,
+        ] {
             assert_eq!(real.who(control), Who::None, "{control}");
         }
         let amt = real.amt.as_ref().unwrap();

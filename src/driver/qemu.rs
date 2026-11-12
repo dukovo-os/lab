@@ -39,6 +39,12 @@
 //! goes in that drive too, as QEMU has no burner: it records the commands
 //! a burner takes (Dukovo's ADR 0449).
 //!
+//! A test that asks for a virtual machine's devices has its boot give the
+//! machine them: a QEMU guest agent channel (a `virtserialport` named
+//! `org.qemu.guest_agent.0` on a `virtio-serial-pci`, its host end a
+//! socket a host step reaches as `{guest-agent}`), and a blank disk on a
+//! `virtio-scsi-pci` adapter, as Proxmox gives them.
+//!
 //! A test that asks for a CompactFlash card has its boot give the machine
 //! a blank one: an `ide-cf` on a `piix3-ide` controller of its own, as
 //! the q35 chipset has no parallel IDE. A card stays in for the boot, as
@@ -62,7 +68,7 @@ use serde_json::json;
 
 use super::{Driver, Setup};
 use crate::bench::Kit;
-use crate::machines::{DiskBus, Firmware, Kvm, QemuSettings};
+use crate::machines::{Control, DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
 use crate::screen::Image;
 use crate::ssh;
@@ -174,6 +180,12 @@ pub struct Qemu {
     /// of this boot's card.
     want_cf_card: Option<u64>,
     cf_card: Option<PathBuf>,
+    /// Whether the next fresh boot gives the machine a QEMU guest agent
+    /// channel and a virtio SCSI adapter with a blank disk, set by
+    /// [`Driver::want_hardware`]; and the file of this boot's SCSI disk.
+    want_guest_agent: bool,
+    want_virtio_scsi: bool,
+    scsi_disk: Option<PathBuf>,
     /// The install stick this boot started from, while it is still in:
     /// its number and the overlay over the image it holds. It stays in
     /// across power cycles, as a real stick would, until it is pulled.
@@ -359,6 +371,9 @@ impl Qemu {
             want_floppy_drive: false,
             want_cf_card: None,
             cf_card: None,
+            want_guest_agent: false,
+            want_virtio_scsi: false,
+            scsi_disk: None,
             boot_stick: None,
             boot_disc: None,
             want_attacker: false,
@@ -387,6 +402,11 @@ impl Qemu {
     /// The socket the drive of music CDs plugs in through.
     fn music_socket(&self) -> PathBuf {
         self.setup.sockets.join("music.sock")
+    }
+
+    /// The host end of the guest agent channel.
+    fn agent_socket(&self) -> PathBuf {
+        self.setup.sockets.join("guest-agent.sock")
     }
 
     /// The drive of music CDs, if this boot has one running.
@@ -575,6 +595,36 @@ impl Qemu {
             args.push(format!("if=none,id={CF_DRIVE},format=raw,file={}", option_value(card)));
             args.push("-device".into());
             args.push(format!("ide-cf,drive={CF_DRIVE},bus={CF_ADAPTER}.0,unit=0,id=cf"));
+        }
+        // A QEMU guest agent channel, as Proxmox's QEMU Guest Agent option
+        // gives: a virtio console with one port of that name, whose host
+        // end is a socket the lab PC's side of a test talks to. Only on a
+        // boot for a test that asks for one, as the agent answers on it.
+        if self.want_guest_agent {
+            args.push("-device".into());
+            args.push("virtio-serial-pci,id=vserial".into());
+            args.push("-chardev".into());
+            args.push(format!(
+                "socket,id=agent,path={},server=on,wait=off",
+                option_value(&self.agent_socket())
+            ));
+            args.push("-device".into());
+            args.push(
+                "virtserialport,bus=vserial.0,chardev=agent,name=org.qemu.guest_agent.0".into(),
+            );
+        }
+        // A virtio SCSI adapter with this boot's blank disk on it, target
+        // 0 and LUN 0, as Proxmox attaches a disk. Only on a boot for a
+        // test that asks for one, as it would show up in a disk test.
+        if let Some(disk) = &self.scsi_disk {
+            args.push("-device".into());
+            args.push("virtio-scsi-pci,id=vscsi".into());
+            args.push("-drive".into());
+            args.push(format!("if=none,id=scsidisk,format=qcow2,file={}", option_value(disk)));
+            args.push("-device".into());
+            args.push(
+                "scsi-hd,bus=vscsi.0,drive=scsidisk,serial=lab-scsi-disk,scsi-id=0,lun=0".into(),
+            );
         }
         // The install stick, named as a stick plugged in later is, so that
         // pulling it works the same way.
@@ -786,6 +836,9 @@ impl Qemu {
         }
         if let Some(card) = self.cf_card.take() {
             let _ = fs::remove_file(card);
+        }
+        if let Some(disk) = self.scsi_disk.take() {
+            let _ = fs::remove_file(disk);
         }
         self.stick = None;
         self.boot_disc = None;
@@ -1017,6 +1070,14 @@ impl Driver for Qemu {
             let card = self.setup.work.join(format!("cf-{}.img", self.boot));
             make_medium(&Stick::Blank(bytes), &card)?;
             self.cf_card = Some(card);
+        }
+        // A blank disk on the virtio SCSI adapter, which takes room only
+        // as it is written.
+        if self.want_virtio_scsi {
+            let disk = self.setup.work.join(format!("scsi-{}.qcow2", self.boot));
+            let name = disk.display().to_string();
+            Self::qemu_img(&["-f", "qcow2", &name, "1G"], "the SCSI disk")?;
+            self.scsi_disk = Some(disk);
         }
         self.power_on()
     }
@@ -1306,6 +1367,16 @@ impl Driver for Qemu {
 
     fn want_cf_card(&mut self, bytes: Option<u64>) {
         self.want_cf_card = bytes;
+    }
+
+    fn want_hardware(&mut self, hardware: &[Control]) {
+        self.want_guest_agent = hardware.contains(&Control::GuestAgent);
+        self.want_virtio_scsi = hardware.contains(&Control::VirtioScsi);
+    }
+
+    fn guest_agent_socket(&self) -> Option<PathBuf> {
+        // A test that asked for the channel has a boot of its own with it.
+        self.want_guest_agent.then(|| self.agent_socket())
     }
 
     fn want_floppy_drive(&mut self, yes: bool) {
@@ -1960,6 +2031,23 @@ mod tests {
         assert!(qemu.eject_disc().unwrap_err().contains("no disc"), "taken out for good");
         assert_eq!(fs::metadata(&install).unwrap().len(), 1 << 20);
         qemu.want_disc_drive(false);
+
+        // A virtual machine's devices, on a boot that asks for them: the
+        // guest agent channel, whose host end takes a connection, and a
+        // blank disk on a virtio SCSI adapter, gone with the boot.
+        assert!(qemu.guest_agent_socket().is_none());
+        qemu.want_hardware(&[Control::GuestAgent, Control::VirtioScsi]);
+        qemu.boot_fresh().unwrap();
+        let socket = qemu.guest_agent_socket().unwrap();
+        std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let scsi = qemu.scsi_disk.clone().unwrap();
+        assert!(scsi.is_file());
+        let devices = qemu.qmp().unwrap().execute("query-block", &json!({})).unwrap();
+        let disk = devices.as_array().unwrap().iter().find(|device| device["device"] == "scsidisk");
+        assert!(disk.unwrap()["inserted"].is_object(), "the disk is on its adapter");
+        qemu.want_hardware(&[]);
+        qemu.boot_fresh().unwrap();
+        assert!(qemu.guest_agent_socket().is_none() && qemu.scsi_disk.is_none());
         qemu.shut_off();
         assert!(!qemu.is_on());
         let log = fs::read_to_string(dir.path().join("logs/qemu-1.log")).unwrap();
