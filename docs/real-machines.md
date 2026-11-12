@@ -109,9 +109,10 @@ and needs the lab card's address.
 
 The first test that uses the screen, keyboard or mouse turns AMT's
 remote screen on, with a password made for the run, and its session
-stays open for the rest of the run. AMT plugs a keyboard and mouse into
-the machine when a session opens, so the session staying open keeps
-them there across boots, as a person's would be.
+stays open until the next power change. AMT plugs a keyboard and mouse
+into the machine when a session opens, and turns power changes down
+while one is open, so the driver closes its session before each power
+change, and the next step that uses the screen opens another.
 
 A person handles the network cable, USB sticks, cards and discs: Needs
 you steps, with those controls set to `person` in the machine file.
@@ -147,7 +148,19 @@ real machines yet; tests that need them are skipped there.
 - AMT refuses connections for a moment when the machine has been off
   and AMT left alone for a while: its engine dozes, and the first
   connection wakes it. The driver keeps trying for 20 seconds before it
-  gives up.
+  gives up. A question AMT does not answer while the machine runs leaves
+  the power as AMT last said it, or on after a power change: only AMT's
+  word ends a wait as off.
+- AMT turns power changes down (`RequestPowerStateChange returned 2`)
+  while a remote screen session is open. The driver closes its own
+  first, but a VNC viewer a person has open on the machine blocks them,
+  and the driver's own sessions too: close it before a run.
+- When `amt.log` shows a net boot but no `GET kernel` after it, the
+  machine did not load the writer: its firmware or the network GRUB went
+  on to the disk, and `writer-<n>.log` shows the disk's GRUB menu. The
+  net-boot server notes each request it turns away, without the token,
+  and `journalctl -u dukovo-lab-dnsmasq` shows whether the machine asked
+  for an address and the boot script.
 - `dukovo-lab machines check <machine>` checks AMT, its remote screen,
   the serial port, the lab network, the TFTP folder, the network GRUB,
   the writer and the lab key, without changing anything.

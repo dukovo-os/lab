@@ -562,6 +562,7 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
     if settings.console.is_empty() || settings.console.contains(char::is_whitespace) {
         return Err("amt.console must be one Linux console name, such as ttyS0,115200".into());
     }
+    crate::netboot::ports(settings.boot_port).map_err(|err| format!("amt.boot_port: {err}"))?;
     Ok(())
 }
 

@@ -47,6 +47,15 @@ order or by hand, so goes on to its disk.
    boot
    ```
 
+   The server listens on four ports, from the machine file's
+   `boot_port`, and each boot's URLs name the next one in turn. GRUB
+   opens its connections from the same source port, 21550 and up, with
+   nearly the same sequence number, on every boot, and the lab PC
+   remembers a connection for a minute after it closes. A boot that came
+   within that minute on the same port would be turned away, and GRUB,
+   answering the lab PC's replies, keeps the old connection remembered
+   for as long as it tries.
+
 2. AMT is asked to boot the machine from the network once, and to turn
    it on. The firmware asks dnsmasq for an address and its boot file,
    GRUB reads the script, and the kernel boots.
