@@ -155,6 +155,13 @@ real machines yet; tests that need them are skipped there.
   starts is taken and not done: the driver waits until AMT says on, and
   asks a hard off again every 5 seconds while the machine stays on, for
   up to 30.
+- AMT that stops answering altogether, no ping and no ARP reply for its
+  address, while the lab network is up, has hung: only pulling the
+  machine's power cord for 30 seconds brings it back. AMT 11.8 on an
+  OptiPlex 7040 hung when asked for a hard off a second after turning
+  the machine on, so the driver waits 10 seconds after turning the
+  machine on or resetting it before the next power change, and
+  `amt.log` notes each wait.
 - AMT turns power changes down (`RequestPowerStateChange returned 2`)
   while a remote screen session is open. The driver closes its own
   first, but a VNC viewer a person has open on the machine blocks them,

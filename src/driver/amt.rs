@@ -64,6 +64,12 @@ const HARD_OFF_AGAIN: Duration = Duration::from_secs(5);
 /// How long AMT may go on saying the machine is off after turning it on.
 const ON_TIME: Duration = Duration::from_secs(30);
 
+/// How long after turning the machine on or resetting it the next power
+/// change waits: AMT 11.8 on an OptiPlex 7040 asked for a hard off 1.1 s
+/// after an on went silent, its engine answering nothing on the network,
+/// until the power cord was pulled.
+const START_SETTLE: Duration = Duration::from_secs(10);
+
 /// How long a power state read from AMT is trusted: waits ask often.
 const POWER_FRESH: Duration = Duration::from_secs(1);
 
@@ -108,6 +114,10 @@ pub struct AmtDriver {
     boot: u32,
     /// The power state last read, and when.
     power: Option<(Instant, bool)>,
+    /// When AMT last turned the machine on or reset it, and how long a
+    /// power change after it waits ([`START_SETTLE`]).
+    last_start: Option<Instant>,
+    start_settle: Duration,
     /// AMT's remote screen: its address, the password set for this run
     /// once it is turned on, the session and when it opened, and where
     /// the pointer was put last.
@@ -163,6 +173,8 @@ impl AmtDriver {
             image: None,
             boot: 0,
             power: None,
+            last_start: None,
+            start_settle: START_SETTLE,
             screen_address,
             screen_password: None,
             screen: None,
@@ -206,6 +218,17 @@ impl AmtDriver {
             self.note("remote screen: session closed for a power change");
         }
         self.power = None;
+        if let Some(started) = self.last_start
+            && change != PowerChange::On
+            && started.elapsed() < self.start_settle
+        {
+            let rest = self.start_settle - started.elapsed();
+            self.note(&format!(
+                "power: waiting {:.1} s after the machine started before a power change",
+                rest.as_secs_f64()
+            ));
+            std::thread::sleep(rest);
+        }
         self.note(&format!("power: {change:?}"));
         let deadline = Instant::now() + SCREEN_CLOSE_TIME;
         let changed = loop {
@@ -215,8 +238,12 @@ impl AmtDriver {
             }
             std::thread::sleep(Duration::from_millis(500));
         };
-        if let Err(err) = &changed {
-            self.note(&format!("power: {err}"));
+        match &changed {
+            Ok(()) if matches!(change, PowerChange::On | PowerChange::Reset) => {
+                self.last_start = Some(Instant::now());
+            }
+            Ok(()) => {}
+            Err(err) => self.note(&format!("power: {err}")),
         }
         changed
     }
@@ -1022,6 +1049,8 @@ mod tests {
             stop: Stop::default(),
         };
         let mut driver = AmtDriver::new(settings, setup).unwrap();
+        // Tests of the wait after a start set their own.
+        driver.start_settle = Duration::ZERO;
         let screen = {
             let state = Arc::clone(&fake.state);
             FakeVnc::start(Box::new(move || state.lock().unwrap().screen.open_password()))
@@ -1149,6 +1178,30 @@ mod tests {
         assert_eq!(hard_offs, 2);
         let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
         assert!(log.contains("power: the machine is still on; asking again"), "{log}");
+    }
+
+    #[test]
+    fn a_power_change_waits_a_while_after_the_machine_starts() {
+        let mut bench = bench("amt-start-settle", false);
+        bench.driver.start_settle = Duration::from_millis(800);
+        let soon = Instant::now() + Duration::from_secs(10);
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        let on = Instant::now();
+        bench.driver.power(PowerAction::Cut, soon).unwrap();
+        assert!(on.elapsed() >= Duration::from_millis(700), "{:?}", on.elapsed());
+        // A reset starts the machine too; an on after an off does not wait.
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        std::thread::sleep(Duration::from_millis(800));
+        bench.driver.power(PowerAction::Reset, soon).unwrap();
+        let reset = Instant::now();
+        bench.driver.power(PowerAction::Cut, soon).unwrap();
+        assert!(reset.elapsed() >= Duration::from_millis(700), "{:?}", reset.elapsed());
+        let off = Instant::now();
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        assert!(off.elapsed() < Duration::from_millis(700), "{:?}", off.elapsed());
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        let waits = log.matches("after the machine started before a power change").count();
+        assert_eq!(waits, 2, "{log}");
     }
 
     #[test]
