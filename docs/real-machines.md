@@ -150,7 +150,11 @@ real machines yet; tests that need them are skipped there.
   connection wakes it. The driver keeps trying for 20 seconds before it
   gives up. A question AMT does not answer while the machine runs leaves
   the power as AMT last said it, or on after a power change: only AMT's
-  word ends a wait as off.
+  word ends a wait as off. For a moment after it turns the machine on,
+  AMT still says it is off, and a hard off asked while the machine
+  starts is taken and not done: the driver waits until AMT says on, and
+  asks a hard off again every 5 seconds while the machine stays on, for
+  up to 30.
 - AMT turns power changes down (`RequestPowerStateChange returned 2`)
   while a remote screen session is open. The driver closes its own
   first, but a VNC viewer a person has open on the machine blocks them,

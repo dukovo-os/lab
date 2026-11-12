@@ -57,6 +57,13 @@ pub const WRITE_TIME: Duration = Duration::from_secs(4 * 60);
 /// How long the machine is given to go off after a hard off.
 const OFF_TIME: Duration = Duration::from_secs(30);
 
+/// How long a hard off is waited for before AMT is asked again: AMT takes
+/// one asked while the machine is starting and does nothing with it.
+const HARD_OFF_AGAIN: Duration = Duration::from_secs(5);
+
+/// How long AMT may go on saying the machine is off after turning it on.
+const ON_TIME: Duration = Duration::from_secs(30);
+
 /// How long a power state read from AMT is trusted: waits ask often.
 const POWER_FRESH: Duration = Duration::from_secs(1);
 
@@ -214,13 +221,48 @@ impl AmtDriver {
         changed
     }
 
-    /// Turns the machine off at once if it is on, and waits until it is.
+    /// Turns the machine off at once if it is on, and waits until it is,
+    /// asking again while it stays on.
     fn hard_off(&mut self) -> Result<(), String> {
         if !self.read_power()? {
             return Ok(());
         }
-        self.change(PowerChange::HardOff)?;
-        self.wait_off(Instant::now() + OFF_TIME)
+        let deadline = Instant::now() + OFF_TIME;
+        loop {
+            self.change(PowerChange::HardOff)?;
+            match self.wait_off((Instant::now() + HARD_OFF_AGAIN).min(deadline)) {
+                Ok(()) => return Ok(()),
+                Err(err) if Instant::now() >= deadline || self.setup.stop.requested() => {
+                    return Err(err);
+                }
+                Err(_) => self.note("power: the machine is still on; asking again"),
+            }
+        }
+    }
+
+    /// Turns the machine on, and waits until AMT says it is: for a moment
+    /// after, AMT still says it is off, which a wait would take as the
+    /// machine going off again.
+    fn turn_on(&mut self) -> Result<(), String> {
+        self.change(PowerChange::On)?;
+        let deadline = Instant::now() + ON_TIME;
+        loop {
+            let said = self.read_power();
+            if said == Ok(true) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline || self.setup.stop.requested() {
+                return Err(match said {
+                    Err(err) => format!("the machine did not come on: {err}"),
+                    _ => format!(
+                        "the machine did not come on: AMT still said it was off {} s after \
+                         turning it on",
+                        ON_TIME.as_secs()
+                    ),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     /// Waits until AMT says the machine is off.
@@ -252,7 +294,7 @@ impl AmtDriver {
         netboot::write_script(&self.script, &netboot::grub_script(what, &base, &cmdline))?;
         self.note(&format!("net boot: {what}, boot script {}", self.script.display()));
         self.amt.boot_from_network_once()?;
-        self.change(PowerChange::On)
+        self.turn_on()
     }
 
     /// Ends a net boot: its script and offer go, so a later boot from the
@@ -677,7 +719,7 @@ impl Driver for AmtDriver {
                 if self.read_power()? {
                     return Ok(());
                 }
-                self.change(PowerChange::On)
+                self.turn_on()
             }
             PowerAction::Off => {
                 self.change(PowerChange::SoftOff).map_err(graceful)?;
@@ -1087,6 +1129,26 @@ mod tests {
         assert!(!bench.driver.is_on());
         let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
         assert!(log.contains("power state: AMT at"), "{log}");
+    }
+
+    #[test]
+    fn power_changes_wait_out_amt_while_the_machine_starts() {
+        let mut bench = bench("amt-power-timing", false);
+        let soon = Instant::now() + Duration::from_secs(10);
+        // AMT says off for a moment after turning the machine on: on
+        // returns only once AMT says on, so a wait after it goes on.
+        bench.fake.state.lock().unwrap().off_after_on = 3;
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        assert!(bench.driver.is_on());
+        // A hard off AMT takes but does nothing with is asked again.
+        bench.fake.state.lock().unwrap().ignored_hard_offs = 1;
+        bench.driver.power(PowerAction::Cut, soon).unwrap();
+        assert!(!bench.driver.is_on());
+        let hard_offs =
+            bench.fake.calls().iter().filter(|call| *call == "RequestPowerStateChange 8").count();
+        assert_eq!(hard_offs, 2);
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        assert!(log.contains("power: the machine is still on; asking again"), "{log}");
     }
 
     #[test]
