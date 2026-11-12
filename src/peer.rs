@@ -21,6 +21,8 @@
 //! - `{machine}` and `{machine-port:N}` (or `{machine-udp-port:N}`): the
 //!   address and port where the lab PC reaches the machine's port N, which
 //!   under QEMU is a port of the lab PC's forwarded to the guest's;
+//! - `{amt}`: the address of the machine's Intel AMT, on a machine that
+//!   has it, for a host step to reach its web and WS-Management ports;
 //! - `{work}`: a folder of the test's own on the lab PC, which host steps
 //!   run in and which goes when the test ends;
 //! - `{here}`: the folder the test file is in, for scripts beside it.
@@ -71,6 +73,8 @@ pub enum Token {
     /// `{port:NAME}`: a free port of the lab PC's for one of the test's
     /// servers.
     Port(String),
+    /// `{amt}`: the machine's AMT's address, on the lab network.
+    Amt,
     /// `{work}`: the test's own folder on the lab PC.
     Work,
     /// `{here}`: the folder the test file is in.
@@ -98,6 +102,7 @@ pub fn scan(text: &str) -> Result<Vec<(Range<usize>, Token)>, String> {
         let token = match inside {
             "peer" => Token::Peer,
             "machine" => Token::Machine,
+            "amt" => Token::Amt,
             "work" => Token::Work,
             "here" => Token::Here,
             _ => {
@@ -134,6 +139,11 @@ pub fn scan(text: &str) -> Result<Vec<(Range<usize>, Token)>, String> {
 /// Whether `text` holds any placeholder.
 pub fn uses_peer(text: &str) -> bool {
     scan(text).is_ok_and(|found| !found.is_empty())
+}
+
+/// Whether `text` names the machine's AMT (`{amt}`).
+pub fn uses_amt(text: &str) -> bool {
+    scan(text).is_ok_and(|found| found.iter().any(|(_, token)| *token == Token::Amt))
 }
 
 /// `text` with each placeholder replaced by what `value` gives for it.

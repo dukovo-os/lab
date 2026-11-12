@@ -74,11 +74,15 @@ pub enum Control {
     /// server, a WireGuard end), and ports of the machine the lab PC
     /// reaches to use the machine's own servers.
     Peer,
+    /// Reaching the machine's out-of-band management, Intel AMT, from the
+    /// lab PC (`{amt}`), as an administrator's console does across the
+    /// network while the system runs.
+    Amt,
 }
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 18] = [
+    pub const ALL: [Control; 19] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
@@ -97,6 +101,7 @@ impl Control {
         Control::Linux,
         Control::Attack,
         Control::Peer,
+        Control::Amt,
     ];
 
     /// Its name in machine files and output.
@@ -120,6 +125,7 @@ impl Control {
             Control::Linux => "linux",
             Control::Attack => "attack",
             Control::Peer => "peer",
+            Control::Amt => "amt",
         }
     }
 }
@@ -369,8 +375,12 @@ impl Machine {
 fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
     match driver {
         // QMP does all of them, and SSH reaches the guest through QEMU's
-        // port forwarding.
-        DriverKind::Qemu => Control::ALL.iter().map(|&control| (control, Who::Driver)).collect(),
+        // port forwarding; a QEMU machine has no AMT.
+        DriverKind::Qemu => Control::ALL
+            .iter()
+            .filter(|&&control| control != Control::Amt)
+            .map(|&control| (control, Who::Driver))
+            .collect(),
         // AMT does power and the power cut (its hard off, which the system
         // gets no warning of), and its remote screen the keys, mouse and
         // screen; the serial cable does the console, the lab network SSH
@@ -386,6 +396,7 @@ fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
             Control::Ssh,
             Control::Linux,
             Control::Peer,
+            Control::Amt,
         ]
         .into_iter()
         .map(|control| (control, Who::Driver))
@@ -467,6 +478,12 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         if control == Control::Peer && who == Who::Person {
             return Err(bad(
                 "peer is \"driver\" or \"none\": a person does not set up the lab PC's side".into(),
+            ));
+        }
+        // AMT is reached across the lab network, or not at all.
+        if control == Control::Amt && who == Who::Person {
+            return Err(bad(
+                "amt is \"driver\" or \"none\": a person cannot stand in for AMT".into()
             ));
         }
         controls.insert(control, who);
@@ -604,7 +621,10 @@ mod tests {
         let machines = load(&dir.path().join("missing")).unwrap();
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].name, "qemu");
-        assert!(Control::ALL.iter().all(|&control| machines[0].who(control) == Who::Driver));
+        for control in Control::ALL {
+            let who = if control == Control::Amt { Who::None } else { Who::Driver };
+            assert_eq!(machines[0].who(control), who, "{control}");
+        }
     }
 
     #[test]
@@ -702,6 +722,7 @@ mod tests {
             Control::Screen,
             Control::Ssh,
             Control::Peer,
+            Control::Amt,
         ] {
             assert_eq!(real.who(control), Who::Driver, "{control}");
         }

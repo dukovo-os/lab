@@ -227,6 +227,12 @@ pub trait Driver: Send {
         None
     }
 
+    /// The address of the machine's Intel AMT on the lab network
+    /// (`{amt}`), on a machine that has it.
+    fn amt_address(&self) -> Option<String> {
+        None
+    }
+
     /// The lab PC's port that reaches the machine's `port` (UDP when
     /// `udp`, else TCP) at [`Driver::machine_address`], for the lab PC's
     /// clients to reach a server of the machine's (`{machine-port:N}`).

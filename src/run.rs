@@ -1168,6 +1168,9 @@ impl<'a> Worker<'a> {
             Token::Machine => self.driver.machine_address().ok_or_else(|| {
                 StepFailure::Error("this machine's driver has no address for the machine".into())
             }),
+            Token::Amt => self.driver.amt_address().ok_or_else(|| {
+                StepFailure::Error("this machine's driver has no address for its AMT".into())
+            }),
             Token::MachinePort { port, udp } => self
                 .driver
                 .reach(*port, *udp)

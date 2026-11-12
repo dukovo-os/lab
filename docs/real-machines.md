@@ -102,6 +102,7 @@ and needs the lab card's address.
 | `serial` | The serial cable: each boot's console is `logs/<machine>/serial-<n>.log`. |
 | `ssh` | The machine's own address on the lab network. |
 | `peer` | The lab PC is `{peer}` (`10.77.0.1`) and the machine `{machine}` (`10.77.0.2`); the machine's ports are reached as they are. |
+| `amt` | `{amt}` is AMT's own address (`10.77.0.10`), for a test that checks AMT keeps answering while the system runs. |
 | `linux` | The machine is its own Linux twin: it boots the Linux kit from the network, then boots afresh to go on with the test. |
 | `screen` | AMT's remote screen, a VNC server on port 5900: `screen` steps read its text and `screenshot` steps save it as a PNG. A failing test's screenshot comes from it too. |
 | `keys` | The remote screen's keyboard, a US layout: `keys` and `type` steps. |
