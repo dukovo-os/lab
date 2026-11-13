@@ -1432,7 +1432,7 @@ impl Driver for Qemu {
         Ok(())
     }
 
-    fn point(&mut self, x: u32, y: u32) -> Result<(), String> {
+    fn point(&mut self, x: i32, y: i32) -> Result<(), String> {
         // QEMU takes where a tablet points as 0 to ABS_MAX on each axis,
         // the whole screen whatever its size, so the pixel is scaled by
         // the size the screen has now.
@@ -1441,13 +1441,16 @@ impl Driver for Qemu {
         let bytes = fs::read(&dump).map_err(|err| format!("{}: {err}", dump.display()))?;
         let _ = fs::remove_file(&dump);
         let screen = Image::parse_ppm(&bytes)?;
-        let (x, y) = (x as usize, y as usize);
-        if x >= screen.width || y >= screen.height {
+        let side = |size: usize| u32::try_from(size).unwrap_or(u32::MAX);
+        let (Some(at_x), Some(at_y)) =
+            (super::pixel(x, side(screen.width)), super::pixel(y, side(screen.height)))
+        else {
             return Err(format!(
                 "({x}, {y}) is off the screen, which is {}x{} pixels",
                 screen.width, screen.height
             ));
-        }
+        };
+        let (x, y) = (at_x as usize, at_y as usize);
         let scale = |at: usize, size: usize| (at * ABS_MAX / (size - 1).max(1)) as u64;
         let events = json!({ "events": [
             { "type": "abs", "data": { "axis": "x", "value": scale(x, screen.width) } },
@@ -1818,11 +1821,12 @@ mod tests {
         let size = |qemu: &mut Qemu| {
             qemu.screen_dump(&dump).unwrap();
             let screen = Image::parse_ppm(&fs::read(&dump).unwrap()).unwrap();
-            (screen.width as u32, screen.height as u32)
+            (i32::try_from(screen.width).unwrap(), i32::try_from(screen.height).unwrap())
         };
         qemu.point(0, 0).unwrap();
         let (width, height) = size(&mut qemu);
         qemu.point(width - 1, height - 1).unwrap();
+        qemu.point(-1, -1).unwrap();
         // Tried again should the screen grow between its size and the point.
         let off = (0..5)
             .find_map(|_| {

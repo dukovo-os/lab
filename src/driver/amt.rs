@@ -841,19 +841,22 @@ impl Driver for AmtDriver {
         })
     }
 
-    fn point(&mut self, x: u32, y: u32) -> Result<(), String> {
+    fn point(&mut self, x: i32, y: i32) -> Result<(), String> {
         let (mut width, mut height) = self.with_screen(false, |vnc| Ok(vnc.size()))?;
-        if x >= width || y >= height {
-            // The size known may be from before the screen last changed.
+        let known = super::pixel(x, width).zip(super::pixel(y, height));
+        if x < 0 || y < 0 || known.is_none() {
+            // The size known may be from before the screen last changed,
+            // and a pixel counted from the far edge depends on it.
             let now = self.capture()?;
             (width, height) = (now.width as u32, now.height as u32);
         }
-        let (Ok(x), Ok(y)) = (u16::try_from(x), u16::try_from(y)) else {
-            return Err(format!("({x}, {y}) is off the screen"));
+        let off = || format!("({x}, {y}) is off the screen, which is {width}x{height} pixels");
+        let (Some(at_x), Some(at_y)) = (super::pixel(x, width), super::pixel(y, height)) else {
+            return Err(off());
         };
-        if u32::from(x) >= width || u32::from(y) >= height {
-            return Err(format!("({x}, {y}) is off the screen, which is {width}x{height} pixels"));
-        }
+        let (Ok(x), Ok(y)) = (u16::try_from(at_x), u16::try_from(at_y)) else {
+            return Err(off());
+        };
         self.with_screen(true, |vnc| vnc.pointer(0, x, y))?;
         self.pointer = (x, y);
         Ok(())
