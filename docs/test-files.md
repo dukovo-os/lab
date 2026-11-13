@@ -158,7 +158,10 @@ screen and says how to get them.
 
 A step polls the screen twice a second until the text shows, or is gone,
 or the test's time runs out. A failing step shows what the screen held
-then. Text stays on the screen as it scrolls up, so wait for something
+then. A boot that reaches the machine's ready line without the kernel
+saying where the console's cells are has no screen to read, as on a real
+machine with no monitor or display emulator plug, and the step fails at
+once and says so. Text stays on the screen as it scrolls up, so wait for something
 new: to wait for a command's output and not the command line that typed
 it, split a label in two in the command, as
 `type = "echo \"in\"\": $(whoami)\"\n"` then `screen = "in: lab"`.

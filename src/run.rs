@@ -1692,6 +1692,15 @@ impl<'a> Worker<'a> {
         self.driver.press_keys(&combos).map(|()| None).map_err(StepFailure::Error)
     }
 
+    /// Whether this boot came up with no console to read: the kernel
+    /// says where the console's cells are long before the machine is
+    /// ready, so a boot that is ready without saying so has no screen,
+    /// and waiting longer will not give it one.
+    fn came_up_without_screen(&mut self) -> bool {
+        let ready = self.machine.ready.clone();
+        came_up_without_screen(self.serial.this_boot(), &ready)
+    }
+
     /// The text on the machine's screen now, a string a row.
     fn read_screen(&mut self) -> Result<Vec<String>, String> {
         let fonts = self.shared.fonts.ok_or(NO_FONTS)?;
@@ -1734,6 +1743,14 @@ impl<'a> Worker<'a> {
                 && screen::shows(screen, texts) == shown
             {
                 return Ok(Some(screen::as_text(screen)));
+            }
+            if read.is_err() && self.came_up_without_screen() {
+                return Err(StepFailure::Fail(format!(
+                    "the machine has no screen to read: this boot said \"{}\" but never \
+                     where the console's cells are (\"console of ... cells\"), as when no \
+                     monitor or dummy plug is attached",
+                    self.machine.ready
+                )));
             }
             if Instant::now() >= deadline {
                 break read;
@@ -1979,6 +1996,12 @@ fn whole_characters(bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+/// Whether `boot`, one boot's serial log, shows the machine `ready`
+/// without the kernel having said where the console's cells are.
+fn came_up_without_screen(boot: &str, ready: &str) -> bool {
+    boot.contains(ready) && screen::Geometry::from_log(boot).is_none()
+}
+
 /// Lets tests run whole runs without QEMU.
 #[cfg(test)]
 mod fake;
@@ -1986,6 +2009,7 @@ mod fake;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machines::DEFAULT_READY;
     use std::io::Write as _;
 
     #[test]
@@ -2089,6 +2113,17 @@ mod tests {
         fs::write(&path, "Boot complete.\nRadix\nBoot complete.\n").unwrap();
         assert!(watch.seen_this_boot("Boot complete."));
         assert!(watch.find("Boot complete."), "the serial step's own place is untouched");
+    }
+
+    #[test]
+    fn a_boot_ready_without_a_console_has_no_screen_to_wait_for() {
+        let console = "[0.3] Framebuffer: console of 160x45 cells with font 8x16 at (0, 0)\n";
+        // Still booting: the console may yet come.
+        assert!(!came_up_without_screen("Radix\n", DEFAULT_READY));
+        // Ready with a console: the screen can be read.
+        assert!(!came_up_without_screen(&format!("{console}Boot complete.\n"), DEFAULT_READY));
+        // Ready with none, as with no monitor: no use waiting.
+        assert!(came_up_without_screen("Radix\nBoot complete.\n", DEFAULT_READY));
     }
 
     #[test]
