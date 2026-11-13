@@ -145,6 +145,13 @@ fn open_port(port: &Path, baud: u32) -> Result<File, String> {
 }
 
 /// Whether `port` opens for reading now, for `machines check`.
+/// A serial log's text so far, with any bytes that are not UTF-8 (noise
+/// on the line at power on) shown as U+FFFD; empty while the file is not
+/// there yet.
+pub fn read_log(path: &Path) -> String {
+    String::from_utf8_lossy(&fs::read(path).unwrap_or_default()).into_owned()
+}
+
 pub fn check_port(port: &Path, baud: u32) -> Result<(), String> {
     open_port(port, baud).map(drop)
 }

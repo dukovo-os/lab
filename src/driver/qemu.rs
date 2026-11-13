@@ -772,7 +772,7 @@ impl Qemu {
         // Linux powers itself off once its benchmarks are done; the done
         // line is the sign they all ran.
         let outcome = loop {
-            let text = fs::read_to_string(log).unwrap_or_default();
+            let text = crate::serial::read_log(log);
             if text.contains(&kit.done) {
                 break Ok(text);
             }

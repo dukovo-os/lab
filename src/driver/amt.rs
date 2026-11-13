@@ -949,7 +949,7 @@ impl Driver for AmtDriver {
         let cmdline = with_console(&kit.cmdline, &self.settings.console);
         let booted = self.net_boot("the Linux twin", Offer::Twin { kit: kit.clone() }, &cmdline);
         let measured = booted.and_then(|()| loop {
-            let text = fs::read_to_string(log).unwrap_or_default();
+            let text = crate::serial::read_log(log);
             if text.contains(&kit.done) {
                 break Ok(text);
             }
@@ -1034,10 +1034,11 @@ mod tests {
                 let (tftp, port, disk) = (tftp.clone(), port.clone(), disk.clone());
                 // As the machine would: the firmware, then what it boots.
                 std::thread::spawn(move || {
-                    let say = |text: &str| {
+                    let say_bytes = |bytes: &[u8]| {
                         let mut port = OpenOptions::new().append(true).open(&port).unwrap();
-                        port.write_all(text.as_bytes()).unwrap();
+                        port.write_all(bytes).unwrap();
                     };
+                    let say = |text: &str| say_bytes(text.as_bytes());
                     let script = fs::read_to_string(netboot::script_path(&tftp, MAC));
                     let Some(script) = script.ok().filter(|_| network) else {
                         say("Boot complete.\n");
@@ -1046,6 +1047,9 @@ mod tests {
                     let Some(base) =
                         script.split_whitespace().find_map(|word| word.strip_prefix("dukovo.lab="))
                     else {
+                        // A real serial line often opens with a byte of
+                        // noise from the power on, which is not UTF-8.
+                        say_bytes(b"\xff\r\n");
                         say("BENCH name=spawn ns=120.0\nlinux-bench: done\n");
                         return;
                     };
