@@ -261,11 +261,11 @@ impl Driver for FakeMachine {
         Ok(())
     }
 
-    fn point(&mut self, x: u32, y: u32) -> Result<(), String> {
+    fn point(&mut self, x: i32, y: i32) -> Result<(), String> {
         // The fake screen is 100 by 40 pixels, as `screen_dump` draws it.
-        if x >= 100 || y >= 40 {
+        let (Some(x), Some(y)) = (crate::driver::pixel(x, 100), crate::driver::pixel(y, 40)) else {
             return Err(format!("({x}, {y}) is off the screen, which is 100x40 pixels"));
-        }
+        };
         self.pointer = (x, y);
         Ok(())
     }

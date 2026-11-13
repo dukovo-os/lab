@@ -93,7 +93,7 @@ Each step has exactly one action key, and only the options that go with it.
 | `floppy = "reinsert"` | | Puts the disk taken out last back in, holding what the machine wrote on it, its tab as it was. | floppy |
 | `keys = ["ctrl-alt-delete"]` | | Presses each combination in turn: QEMU key names joined by `-`. | keys |
 | `type = "<text>"` | | Types the text on a US keyboard: `\n` is Enter, and `{password}` types the lab password, which is never shown or kept. A character with no key on a US keyboard is an error when the suite loads. | keys |
-| `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. An error if the screen is smaller. | mouse |
+| `point = [x, y]` | | Moves the pointer to that pixel of the screen, counted from its top left corner. A negative number counts back from the right or bottom edge, so `[-1, -1]` is the bottom right corner of a screen of any size. An error if the screen is smaller. | mouse |
 | `click = "left"` | | Presses a pointer button where the pointer is and lets it go: `left`, `right` or `middle`. | mouse |
 | `screen = "<text>"` | | Waits until the screen shows the text, a string or a list of strings that must all show, each within one row (see [Reading the screen](#reading-the-screen)). | screen |
 | `screen_gone = "<text>"` | | Waits until the screen no longer shows the text. | screen |

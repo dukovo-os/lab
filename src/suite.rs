@@ -276,10 +276,10 @@ pub enum Step {
     /// [`PASSWORD_TOKEN`] types the lab password.
     Type(String),
     /// Moves the pointer to this pixel of the screen, counted from its
-    /// top left corner.
+    /// top left corner, or back from its far edges when negative.
     Point {
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
     },
     /// Presses a pointer button and lets it go, where the pointer is.
     Click(Button),
@@ -825,7 +825,7 @@ struct StepFile {
     or_skip: Option<String>,
     #[serde(rename = "type")]
     typed: Option<String>,
-    point: Option<Vec<u32>>,
+    point: Option<Vec<i32>>,
     click: Option<Button>,
     attack: Option<String>,
     host: Option<String>,

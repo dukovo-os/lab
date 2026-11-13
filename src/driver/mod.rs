@@ -169,8 +169,9 @@ pub trait Driver: Send {
     /// Presses each key combination in turn.
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String>;
 
-    /// Moves the pointer to pixel (`x`, `y`) of the screen.
-    fn point(&mut self, x: u32, y: u32) -> Result<(), String>;
+    /// Moves the pointer to pixel (`x`, `y`) of the screen, each found
+    /// by [`pixel`].
+    fn point(&mut self, x: i32, y: i32) -> Result<(), String>;
 
     /// Presses `button` and lets it go.
     fn click(&mut self, button: Button) -> Result<(), String>;
@@ -322,5 +323,29 @@ pub fn start(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String>
             let settings = machine.amt.clone().ok_or("an amt machine has no [amt] settings")?;
             Ok(Box::new(amt::AmtDriver::new(settings, setup)?))
         }
+    }
+}
+
+/// A pixel along one side of a screen `size` pixels long: counted from
+/// the top or left edge, or, when negative, back from the bottom or right
+/// edge (-1 is the last pixel), so that a test can point at a corner of a
+/// screen of any size. `None` when it is off the screen.
+pub fn pixel(at: i32, size: u32) -> Option<u32> {
+    let pixel = if at < 0 { size.checked_sub(at.unsigned_abs())? } else { at.unsigned_abs() };
+    (pixel < size).then_some(pixel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pixel;
+
+    #[test]
+    fn a_negative_pixel_counts_back_from_the_far_edge() {
+        assert_eq!(pixel(0, 1920), Some(0));
+        assert_eq!(pixel(1919, 1920), Some(1919));
+        assert_eq!(pixel(1920, 1920), None);
+        assert_eq!(pixel(-1, 1920), Some(1919));
+        assert_eq!(pixel(-1920, 1920), Some(0));
+        assert_eq!(pixel(-1921, 1920), None);
     }
 }
