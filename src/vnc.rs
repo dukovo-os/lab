@@ -13,7 +13,10 @@
 //!   into an [`Image`]. A server that changes the screen's size says so
 //!   with the DesktopSize pseudo-encoding, and the client asks again.
 //! - **Keys** are X keysyms, as RFB has them: [`keysyms`] turns QEMU's
-//!   key names, which the lab's tests use, into them, US layout.
+//!   key names, which the lab's tests use, into them, US layout. A
+//!   shifted character is the Shift key and its key cap's plain keysym,
+//!   as a keyboard sends it, because AMT maps some shifted keysyms to the
+//!   wrong key.
 //! - **The pointer** is absolute, in the screen's pixels.
 
 use std::io::{ErrorKind, Read, Write};
@@ -531,21 +534,21 @@ fn parse_version(version: &[u8]) -> Option<u32> {
     }
 }
 
-/// Keys that type a character, by QEMU's name: the character alone, and
-/// with shift held.
-const PRINTING: [(&str, char, char); 12] = [
-    ("spc", ' ', ' '),
-    ("minus", '-', '_'),
-    ("equal", '=', '+'),
-    ("bracket_left", '[', '{'),
-    ("bracket_right", ']', '}'),
-    ("semicolon", ';', ':'),
-    ("apostrophe", '\'', '"'),
-    ("grave_accent", '`', '~'),
-    ("backslash", '\\', '|'),
-    ("comma", ',', '<'),
-    ("dot", '.', '>'),
-    ("slash", '/', '?'),
+/// Keys that type a character, by QEMU's name, with the character on the
+/// key cap when shift is not held.
+const PRINTING: [(&str, char); 12] = [
+    ("spc", ' '),
+    ("minus", '-'),
+    ("equal", '='),
+    ("bracket_left", '['),
+    ("bracket_right", ']'),
+    ("semicolon", ';'),
+    ("apostrophe", '\''),
+    ("grave_accent", '`'),
+    ("backslash", '\\'),
+    ("comma", ','),
+    ("dot", '.'),
+    ("slash", '/'),
 ];
 
 /// The other keys, by QEMU's name, with their X keysyms.
@@ -587,25 +590,20 @@ const OTHER_KEYS: [(&str, u32); 35] = [
     ("kp_decimal", 0xffae),
 ];
 
-/// The characters shift turns the digits 0 to 9 into, US layout.
-const SHIFTED_DIGITS: [char; 10] = [')', '!', '@', '#', '$', '%', '^', '&', '*', '('];
-
 /// The X keysym of the key QEMU calls `name`. A key that types a
-/// character gives the character it types, with shift held or not, as an
-/// X client sends it.
-fn keysym(name: &str, shift: bool) -> Option<u32> {
-    let pick = |plain: char, shifted: char| Some(u32::from(if shift { shifted } else { plain }));
+/// character gives the keysym of its key cap's unshifted character, the
+/// same with shift held or not: AMT's remote screen turns some shifted
+/// keysyms into the wrong key (`"`, with Shift held, comes out as `?`), and
+/// the plain keysym with the Shift key down is what a keyboard sends.
+fn keysym(name: &str) -> Option<u32> {
     if let [byte] = name.as_bytes() {
         let c = char::from(*byte);
-        if c.is_ascii_lowercase() {
-            return pick(c, c.to_ascii_uppercase());
-        }
-        if let Some(digit) = c.to_digit(10) {
-            return pick(c, SHIFTED_DIGITS[digit as usize]);
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            return Some(u32::from(c));
         }
     }
-    if let Some(&(_, plain, shifted)) = PRINTING.iter().find(|(key, ..)| *key == name) {
-        return pick(plain, shifted);
+    if let Some(&(_, plain)) = PRINTING.iter().find(|(key, _)| *key == name) {
+        return Some(u32::from(plain));
     }
     if let Some(&(_, keysym)) = OTHER_KEYS.iter().find(|(key, _)| *key == name) {
         return Some(keysym);
@@ -621,11 +619,10 @@ fn keysym(name: &str, shift: bool) -> Option<u32> {
 /// The keysyms of a key combination such as `ctrl-alt-delete`, in the
 /// order they are pressed.
 pub fn keysyms(combo: &str) -> Result<Vec<u32>, String> {
-    let keys: Vec<&str> = combo.split('-').collect();
-    let shift = keys.iter().any(|key| matches!(*key, "shift" | "shift_r"));
-    keys.iter()
+    combo
+        .split('-')
         .map(|key| {
-            keysym(key, shift).ok_or_else(|| {
+            keysym(key).ok_or_else(|| {
                 format!("the remote screen has no key named \"{key}\" (in \"{combo}\")")
             })
         })
@@ -1017,12 +1014,13 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_x_keysyms() {
+    fn a_shifted_character_is_shift_and_its_key_caps_keysym() {
         assert_eq!(keysyms("a").unwrap(), [0x61]);
-        assert_eq!(keysyms("shift-a").unwrap(), [0xffe1, 0x41]);
-        assert_eq!(keysyms("shift-1").unwrap(), [0xffe1, 0x21]);
-        assert_eq!(keysyms("shift-0").unwrap(), [0xffe1, 0x29]);
-        assert_eq!(keysyms("shift-slash").unwrap(), [0xffe1, 0x3f]);
+        assert_eq!(keysyms("shift-a").unwrap(), [0xffe1, 0x61]);
+        assert_eq!(keysyms("shift-1").unwrap(), [0xffe1, 0x31]);
+        assert_eq!(keysyms("shift-0").unwrap(), [0xffe1, 0x30]);
+        assert_eq!(keysyms("shift-slash").unwrap(), [0xffe1, 0x2f]);
+        assert_eq!(keysyms("shift-apostrophe").unwrap(), [0xffe1, 0x27]);
         assert_eq!(keysyms("ctrl-alt-delete").unwrap(), [0xffe3, 0xffe9, 0xffff]);
         assert_eq!(keysyms("spc").unwrap(), [0x20]);
         assert_eq!(keysyms("f1").unwrap(), [0xffbe]);
