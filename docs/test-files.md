@@ -71,6 +71,7 @@ Each step has exactly one action key, and only the options that go with it.
 | `bench = "<command>"` | `rows` (required), `limit` (default 1.00), `root` | Runs a benchmark program over SSH and holds each of its `rows` to the same row on the machine's Linux twin: passes when Dukovo takes at most `limit` times Linux's time per operation (see [Performance tests](#performance-tests)). | ssh, linux |
 | `attack = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root` | Runs the command on the attacker, a second machine on a private network only it and the machine under test share, and holds its output as `run` does. `{target}` in the command, `expect` or `expect_not` becomes the machine's address on that network. See [Attack tests](#attack-tests-the-security-range). | attack |
 | `host = "<command>"` | `exit` (default 0), `expect`, `expect_not`, `root`, `input`, or `background` and `ready` | Runs the command on the lab PC, in a folder of the test's own, and holds it as `run` does; with `background = true`, starts a server there that runs until the test ends, waiting until its output holds `ready` when given. See [The lab PC as a peer](#the-lab-pc-as-a-peer). | peer |
+| `browser = "<script>"` | `engines`, `port` | Opens the page the machine serves in real browsers on the lab PC, one engine after another, and runs `script`, a `.mjs` file in the test's folder, against it. Passes when the script ends in every engine that runs; an engine the lab PC does not have, or cannot start, is skipped. See [Browser tests](#browser-tests). | peer |
 | `serial = "<text>"` | | Waits for the text on the serial console, after the last text a step found. A test that booted the machine searches its whole boot; a test sharing a boot sees only what came after it started; after `power = "on"` or `"reset"`, only what the new boot printed. | serial |
 | `power = "on"` | | Powers the machine on. | power |
 | `power = "off"` | | Presses the power button and waits until the machine is off. Fails if it is still on at the time limit. | power |
@@ -375,6 +376,112 @@ real machine. The runner fills them in, in the command, `input`,
 - A machine whose driver cannot reach the lab PC (`peer = "none"`)
   skips these tests, as does any test whose `run` steps name `{peer}`
   or a `{port:NAME}`.
+
+## Browser tests
+
+The admin console is used in browsers, and the engines behind them differ.
+A `browser` step runs a script that drives a page the machine serves, the
+way a person does, in Chromium, Firefox and WebKit on the lab PC. The
+script checks the page with axe-core against WCAG 2.2 A and AA, and the
+screenshots it takes go in the run's bundle. The browsers are
+[Playwright](https://playwright.dev)'s, from a kit that `ob lab` builds
+(below).
+
+```toml
+about = "The overview page shows its heading in dark and light and passes the accessibility check"
+time = "5m"
+
+[[step]]
+browser = "overview.mjs"              # a script beside the test file
+engines = ["chromium", "firefox"]     # optional; all three by default
+port = 9090                           # optional; the machine's port; 9090 by default
+```
+
+`overview.mjs` is an ES module whose default export is a function. It is
+given `t`, which opens pages and checks them:
+
+```js
+export default async function check(t) {
+  for (const colorScheme of ["dark", "light"]) {
+    const page = await t.open("/overview", { colorScheme });
+    await t.see(page.getByRole("heading", { name: "Overview" }));
+    await page.getByRole("button", { name: "Refresh" }).click();
+    await t.axe(page);
+    await t.screenshot(page, colorScheme);
+  }
+}
+```
+
+The page is at `https://{machine}:{machine-port:PORT}`, filled in as a
+`host` step's placeholders are, so under QEMU the port is forwarded for
+the rest of the boot. `page` is a Playwright
+[Page](https://playwright.dev/docs/api/class-page): the script finds
+elements by their role and name, as a person using a screen reader does,
+and acts on them with Playwright's own calls.
+
+| Member | Does |
+| --- | --- |
+| `t.url` | The page address, `https://host:port`, with no slash at its end. |
+| `t.engine` | `"chromium"`, `"firefox"` or `"webkit"`. |
+| `await t.open(path, options)` | Opens a new browser context and page, goes to `path` on `t.url` and waits for `load`. `options` go to Playwright's [`newContext`](https://playwright.dev/docs/api/class-browser#browser-new-context) over the defaults `{ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 800 }, locale: "en-US" }`, so a test can ask for `colorScheme`, `forcedColors`, `contrast`, `reducedMotion`, `timezoneId`, `viewport`, `isMobile` and the rest. Tracing is on for the context. Gives the page. |
+| `await t.see(locator)` | Waits up to 15 seconds for the locator to be visible, else throws an error naming it. |
+| `await t.gone(locator)` | Waits up to 15 seconds for the locator to be hidden or gone, else throws. |
+| `await t.violations(page)` | Runs axe-core against WCAG 2.2 A and AA (the tags `wcag2a`, `wcag2aa`, `wcag21a`, `wcag21aa` and `wcag22aa`) and gives its violations as `[{ id, help, targets }]`, `targets` the selectors of the first three elements. For a test that expects a fault, as a check of the check. |
+| `await t.axe(page)` | Throws when `t.violations(page)` finds any, with a line for each: `<id>: <help> (<targets>)`. |
+| `await t.screenshot(page, name)` | Keeps the whole page as a PNG, `screenshots/<machine>/<category>-<test>-<engine>-<name>.png` in the bundle. `name` is letters, digits and `-`. |
+| `t.skip(reason)` | Skips the engine with that reason. For an engine that cannot do what the test checks. |
+
+`ignoreHTTPSErrors` is on because a page test checks pages, not
+certificates: a test of the console's TLS is a test of its own.
+
+### What passes, fails and skips
+
+The step runs the script once for each engine, in the order `engines`
+gives, and an engine's run ends in one of three ways:
+
+- It **passes** when the script returns.
+- It **fails** when the script throws, whether an assertion of its own, a
+  `t` call that found a fault, or a Playwright error such as a click that
+  found no button. The message is the error's, without the call log
+  Playwright adds below it, which the trace holds. The step keeps a
+  screenshot of each page still open,
+  `screenshots/<machine>/<category>-<test>-<engine>-failed-<n>.png`, and
+  a Playwright trace of each context,
+  `logs/<machine>/<category>-<test>-<engine>-trace-<n>.zip`, which
+  `npx playwright show-trace` opens to step through what the page did.
+- It is **skipped** when the engine is not in the browser kit, when it will
+  not start on the lab PC (on Linux nearly always a system library the engine
+  needs, which `sudo npx playwright install-deps` installs), or when the
+  script calls `t.skip`.
+
+The step fails when any engine failed, and says why with a line for each,
+`<engine>: <message>`. When every engine was skipped the step is skipped.
+Otherwise it passes, and its note says what ran: `passed in chromium;
+skipped firefox (firefox is not in the browser kit), webkit (...)`. The
+test's log shows each engine's output below the note.
+
+A run given no kit (no `--browsers`) skips the step, as does a lab PC with
+no `node`: the runner needs Node.js 22 or later. A machine whose driver
+cannot reach the lab PC (`peer = "none"`) skips it as it skips `host`
+steps. A script that does not end within the test's time is ended with its
+browser, and the step fails.
+
+### The kit
+
+`--browsers` names the browser kit: a folder with `node_modules/playwright`
+and `node_modules/axe-core`, and `browsers` when the engines are the kit's
+own. Dukovo's `ob lab` builds it in `out/lab-browsers` from the versions
+pinned in the repository's `lab/browsers/package.json`, and installs the
+three engines in it. A machine that has engines of its own, as the cloud
+build machines do, sets `PLAYWRIGHT_BROWSERS_PATH`, and the runner leaves
+the variable as it is. An engine the kit lacks is skipped, with its name.
+
+The script runs under the runner, which the lab writes into the test's
+folder on the lab PC as `browser-runner.mjs` and starts with `node`. It
+is the same file for every test; read its comments in the lab's
+`src/browser/runner.mjs` for the exact messages.
+
+Browser tests of the admin console live under `lab/tests/web-console/`.
 
 ## Card reader tests
 

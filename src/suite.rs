@@ -292,6 +292,9 @@ pub enum Step {
     Host(Command),
     /// Starts a server on the lab PC that runs until the test ends.
     Serve(Serve),
+    /// Drives the page the machine serves in real browsers on the lab PC,
+    /// and checks what it did (see browser.rs).
+    Browser(Browser),
 }
 
 /// A server a `host` step with `background = true` starts on the lab PC.
@@ -303,6 +306,55 @@ pub struct Serve {
     /// Text its output holds once it is ready, which the step waits for.
     pub ready: Option<String>,
 }
+
+/// A browser engine a `browser` step drives: one of the three behind every
+/// major browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Chromium,
+    Firefox,
+    Webkit,
+}
+
+impl Engine {
+    /// Every engine, in the order a step runs them unless it names some.
+    pub const ALL: [Engine; 3] = [Engine::Chromium, Engine::Firefox, Engine::Webkit];
+
+    /// Its name in test files, which is Playwright's.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::Chromium => "chromium",
+            Engine::Firefox => "firefox",
+            Engine::Webkit => "webkit",
+        }
+    }
+
+    /// `engines` as a list in a sentence: `chromium, firefox and webkit`.
+    pub fn list(engines: &[Engine]) -> String {
+        let names: Vec<&str> = engines.iter().copied().map(Engine::as_str).collect();
+        match names[..] {
+            [] => String::new(),
+            [only] => only.to_string(),
+            [ref first @ .., last] => format!("{} and {last}", first.join(", ")),
+        }
+    }
+}
+
+/// A script that drives a page the machine serves, and where it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Browser {
+    /// The script's file name, beside the test file.
+    pub script: String,
+    /// The engines it runs in, one after another.
+    pub engines: Vec<Engine>,
+    /// The machine's port that serves the page, which the lab PC reaches
+    /// as `{machine-port:N}` does.
+    pub port: u16,
+}
+
+/// The port a `browser` step opens unless it names one: the admin
+/// console's.
+const DEFAULT_BROWSER_PORT: u16 = 9090;
 
 /// A pointer button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -486,7 +538,7 @@ impl Step {
             Step::Keys(_) | Step::Type(_) => Some(Control::Keys),
             Step::Point { .. } | Step::Click(_) => Some(Control::Mouse),
             Step::Attack(_) => Some(Control::Attack),
-            Step::Host(_) | Step::Serve(_) => Some(Control::Peer),
+            Step::Host(_) | Step::Serve(_) | Step::Browser(_) => Some(Control::Peer),
             Step::Screenshot(_) | Step::Screen(_) | Step::ScreenGone(_) => Some(Control::Screen),
             Step::WaitReady | Step::Sleep(_) => None,
             // It also runs over SSH: see `Test::controls`.
@@ -584,6 +636,11 @@ impl Step {
                     None => format!("on the lab PC, start `{}`{who}", serve.command),
                 }
             }
+            Step::Browser(browser) => format!(
+                "in a browser on the lab PC: {}, in {}",
+                browser.script,
+                Engine::list(&browser.engines)
+            ),
             Step::Screen(texts) => {
                 let texts: Vec<String> = texts.iter().map(|text| format!("\"{text}\"")).collect();
                 format!("wait until the screen shows {}", texts.join(", "))
@@ -832,6 +889,9 @@ struct StepFile {
     background: Option<bool>,
     ready: Option<String>,
     input: Option<String>,
+    browser: Option<String>,
+    engines: Option<Vec<String>>,
+    port: Option<i64>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -1113,12 +1173,13 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         ("click", step.click.is_some()),
         ("attack", step.attack.is_some()),
         ("host", step.host.is_some()),
+        ("browser", step.browser.is_some()),
     ];
     let given: Vec<&str> = actions.iter().filter(|(_, set)| *set).map(|(key, _)| *key).collect();
     match given.as_slice() {
         [] => {
             return Err(
-                "no action: give one of run, attack, host, serial, power, link, usb, card, sd, disc, floppy, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
+                "no action: give one of run, attack, host, browser, serial, power, link, usb, card, sd, disc, floppy, keys, type, point, click, screen, screen_gone, screenshot, wait or bench"
                     .into(),
             );
         }
@@ -1175,6 +1236,8 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     if step.ready.is_some() && !background {
         return Err("ready goes only with host and background = true".into());
     }
+    only_with("engines", step.engines.is_some(), "browser")?;
+    only_with("port", step.port.is_some(), "browser")?;
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
     // A stick's, a card's, a disc's or a floppy disk's: what it holds. A
@@ -1233,6 +1296,9 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         let command = command(text, &step);
         check_placeholders(&command, "host")?;
         return Ok(Step::Host(command));
+    }
+    if let Some(script) = step.browser {
+        return parse_browser(script, step.engines, step.port, folder).map(Step::Browser);
     }
     if let Some(command) = step.bench {
         return parse_bench(command, step.root, step.rows, step.limit);
@@ -1417,6 +1483,52 @@ fn check_placeholders(command: &Command, action: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// What a `browser` step's script, engines and port make: the script a
+/// file beside the test, as a stick's image is, and each engine named once.
+fn parse_browser(
+    script: String,
+    engines: Option<Vec<String>>,
+    port: Option<i64>,
+    folder: &Path,
+) -> Result<Browser, String> {
+    // Only files beside the test, as for an image.
+    let plain = script.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    if !plain || !script.ends_with(".mjs") || !folder.join(&script).is_file() {
+        return Err(format!(
+            "browser: \"{script}\" is not a script beside the test: a file name ending in .mjs in {}",
+            folder.display()
+        ));
+    }
+    let engines = match engines {
+        None => Engine::ALL.to_vec(),
+        Some(names) if names.is_empty() => return Err("engines: the list is empty".into()),
+        Some(names) => {
+            let mut engines = Vec::new();
+            for name in names {
+                let Some(engine) = Engine::ALL.into_iter().find(|engine| engine.as_str() == name)
+                else {
+                    return Err(format!(
+                        "engines: \"{name}\" is not a browser engine: chromium, firefox or webkit"
+                    ));
+                };
+                if engines.contains(&engine) {
+                    return Err(format!("engines: \"{name}\" is named twice"));
+                }
+                engines.push(engine);
+            }
+            engines
+        }
+    };
+    let port = match port {
+        None => DEFAULT_BROWSER_PORT,
+        Some(number) => u16::try_from(number)
+            .ok()
+            .filter(|&port| port > 0)
+            .ok_or_else(|| format!("port: {number} is not a port, 1 to 65535"))?,
+    };
+    Ok(Browser { script, engines, port })
 }
 
 /// The range a `limit` may take: a bar below a tenth of Linux's time, or
@@ -2310,6 +2422,103 @@ expect = "1 received"
         dir.write("security/scan.toml", "about = \"x\"\ntime = \"1m\"\n[[step]]\nattack = \"\"\n");
         let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
         assert!(why.contains("attack needs a command"), "{why}");
+    }
+
+    #[test]
+    fn a_browser_step_runs_a_script_beside_the_test() {
+        let dir = TempDir::new("suite-browser");
+        dir.write("features/overview.mjs", "");
+        dir.write(
+            "features/pages.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nbrowser = \"overview.mjs\"\n\
+             [[step]]\nbrowser = \"overview.mjs\"\nengines = [\"webkit\", \"chromium\"]\nport = 443\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert_eq!(
+            test.steps[0],
+            Step::Browser(Browser {
+                script: "overview.mjs".into(),
+                engines: Engine::ALL.to_vec(),
+                port: 9090,
+            })
+        );
+        assert_eq!(
+            test.steps[0].describe(),
+            "in a browser on the lab PC: overview.mjs, in chromium, firefox and webkit"
+        );
+        assert_eq!(
+            test.steps[1],
+            Step::Browser(Browser {
+                script: "overview.mjs".into(),
+                engines: vec![Engine::Webkit, Engine::Chromium],
+                port: 443,
+            })
+        );
+        assert_eq!(
+            test.steps[1].describe(),
+            "in a browser on the lab PC: overview.mjs, in webkit and chromium"
+        );
+        assert_eq!(test.steps[0].control(), Some(Control::Peer));
+        assert!(test.controls().contains(&Control::Peer));
+        // A machine that cannot reach the lab PC skips it, as it skips a
+        // host step.
+        let mut machine = crate::machines::load(&dir.path().join("none")).unwrap().remove(0);
+        assert_eq!(test.fit(&machine), Fit::Runs);
+        machine.controls.insert(Control::Peer, Who::None);
+        assert_eq!(test.fit(&machine).skip_reason().unwrap(), "the machine has no peer");
+    }
+
+    #[test]
+    fn engines_are_listed_as_in_a_sentence() {
+        let list = |engines: &[Engine]| Engine::list(engines);
+        assert_eq!(list(&[Engine::Firefox]), "firefox");
+        assert_eq!(list(&[Engine::Firefox, Engine::Webkit]), "firefox and webkit");
+        assert_eq!(list(&Engine::ALL), "chromium, firefox and webkit");
+    }
+
+    #[test]
+    fn a_browser_step_names_a_script_engines_and_a_port_that_exist() {
+        let dir = TempDir::new("suite-browser-bad");
+        dir.write("features/overview.mjs", "");
+        dir.write("features/notes.txt", "");
+        let folder = dir.path().join("features").display().to_string();
+        let no_script = |name: &str| {
+            format!(
+                "browser: \"{name}\" is not a script beside the test: a file name ending in .mjs in {folder}"
+            )
+        };
+        let with_script = |options: &str| format!("browser = \"overview.mjs\"\n{options}");
+        for (step, complaint) in [
+            ("browser = \"missing.mjs\"".to_string(), no_script("missing.mjs")),
+            ("browser = \"notes.txt\"".to_string(), no_script("notes.txt")),
+            ("browser = \"../overview.mjs\"".to_string(), no_script("../overview.mjs")),
+            (
+                with_script("engines = [\"opera\"]"),
+                "engines: \"opera\" is not a browser engine: chromium, firefox or webkit".into(),
+            ),
+            (with_script("engines = []"), "engines: the list is empty".into()),
+            (
+                with_script("engines = [\"webkit\", \"firefox\", \"webkit\"]"),
+                "engines: \"webkit\" is named twice".into(),
+            ),
+            (with_script("port = 0"), "port: 0 is not a port, 1 to 65535".into()),
+            (with_script("port = 65536"), "port: 65536 is not a port, 1 to 65535".into()),
+            (with_script("port = -1"), "port: -1 is not a port, 1 to 65535".into()),
+            (
+                "run = \"true\"\nengines = [\"webkit\"]".into(),
+                "engines goes only with browser".into(),
+            ),
+            ("run = \"true\"\nport = 443".into(), "port goes only with browser".into()),
+            (with_script("host = \"true\""), "one action per step".into()),
+            (with_script("root = true"), "root goes only with run".into()),
+        ] {
+            dir.write(
+                "features/pages.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("{step} loaded") };
+            assert!(why.contains(&complaint), "{step}: {why}");
+        }
     }
 
     #[test]

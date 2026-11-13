@@ -85,9 +85,10 @@ struct Page {
     build: Option<String>,
     /// The Linux kit runs from the page hold Dukovo to, when given.
     linux: Option<PathBuf>,
-    /// The console's fonts and the install stick and DVD runs from the
-    /// page use, when given.
+    /// The console's fonts, the browser kit and the install stick and DVD
+    /// runs from the page use, when given.
     fonts: Option<PathBuf>,
+    browsers: Option<PathBuf>,
     stick: Option<PathBuf>,
     dvd: Option<PathBuf>,
     /// Dukovo's ob, which holds the music CDs of runs from the page in
@@ -143,6 +144,16 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         }
         None => None,
     };
+    let browsers = match &arguments.browsers {
+        Some(browsers) if !browsers.is_dir() => {
+            return Err(Error::Usage(format!(
+                "the browser kit {} does not exist",
+                browsers.display()
+            )));
+        }
+        Some(browsers) => Some(absolute(browsers.clone())?),
+        None => None,
+    };
     let stick = match &arguments.stick {
         Some(stick) if !stick.is_file() => {
             return Err(Error::Usage(format!(
@@ -187,6 +198,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         build: arguments.build.clone(),
         linux,
         fonts,
+        browsers,
         stick,
         dvd,
         ob,
@@ -398,6 +410,9 @@ impl Page {
         }
         if let Some(fonts) = &self.fonts {
             args.extend(["--fonts".into(), fonts.display().to_string()]);
+        }
+        if let Some(browsers) = &self.browsers {
+            args.extend(["--browsers".into(), browsers.display().to_string()]);
         }
         if let Some(stick) = &self.stick {
             args.extend(["--stick".into(), stick.display().to_string()]);
@@ -659,6 +674,7 @@ mod tests {
             build: None,
             linux: None,
             fonts: None,
+            browsers: None,
             stick: None,
             dvd: None,
             ob: None,

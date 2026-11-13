@@ -526,6 +526,7 @@ fn run_with(
         with_person,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -674,6 +675,7 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
         with_person: false,
         linux,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -767,6 +769,7 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         with_person: false,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -824,6 +827,7 @@ fn attack_steps_run_on_a_private_lab_network() {
         with_person: false,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -889,6 +893,7 @@ fn card_tests_boot_with_a_card_reader_of_their_own() {
         with_person: false,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -954,6 +959,7 @@ fn disc_tests_boot_with_an_optical_drive_of_their_own() {
         with_person: false,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -1012,6 +1018,7 @@ fn floppy_tests_boot_with_a_floppy_drive_of_their_own() {
         with_person: false,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -1104,6 +1111,7 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
         with_person: false,
         linux: None,
         fonts,
+        browsers: None,
         stick,
         dvd,
         ob: None,
@@ -1387,6 +1395,7 @@ fn host_steps_run_the_lab_pc_side_and_end_its_servers() {
         with_person: false,
         linux: None,
         fonts: None,
+        browsers: None,
         stick: None,
         dvd: None,
         ob: None,
@@ -1429,6 +1438,143 @@ fn host_steps_run_the_lab_pc_side_and_end_its_servers() {
     assert!(reason.contains("ended (status 1) before it said \"ready\""), "{reason}");
     assert!(reason.contains("no such realm"), "{reason}");
     assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 2, errors: 1 });
+}
+
+/// A browser kit whose Playwright opens nothing: its chromium starts, its
+/// firefox is not installed, and its webkit will not start.
+const FAKE_PLAYWRIGHT: &str = r#"
+const fs = require("fs");
+const page = {
+  goto: async () => {},
+  isClosed: () => false,
+  screenshot: async ({ path }) => fs.writeFileSync(path, "png"),
+};
+const context = {
+  tracing: { start: async () => {}, stop: async (saved) => saved && fs.writeFileSync(saved.path, "trace") },
+  newPage: async () => page,
+  on: () => {},
+};
+const started = { newContext: async () => context, close: async () => {} };
+module.exports = {
+  errors: { TimeoutError: class extends Error {} },
+  chromium: { executablePath: () => process.execPath, launch: async () => started },
+  firefox: { executablePath: () => "/no/such/firefox" },
+  webkit: {
+    executablePath: () => process.execPath,
+    launch: async () => { throw new Error("missing libraries\nsecond line"); },
+  },
+};
+"#;
+
+#[test]
+fn browser_steps_run_the_runner_in_each_engine_and_skip_without_a_kit() {
+    let step = |script: &str, engines: &str| {
+        format!(
+            "about = \"drives a page\"\ntime = \"1m\"\n[[step]]\nbrowser = \"{script}\"\n\
+             port = 443\n{engines}"
+        )
+    };
+    let setting = setting_with(&[
+        ("features/pages.toml", &step("pages.mjs", "")),
+        (
+            "features/pages.mjs",
+            "export default async function check(t) {\n\
+             if (t.url !== \"https://127.0.0.1:40443\") throw new Error(`url ${t.url}`);\n\
+             await t.screenshot(await t.open(\"/page.html\"), \"start\");\n}\n",
+        ),
+        ("features/pages-broken.toml", &step("broken.mjs", "engines = [\"chromium\"]\n")),
+        (
+            "features/broken.mjs",
+            "export default async (t) => { await t.open(\"/\"); throw new Error(\"the heading is not visible\"); };\n",
+        ),
+        (
+            "features/pages-skipped.toml",
+            &step("pages.mjs", "engines = [\"firefox\", \"webkit\"]\n"),
+        ),
+    ]);
+    setting.dir.write("kit/node_modules/playwright/index.js", FAKE_PLAYWRIGHT);
+    setting.dir.write("kit/node_modules/axe-core/package.json", "{ \"main\": \"axe.js\" }");
+    setting.dir.write("kit/node_modules/axe-core/axe.js", "");
+    let request = |browsers: Option<PathBuf>| Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: None,
+        with_person: false,
+        linux: None,
+        fonts: None,
+        browsers,
+        stick: None,
+        dvd: None,
+        ob: None,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let results_of = |request: &Request<'_>| {
+        run(request, &Reporter::silent(), &start_fake).unwrap();
+        let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+        let results: crate::bundle::ResultsFile =
+            serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap())
+                .unwrap();
+        (bundle, results.results)
+    };
+    let by_test = |results: &[ResultRecord], test: &str| {
+        results.iter().find(|result| result.test == test).unwrap().clone()
+    };
+
+    let (bundle, results) = results_of(&request(Some(setting.dir.path().join("kit"))));
+    let pages = by_test(&results, "features/pages");
+    assert_eq!(pages.result, Outcome::Pass, "{:?}", pages.reason);
+    let note = pages.steps[1].note.as_ref().unwrap();
+    assert!(
+        note.starts_with(
+            "passed in chromium; skipped firefox (firefox is not in the browser kit), \
+             webkit (webkit would not start on the lab PC: missing libraries)\n"
+        ),
+        "{note}"
+    );
+    assert_eq!(pages.screenshots, ["screenshots/qemu/features-pages-chromium-start.png"]);
+    assert!(bundle.join(&pages.screenshots[0]).is_file());
+
+    let broken = by_test(&results, "features/pages-broken");
+    assert_eq!(broken.result, Outcome::Fail);
+    assert!(
+        broken
+            .reason
+            .as_ref()
+            .unwrap()
+            .starts_with("step 1: chromium: the heading is not visible\n"),
+        "{:?}",
+        broken.reason
+    );
+    // The machine's own screen at the failure comes after the engine's.
+    assert_eq!(
+        broken.screenshots[0],
+        "screenshots/qemu/features-pages-broken-chromium-failed-1.png"
+    );
+    assert!(bundle.join("logs/qemu/features-pages-broken-chromium-trace-1.zip").is_file());
+
+    let skipped = by_test(&results, "features/pages-skipped");
+    assert_eq!(skipped.result, Outcome::Skip);
+    assert_eq!(
+        skipped.reason.as_deref(),
+        Some(
+            "step 1: firefox: firefox is not in the browser kit; \
+             webkit: webkit would not start on the lab PC: missing libraries"
+        )
+    );
+
+    // Without a kit, every test that drives a browser is skipped.
+    let (_, results) = results_of(&request(None));
+    for test in ["features/pages", "features/pages-broken", "features/pages-skipped"] {
+        let result = by_test(&results, test);
+        assert_eq!(result.result, Outcome::Skip, "{test}");
+        assert_eq!(result.reason, Some(format!("step 1: {NO_BROWSERS}")), "{test}");
+    }
 }
 
 #[test]

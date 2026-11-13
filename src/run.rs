@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::Error;
 use crate::bench::{self, Kit, Row};
+use crate::browser;
 use crate::bundle::{
     Bundle, MachineRecord, Outcome, ResultRecord, RunRecord, SCHEMA, StepRecord, Summary,
     new_run_id,
@@ -49,7 +50,8 @@ use crate::ssh;
 use crate::stop::Stop;
 use crate::store::Running;
 use crate::suite::{
-    Bench, Boot, Command, Fit, PASSWORD_TOKEN, PowerAction, Serve, Step, TARGET_TOKEN, Test,
+    Bench, Boot, Browser, Command, Engine, Fit, PASSWORD_TOKEN, PowerAction, Serve, Step,
+    TARGET_TOKEN, Test,
 };
 use crate::units::format_duration;
 
@@ -71,6 +73,9 @@ pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given
 
 /// Why a step that reads the screen's text is skipped.
 pub const NO_FONTS: &str = "this step reads the screen, and the run was given no console fonts: `ob lab` passes Dukovo's with --fonts";
+
+/// Why a `browser` step is skipped.
+pub const NO_BROWSERS: &str = "this step drives a browser, and the run was given no browser kit: `ob lab` makes one and passes it with --browsers";
 
 /// Why a test that boots the install stick is skipped.
 pub const NO_STICK: &str = "this test boots the install stick, and the run was given none: `ob lab` builds one and passes it with --stick";
@@ -168,6 +173,8 @@ pub struct Request<'a> {
     pub linux: Option<Kit>,
     /// The console's fonts, for steps that read the screen, when given.
     pub fonts: Option<Vec<Font>>,
+    /// The browser kit, for steps that drive a browser, when given.
+    pub browsers: Option<PathBuf>,
     /// The install stick's image, for tests that boot it, when given.
     pub stick: Option<PathBuf>,
     /// The install DVD's ISO, for tests that boot it, when given.
@@ -203,6 +210,7 @@ struct Shared<'a> {
     /// side by side never time each other's load.
     measuring: &'a Mutex<()>,
     fonts: Option<&'a [Font]>,
+    browsers: Option<&'a Path>,
     /// The install stick, given a second name in the work folder as the
     /// image is.
     stick: Option<&'a Path>,
@@ -279,6 +287,7 @@ pub fn run(
         linux: request.linux.as_ref(),
         measuring: &measuring,
         fonts: request.fonts.as_deref(),
+        browsers: request.browsers.as_deref(),
         stick: stick.as_deref(),
         dvd: dvd.as_deref(),
     };
@@ -926,6 +935,7 @@ impl<'a> Worker<'a> {
             Step::Run(command) => self.run_command(command, deadline),
             Step::Attack(command) => self.run_attack(command, deadline),
             Step::Host(command) => self.run_host(command, deadline),
+            Step::Browser(browser) => self.run_browser(test, browser, deadline),
             Step::Serve(serve) => self.serve(test, serve, deadline),
             Step::Bench(bench) => self.bench(bench, deadline),
             Step::Serial(text) => self.wait_serial(text, deadline),
@@ -1084,6 +1094,89 @@ impl<'a> Worker<'a> {
             )));
         }
         check_command(&command, &output, shown, false)
+    }
+
+    /// Runs a `browser` step's script in each of its engines on the lab PC,
+    /// one after another, and folds how each went into the step's result
+    /// (see browser.rs). Every engine runs, so that one that fails does not
+    /// hide another's failure. The kit and node are the lab's to have, not
+    /// Dukovo's: a run without them skips the step.
+    fn run_browser(
+        &mut self,
+        test: &Test,
+        browser: &Browser,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        let Some(kit) = self.shared.browsers else {
+            return Err(StepFailure::Skip(NO_BROWSERS.into()));
+        };
+        if !peer::missing_programs(&["node".to_string()]).is_empty() {
+            return Err(StepFailure::Skip(
+                "this step drives a browser, and the lab PC has no node: install Node.js 22 or later"
+                    .into(),
+            ));
+        }
+        let file = self.peer_work()?.join("browser-runner.mjs");
+        fs::write(&file, browser::RUNNER)
+            .map_err(|err| StepFailure::Error(format!("writing {}: {err}", file.display())))?;
+        let shots = self.shared.bundle.screenshots(&self.machine.name);
+        let logs = self.shared.bundle.logs(&self.machine.name);
+        for folder in [&shots, &logs] {
+            fs::create_dir_all(folder)
+                .map_err(|err| StepFailure::Error(format!("making {}: {err}", folder.display())))?;
+        }
+        let url = self.fill(&format!("https://{{machine}}:{{machine-port:{}}}", browser.port))?;
+        let (kit, script) = (absolute(kit), self.peer.here.join(&browser.script));
+        let (absolute_shots, absolute_logs) = (absolute(&shots), absolute(&logs));
+        let runner = browser::Runner {
+            file: &file,
+            kit: &kit,
+            url: &url,
+            script: &script,
+            shots: &absolute_shots,
+            logs: &absolute_logs,
+            name: &test.id.replace('/', "-"),
+        };
+        let mut runs = Vec::new();
+        let mut shown = Vec::new();
+        for &engine in &browser.engines {
+            let (outcome, log) = self.run_engine(&runner, engine, deadline)?;
+            if let browser::Outcome::Passed { screenshots }
+            | browser::Outcome::Failed { screenshots, .. } = &outcome
+            {
+                for name in screenshots {
+                    self.screenshots.push(self.shared.bundle.relative(&shots.join(name)));
+                }
+            }
+            runs.push((engine, outcome));
+            shown.push(log);
+        }
+        let shown = shown.join("\n");
+        match browser::verdict(&runs) {
+            browser::Verdict::Passed(note) => Ok(Some(format!("{note}\n{shown}"))),
+            browser::Verdict::Skipped(reason) => Err(StepFailure::Skip(reason)),
+            browser::Verdict::Failed(why) => Err(StepFailure::Fail(format!("{why}\n{shown}"))),
+        }
+    }
+
+    /// Runs the runner for `engine` as a host step runs its command, and
+    /// gives how it went and how a log shows the run.
+    fn run_engine(
+        &mut self,
+        runner: &browser::Runner<'_>,
+        engine: Engine,
+        deadline: Instant,
+    ) -> Result<(browser::Outcome, String), StepFailure> {
+        let command = runner.command(engine);
+        let folder = self.peer_work()?;
+        let scratch = self.peer.base.join("output");
+        let output = peer::run(&command, &[], None, &folder, &scratch, deadline, self.shared.stop)
+            .map_err(StepFailure::Error)?;
+        let (output, shown) = self.finish(&command, output, "lab-pc $")?;
+        let Some(status) = output.status else {
+            return Err(StepFailure::Fail("the browser ran past the test's time limit".into()));
+        };
+        Ok((browser::outcome(status, &output.text), shown))
     }
 
     /// Starts a server on the lab PC for the rest of the test, and waits
