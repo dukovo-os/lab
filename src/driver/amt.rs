@@ -89,6 +89,13 @@ const SCREEN_OPEN_TIME: Duration = Duration::from_secs(30);
 const SCREEN_SETTLE: Duration =
     if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(2) };
 
+/// How long after a session's first key, a Shift tap, the keys typed
+/// wait. On the lab's OptiPlex 7040 the first key of each session was
+/// held about a second (repeating some 24 times), whatever came after
+/// it: a Shift held that long types nothing.
+const FIRST_KEY_SETTLE: Duration =
+    if cfg!(test) { Duration::from_millis(10) } else { Duration::from_millis(1500) };
+
 /// How long the whole screen may take to arrive: a few megabytes of raw
 /// pixels.
 const CAPTURE_TIME: Duration = Duration::from_secs(90);
@@ -96,6 +103,17 @@ const CAPTURE_TIME: Duration = Duration::from_secs(90);
 /// How long a key is held, and the pause after each combination.
 const KEY_HOLD: Duration = Duration::from_millis(50);
 const KEY_GAP: Duration = Duration::from_millis(100);
+/// The left Shift's X keysym.
+const SHIFT: u32 = 0xffe1;
+
+/// A session's first input: a Shift tap, then [`FIRST_KEY_SETTLE`].
+fn prime(vnc: &mut Vnc) -> Result<(), String> {
+    vnc.key(SHIFT, true)?;
+    std::thread::sleep(KEY_HOLD);
+    vnc.key(SHIFT, false)?;
+    std::thread::sleep(FIRST_KEY_SETTLE);
+    Ok(())
+}
 
 /// A real machine driven through AMT.
 pub struct AmtDriver {
@@ -124,6 +142,9 @@ pub struct AmtDriver {
     screen_address: String,
     screen_password: Option<String>,
     screen: Option<(Vnc, Instant)>,
+    /// Whether a key has gone through this session yet (see
+    /// [`FIRST_KEY_SETTLE`]).
+    primed: bool,
     pointer: (u16, u16),
     log: File,
     started: Instant,
@@ -178,6 +199,7 @@ impl AmtDriver {
             screen_address,
             screen_password: None,
             screen: None,
+            primed: false,
             pointer: (0, 0),
             log,
             started: Instant::now(),
@@ -462,6 +484,7 @@ impl AmtDriver {
                     vnc.name
                 ));
                 self.screen = Some((vnc, Instant::now()));
+                self.primed = false;
                 Ok(())
             }
             Err(err) => {
@@ -490,7 +513,12 @@ impl AmtDriver {
         if input && let Some(wait) = SCREEN_SETTLE.checked_sub(opened.elapsed()) {
             std::thread::sleep(wait);
         }
-        let done = act(vnc);
+        let mut done = Ok(());
+        if input && !self.primed {
+            done = prime(vnc);
+            self.primed = done.is_ok();
+        }
+        let done = done.and_then(|()| act(vnc));
         if let Err(err) = &done {
             self.screen = None;
             self.note(&format!("remote screen: {err}"));
@@ -1257,11 +1285,14 @@ mod tests {
         let shot = bench.dir.path().join("screen.png");
         bench.driver.screenshot(&shot).unwrap();
         assert!(fs::read(&shot).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
-        // The screen answers in order, so all that was sent has arrived.
+        // The screen answers in order, so all that was sent has arrived:
+        // the session's first key a Shift tap, then the keys asked for.
         let (shift, ctrl, alt, delete) = (0xffe1, 0xffe3, 0xffe9, 0xffff);
         assert_eq!(
             bench.screen.events(),
             [
+                Event::Key(shift, true),
+                Event::Key(shift, false),
                 Event::Key(shift, true),
                 Event::Key(0x41, true),
                 Event::Key(0x41, false),
@@ -1287,7 +1318,7 @@ mod tests {
         assert!(err.contains("no key named \"f13\""), "{err}");
         let err = bench.driver.point(40, 10).unwrap_err();
         assert!(err.contains("off the screen, which is 40x30"), "{err}");
-        assert_eq!(bench.screen.events().len(), 13);
+        assert_eq!(bench.screen.events().len(), 15);
 
         // A session AMT ends is opened again, and the screen's new size
         // is seen.
