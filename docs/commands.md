@@ -95,8 +95,8 @@ See [Real machines](real-machines.md).
 ```
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
                [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
-               [--stick <file>] [--dvd <file>] [--ob <file>] [--with-person]
-               [--detach]
+               [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
+               [--with-person] [--detach]
 ```
 
 Runs the tests on each machine (default `qemu`), the machines side by
@@ -134,6 +134,14 @@ own, which `screen` and `screen_gone` steps read the screen's text with
 (see [test files](test-files.md#reading-the-screen)). `ob lab` passes
 Dukovo's, `kernel/lib/fbcon/fonts`. Without it, tests that read the
 screen are skipped.
+
+`--browsers` names the browser kit: a folder with `node_modules/playwright`
+and `node_modules/axe-core`, and `browsers` when the engines are the kit's
+own, which `browser` steps drive web pages with (see [test
+files](test-files.md#browser-tests)). `ob lab` builds it in
+`out/lab-browsers` and passes it. Without it, tests with browser steps are
+skipped. `dukovo-lab` does not look inside the folder: the runner checks
+it for each engine, and skips an engine the kit lacks.
 
 `--stick` names the install stick's image, which tests with `boot =
 "stick"` boot from (see [test files](test-files.md#installer-tests)),
@@ -351,8 +359,8 @@ and with the runner page closed. See [Schedules](schedules.md).
 
 ```
 dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--fonts <dir>]
-              [--stick <file>] [--dvd <file>] [--ob <file>] [--port <n>]
-              [--no-open]
+              [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
+              [--port <n>] [--no-open]
 ```
 
 Serves the runner page to a browser on this PC, at
@@ -362,7 +370,7 @@ open, which carries a key made anew each time; without it the page does
 not open. Ctrl+C closes the page; runs started from it carry on. Without
 `--image` the page shows tests and runs but cannot start runs; `ob lab
 ui` gives the image. Runs started from the page get `--linux`,
-`--fonts`, `--stick`, `--dvd` and `--ob` when they were given. See [the runner page](runner-page.md).
+`--fonts`, `--browsers`, `--stick`, `--dvd` and `--ob` when they were given. See [the runner page](runner-page.md).
 
 ## key
 
@@ -400,7 +408,7 @@ as dukovo-os/lab-results keeps runs:
 run.json                  what ran: build, image, machines, tests, preset, start and end
 results.json              each test's result on each machine, step by step
 events.jsonl              what happened as it happened: run's JSON lines, every one
-logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.log
+logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.log, and the traces of failed browser steps
 screenshots/<machine>/    <category>-<test>-<name>.png, and .txt: the screen's text, with --fonts
 ```
 
@@ -431,6 +439,10 @@ JSON. Times are UTC, in RFC 3339.
 | A bench step fails "slower than Linux" | A finding: the rows marked `over` take more than `limit` times Linux's time. The note has both tables; `logs/<machine>/linux-boot-<n>.log` has Linux's run. Run again to rule out a busy PC before sending it. |
 | Tests that read the screen are skipped saying the run was given no console fonts | Give `--fonts` with Dukovo's `kernel/lib/fbcon/fonts`; `ob lab` does. |
 | A `screen` step fails though the text is plainly on the screenshot | The step reads cells, each within one row: text that wraps past the row's end, or a word the cursor sits on, does not match. The `.txt` beside the screenshot shows what was read. A screen of `?` means the fonts are not the console's: rebuild with the same checkout as the image. |
+| Tests with browser steps are skipped saying the run was given no browser kit | Give `--browsers` with the kit's folder; `ob lab` builds it in `out/lab-browsers` and prints `note: the web console's tests will skip: ...` when it cannot, with the reason: usually no `npm`, or no network to fetch the packages. |
+| A browser step is skipped saying the lab PC has no node | Install Node.js 22 or later on the lab PC. |
+| An engine is skipped saying it is not in the browser kit | The kit has no copy of that engine: `ob lab` installs all three, but a machine that provides its own through `PLAYWRIGHT_BROWSERS_PATH`, as the cloud build machines do, may have only Chromium. |
+| An engine is skipped saying it would not start on the lab PC | A system library the engine needs is missing. On Linux, `sudo npx --prefix out/lab-browsers playwright install-deps` installs them. |
 | Installer tests are skipped saying the run was given no stick | Give `--stick` with the install stick's image (`ob image` builds it as `out/dukovo-<version>-x86_64.img`); `ob lab` builds and passes it. |
 | Installer tests are skipped saying the run was given no DVD | Give `--dvd` with the install DVD's ISO (`ob image --iso` builds it as `out/dukovo-<version>-x86_64.iso`); `ob lab` builds and passes it. |
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |

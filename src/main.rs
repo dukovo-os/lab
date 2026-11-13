@@ -14,6 +14,7 @@
 
 mod amt;
 mod bench;
+mod browser;
 mod bundle;
 mod clock;
 mod des;
@@ -114,6 +115,8 @@ Options for run:
                    builds it in out/lab-linux)
   --fonts <dir>    The console's PSF fonts, for steps that read the screen
                    (`ob lab` gives Dukovo's)
+  --browsers <dir> The browser kit, for steps that drive a browser (`ob lab`
+                   builds it in out/lab-browsers)
   --stick <file>   The install stick's image, for tests that boot it (`ob
                    lab` builds it with `ob image`)
   --dvd <file>     The install DVD's ISO, for tests that boot it (`ob lab`
@@ -188,6 +191,8 @@ struct Arguments {
     linux: Option<PathBuf>,
     /// The console's fonts, for reading the screen.
     fonts: Option<PathBuf>,
+    /// The browser kit, for steps that drive a browser.
+    browsers: Option<PathBuf>,
     /// The install stick's image.
     stick: Option<PathBuf>,
     /// The install DVD's ISO.
@@ -267,6 +272,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--image" => arguments.image = Some(value("--image")?.into()),
             "--linux" => arguments.linux = Some(value("--linux")?.into()),
             "--fonts" => arguments.fonts = Some(value("--fonts")?.into()),
+            "--browsers" => arguments.browsers = Some(value("--browsers")?.into()),
             "--stick" => arguments.stick = Some(value("--stick")?.into()),
             "--dvd" => arguments.dvd = Some(value("--dvd")?.into()),
             "--ob" => arguments.ob = Some(value("--ob")?.into()),
@@ -682,12 +688,18 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         Some(dir) => Some(bench::Kit::read(dir).map_err(Error::Usage)?),
         None => None,
     };
-    // Without fonts, steps that read the screen skip; without a stick,
-    // tests that boot it skip; each says how to get one.
+    // Without fonts, steps that read the screen skip; without a browser
+    // kit, steps that drive a browser; without a stick, tests that boot
+    // it; each says how to get one.
     let fonts = match &arguments.fonts {
         Some(dir) => Some(screen::Font::read_dir(dir).map_err(Error::Usage)?),
         None => None,
     };
+    if let Some(browsers) = &arguments.browsers
+        && !browsers.is_dir()
+    {
+        return Err(Error::Usage(format!("the browser kit {} does not exist", browsers.display())));
+    }
     if let Some(stick) = &arguments.stick
         && !stick.is_file()
     {
@@ -723,6 +735,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         with_person: arguments.with_person,
         linux,
         fonts,
+        browsers: arguments.browsers.clone(),
         stick: arguments.stick.clone(),
         dvd: arguments.dvd.clone(),
         ob: arguments.ob.clone(),
