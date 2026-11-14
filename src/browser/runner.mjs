@@ -169,7 +169,10 @@ const t = {
 
   async violations(page) {
     axeSource ??= fs.readFileSync(axeScript, "utf8");
-    await page.addScriptTag({ content: axeSource });
+    // Run by the engine rather than added as a <script>, which a page's
+    // content security policy stops: a page with a strict policy, as the
+    // admin console's is, is checked as it is served.
+    await page.evaluate(axeSource);
     return page.evaluate(async (tags) => {
       const { violations } = await window.axe.run(document, {
         runOnly: { type: "tag", values: tags },
