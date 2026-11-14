@@ -54,7 +54,8 @@
 //! reaches the lab PC's loopback at 10.0.2.2 (`{peer}`); a guest's port
 //! the lab PC's clients need is forwarded from a free port of the lab
 //! PC's loopback with the monitor's `hostfwd_add`, for the rest of the
-//! boot.
+//! boot, at the same port after the cord is pulled and the machine is on
+//! again.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -690,6 +691,15 @@ impl Qemu {
             _ => None,
         };
         self.running = Some(Running { child, qmp, music });
+        // The ports forwarded on this boot stay where they were once the
+        // cord is pulled and the machine is on again: the new QEMU has
+        // only those of its command line, so each is forwarded again, at
+        // the same port of the lab PC's.
+        let forwards: Vec<(bool, u16, u16)> =
+            self.forwards.iter().map(|(&(udp, port), &host_port)| (udp, port, host_port)).collect();
+        for (udp, port, host_port) in forwards {
+            self.forward(udp, port, host_port)?;
+        }
         // A stick plugged in while it ran is gone with the old QEMU; the
         // install stick, given on its command line, is still in. So is a
         // card, and the new reader is empty: a card in the old one counts
@@ -711,6 +721,24 @@ impl Qemu {
         // The install DVD, given on its command line, is still in.
         if let Some(dvd) = &self.boot_disc {
             self.disc = Some(InDrive::Image(dvd.clone()));
+        }
+        Ok(())
+    }
+
+    /// Forwards the lab PC's `host_port`, on its loopback, to the guest's
+    /// `port` (UDP when `udp`, else TCP), on the QEMU that runs now.
+    fn forward(&mut self, udp: bool, port: u16, host_port: u16) -> Result<(), String> {
+        let protocol = if udp { "udp" } else { "tcp" };
+        let rule = format!("{protocol}:127.0.0.1:{host_port}-:{port}");
+        // QMP has no command of its own for this; the human monitor's,
+        // through QMP, says nothing when it works and why when it does not.
+        let said = self.qmp()?.execute(
+            "human-monitor-command",
+            &json!({ "command-line": format!("hostfwd_add {NETDEV} {rule}") }),
+        )?;
+        let said = said.as_str().unwrap_or_default().trim();
+        if !said.is_empty() {
+            return Err(format!("forwarding the guest's port: hostfwd_add {rule}: {said}"));
         }
         Ok(())
     }
@@ -1628,19 +1656,8 @@ impl Driver for Qemu {
         if let Some(&forwarded) = self.forwards.get(&(udp, port)) {
             return Ok(forwarded);
         }
-        let (protocol, host_port) =
-            if udp { ("udp", crate::peer::free_udp_port()?) } else { ("tcp", free_port()?) };
-        // QMP has no command of its own for this; the human monitor's,
-        // through QMP, says nothing when it works and why when it does not.
-        let rule = format!("{protocol}:127.0.0.1:{host_port}-:{port}");
-        let said = self.qmp()?.execute(
-            "human-monitor-command",
-            &json!({ "command-line": format!("hostfwd_add {NETDEV} {rule}") }),
-        )?;
-        let said = said.as_str().unwrap_or_default().trim();
-        if !said.is_empty() {
-            return Err(format!("forwarding the guest's port: hostfwd_add {rule}: {said}"));
-        }
+        let host_port = if udp { crate::peer::free_udp_port()? } else { free_port()? };
+        self.forward(udp, port, host_port)?;
         self.forwards.insert((udp, port), host_port);
         Ok(host_port)
     }
