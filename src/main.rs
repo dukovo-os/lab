@@ -24,6 +24,7 @@ mod hash;
 mod http;
 mod machines;
 mod netboot;
+mod netlog;
 mod output;
 mod peer;
 mod png;
@@ -33,6 +34,7 @@ mod schedule;
 mod screen;
 mod send;
 mod serial;
+mod shelly;
 mod ssh;
 mod status;
 mod stop;
@@ -600,21 +602,22 @@ fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> 
     let key = ssh::key_path(&arguments.config_dir()?);
     let mut results = Vec::new();
     for machine in &machines {
-        let checks = match &machine.amt {
-            Some(settings) => {
+        let checks = match (&machine.amt, &machine.plug) {
+            (Some(settings), _) => {
                 let screen = [Control::Keys, Control::Mouse, Control::Screen]
                     .into_iter()
                     .any(|control| machine.who(control) == Who::Driver);
                 driver::amt::check(settings, Some(&key), screen)
             }
-            None => Vec::new(),
+            (None, Some(settings)) => driver::plug::check(settings, Some(&key)),
+            (None, None) => Vec::new(),
         };
         results.push((machine, checks));
     }
     let problems = results
         .iter()
         .flat_map(|(_, checks)| checks)
-        .any(|check| check.verdict == driver::amt::Verdict::Problem);
+        .any(|check| check.verdict == driver::real::Verdict::Problem);
     if arguments.json {
         let machines: Vec<Value> = results
             .iter()
@@ -630,9 +633,9 @@ fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> 
             println!("{}: {}", machine.name, machine.about);
             for check in checks {
                 let verdict = match check.verdict {
-                    driver::amt::Verdict::Ok => "ok",
-                    driver::amt::Verdict::Note => "note",
-                    driver::amt::Verdict::Problem => "PROBLEM",
+                    driver::real::Verdict::Ok => "ok",
+                    driver::real::Verdict::Note => "note",
+                    driver::real::Verdict::Problem => "PROBLEM",
                 };
                 println!("  {verdict:<8} {:<13} {}", check.check, check.detail);
             }

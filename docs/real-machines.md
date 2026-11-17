@@ -12,6 +12,12 @@ writes the image under test to its disk before each fresh boot, a serial
 cable brings its console to the lab PC, and the lab network carries SSH
 and the lab PC's side of a test.
 
+A machine with neither AMT nor a serial port runs through the `plug`
+driver instead: a Shelly smart plug turns it on and off, and its console
+comes over the network. [A machine on a smart plug](#a-machine-on-a-smart-plug)
+below sets one up; the rest of this page is about AMT machines, and what
+it says of net boot, the lab network and the lab PC holds for both.
+
 ## What a machine needs
 
 - Intel AMT (a vPro machine), with its network port on the lab network.
@@ -179,3 +185,65 @@ real machines yet; tests that need them are skipped there.
 - A screen that stays black over the remote screen while the machine
   runs needs a monitor or a display emulator plug on the board's Intel
   graphics.
+
+## A machine on a smart plug
+
+A real machine with no AMT and no serial port, such as a ThinkCentre M75q,
+runs through the `plug` driver. What it needs:
+
+- A firmware that boots from the network (UEFI IPv4 PXE) before its
+  disk, every time, and powers the machine on after a power loss
+  (After Power Loss set to Power On). The plug is its power switch: the
+  driver switches the plug on, and the firmware does the rest.
+- A Shelly plug (Gen 2 or later, such as the Plug US Gen 4) on the home
+  network, with a fixed address and no password. The lab PC reaches it
+  through its ordinary card, so the machine's own port is the only one on
+  the lab network. The plug's `Switch.GetStatus` says whether its switch
+  is on and what the machine draws.
+- The lab network, as above, with the machine's address handed out by
+  dnsmasq by its MAC address (`dhcp-host=<mac>,<machine_address>,<name>`):
+  a plug machine's address is not the OptiPlex's `10.77.0.2`, so the
+  machine file's `machine_address` names it, such as `10.77.0.3`.
+- A disk the lab may overwrite, as above.
+- The lab image's netlog: every lab image names the lab PC (`10.77.0.1`,
+  port 6666) as netlog's target, and netlog sends the system's log over
+  UDP from the machine's first moments, which the lab reads as the
+  machine's console. Only the machine file's `machine_address` is listened
+  to. An image that does not name the lab PC, or a machine whose network
+  does not come up, leaves the console log empty.
+
+Setting it up is the AMT machine's steps without MEBx and the serial
+cable: the firmware settings above, then the plug machine's file
+([machines/m75q.toml](../machines/m75q.toml)) with its MAC address, the
+plug's address and the disk's serial number, then
+`dukovo-lab machines check <machine>`.
+
+The disk's serial number may be unknown: with `disk = "UNKNOWN"` the first
+fresh boot fails with the writer's own message, which lists each disk it
+found and its serial number (`no disk has the serial number UNKNOWN; the
+disks are: nvme0n1 (...)`) in the error, `writer-<n>.log` and `plug.log`.
+Put the NVMe's number in the machine file and run again; no disk is
+written before that.
+
+| Control | How |
+| --- | --- |
+| A fresh boot | The driver writes the boot script and power-cycles the plug (off, 5 seconds, on). The firmware boots from the network, the network GRUB reads the script, and the writer writes the image and checks it; once the hash matches, the machine restarts, finds no script, and boots its disk. The time this takes is added to the test's time limit. |
+| `power = "on"` | The plug is switched on. When the plug is on but the machine draws less than `on_watts`, the machine shut itself down, and the plug is cycled. |
+| `power = "reset"` | The plug off, 5 seconds, on. |
+| `power = "cut"` (`cord`) | The plug off: a hard power loss, as when the cord is pulled. |
+| `power = "button"` and `"off"` | Not available: a plug cannot ask the system to shut down, so these steps fail here, as on an AMT machine that does not answer; `machines check` says so. |
+| `serial` | The netlog: each boot's console is `logs/<machine>/serial-<n>.log`, one line to a record, as a serial log reads. |
+| `ssh`, `peer` | As for AMT: the machine's address and the lab PC's on the lab network. |
+| `keys`, `mouse`, `screen`, `linux` | `none`: tests that need them are skipped. |
+
+The lab listens for one machine's netlog on one UDP port, so a run drives
+one plug machine at a time. A second one needs its own `machine_address`,
+and, at the same time, its own `netlog_port` and `boot_port`.
+
+When something goes wrong, `logs/<machine>/plug.log` says what the driver
+did: each switch of the plug, each net boot and each request the writer
+made. A plug that stops answering fails the step with its address;
+Wi-Fi drops a call now and then, so each call is tried three times.
+`serial-<n>.log` stays empty while the machine runs when its network does
+not come up or the image does not send its log to the lab PC; `plug.log`
+and `writer-<n>.log` still show the fresh boot.

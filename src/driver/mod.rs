@@ -5,14 +5,17 @@
 //!
 //! The runner drives every machine through [`Driver`], so a test written
 //! against QEMU runs unchanged on a real machine: QEMU's driver is in
-//! qemu.rs, and real machines with Intel AMT have theirs in amt.rs. Each
-//! method is one [`Control`] of a machine file; the runner calls only
-//! those the machine file says the driver does.
+//! qemu.rs, real machines with Intel AMT have theirs in amt.rs, and real
+//! machines on a smart plug theirs in plug.rs (real.rs holds what those
+//! two share). Each method is one [`Control`] of a machine file; the
+//! runner calls only those the machine file says the driver does.
 //!
 //! [`Control`]: crate::machines::Control
 
 pub mod amt;
+pub mod plug;
 pub mod qemu;
+pub mod real;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -322,6 +325,10 @@ pub fn start(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String>
         DriverKind::Amt => {
             let settings = machine.amt.clone().ok_or("an amt machine has no [amt] settings")?;
             Ok(Box::new(amt::AmtDriver::new(settings, setup)?))
+        }
+        DriverKind::Plug => {
+            let settings = machine.plug.clone().ok_or("a plug machine has no [plug] settings")?;
+            Ok(Box::new(plug::PlugDriver::new(settings, setup)?))
         }
     }
 }

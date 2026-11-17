@@ -170,6 +170,11 @@ pub enum DriverKind {
     /// next boot through AMT, a fresh disk for each test through net
     /// boot, its console through a serial cable to the lab PC.
     Amt,
+    /// A real machine with neither AMT nor a serial port, on the lab
+    /// network: power through a Shelly smart plug, a fresh disk for each
+    /// test through net boot (its firmware boots from the network first),
+    /// its console through Dukovo's netlog over UDP.
+    Plug,
 }
 
 /// Firmware a QEMU machine boots through.
@@ -338,12 +343,63 @@ fn default_console() -> String {
     "ttyS0,115200".into()
 }
 
+/// How the lab reaches a real machine with no AMT and no serial port, and
+/// boots it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlugSettings {
+    /// The Shelly plug's address on the home network, with `:port` for a
+    /// plug that does not listen on port 80.
+    pub shelly: String,
+    /// Reserved for a plug that asks for a password: the lab cannot sign
+    /// in to one yet, so a machine file that names a file is refused.
+    pub password_file: Option<PathBuf>,
+    /// The MAC address of the machine's network card on the lab network,
+    /// which it boots from the network with.
+    pub mac: String,
+    /// The serial number of the disk the image is written to, the only
+    /// disk the writer may write (`lsblk -o NAME,SERIAL` shows it).
+    pub disk: String,
+    /// The machine's address on the lab network, for SSH, the netlog's
+    /// sender and the lab PC's clients (`{machine}`).
+    #[serde(default = "default_machine_address")]
+    pub machine_address: String,
+    /// The lab PC's address on the lab network: the net-boot server and
+    /// the netlog reader listen on it, and tests reach the lab PC there
+    /// (`{peer}`).
+    #[serde(default = "default_lab_address")]
+    pub lab_address: String,
+    /// The net-boot server's port.
+    #[serde(default = "default_boot_port")]
+    pub boot_port: u16,
+    /// dnsmasq's TFTP folder, which boot scripts are written into.
+    #[serde(default = "default_tftp")]
+    pub tftp: PathBuf,
+    /// The writer's kit, as `ob lab` installs it.
+    #[serde(default = "default_writer")]
+    pub writer: PathBuf,
+    /// The UDP port the lab PC listens on for the machine's netlog.
+    #[serde(default = "default_netlog_port")]
+    pub netlog_port: u16,
+    /// The least the machine draws while it runs, in watts: a plug that
+    /// is on with the machine drawing less means the machine shut down.
+    #[serde(default = "default_on_watts")]
+    pub on_watts: f64,
+}
+
+fn default_netlog_port() -> u16 {
+    6666
+}
+fn default_on_watts() -> f64 {
+    5.0
+}
+
 /// The serial console line that says a machine has finished booting,
 /// unless its file names another.
 pub const DEFAULT_READY: &str = "Boot complete.";
 
 /// One machine.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Machine {
     /// Its name: the machine file's name without `.toml`.
     pub name: String,
@@ -360,6 +416,9 @@ pub struct Machine {
     /// For a real machine with AMT.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amt: Option<AmtSettings>,
+    /// For a real machine on a smart plug.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plug: Option<PlugSettings>,
 }
 
 impl Machine {
@@ -379,6 +438,7 @@ impl Machine {
             controls: driver_controls(&DriverKind::Qemu),
             qemu: Some(QemuSettings::default()),
             amt: None,
+            plug: None,
         }
     }
 }
@@ -413,6 +473,16 @@ fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
         .into_iter()
         .map(|control| (control, Who::Driver))
         .collect(),
+        // The plug does power and the power cut (a hard power loss, which
+        // the system gets no warning of), netlog the console, and the lab
+        // network SSH and the lab PC's side. The machine has no screen,
+        // keyboard or mouse the lab can reach, and no Linux twin yet.
+        DriverKind::Plug => {
+            [Control::Power, Control::Cord, Control::Serial, Control::Ssh, Control::Peer]
+                .into_iter()
+                .map(|control| (control, Who::Driver))
+                .collect()
+        }
     }
 }
 
@@ -427,6 +497,7 @@ struct MachineFile {
     controls: BTreeMap<Control, Who>,
     qemu: Option<QemuSettings>,
     amt: Option<AmtSettings>,
+    plug: Option<PlugSettings>,
 }
 
 /// Reads every machine file in `dir`, and adds the built-in `qemu` unless
@@ -506,31 +577,46 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         }
         controls.insert(control, who);
     }
-    let (qemu, amt) = match file.driver {
-        DriverKind::Qemu if file.amt.is_some() => {
-            return Err(bad("[amt] is for machines whose driver is amt".into()));
+    for (present, section, driver) in [
+        (file.qemu.is_some(), "qemu", DriverKind::Qemu),
+        (file.amt.is_some(), "amt", DriverKind::Amt),
+        (file.plug.is_some(), "plug", DriverKind::Plug),
+    ] {
+        if present && file.driver != driver {
+            return Err(bad(format!("[{section}] is for machines whose driver is {section}")));
         }
-        DriverKind::Amt if file.qemu.is_some() => {
-            return Err(bad("[qemu] is for machines whose driver is qemu".into()));
-        }
-        DriverKind::Qemu => (Some(file.qemu.unwrap_or_default()), None),
+    }
+    let needs = |article: &str, section: &str| {
+        bad(format!("a machine whose driver is {section} needs {article} [{section}] section"))
+    };
+    let qemu = match file.driver {
+        DriverKind::Qemu => Some(file.qemu.unwrap_or_default()),
+        _ => None,
+    };
+    let amt = match file.driver {
         DriverKind::Amt => {
-            let mut settings = file.amt.ok_or_else(|| {
-                bad("a machine whose driver is amt needs an [amt] section".into())
-            })?;
+            let mut settings = file.amt.ok_or_else(|| needs("an", "amt"))?;
             if settings.password_file.is_relative()
                 && let Some(folder) = path.parent()
             {
                 settings.password_file = folder.join(&settings.password_file);
             }
-            (None, Some(settings))
+            Some(settings)
         }
+        _ => None,
+    };
+    let plug = match file.driver {
+        DriverKind::Plug => Some(file.plug.ok_or_else(|| needs("a", "plug"))?),
+        _ => None,
     };
     if let Some(settings) = &qemu {
         check_qemu(settings).map_err(bad)?;
     }
     if let Some(settings) = &amt {
         check_amt(settings).map_err(bad)?;
+    }
+    if let Some(settings) = &plug {
+        check_plug(settings).map_err(bad)?;
     }
     Ok(Machine {
         name,
@@ -541,6 +627,7 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         controls,
         qemu,
         amt,
+        plug,
     })
 }
 
@@ -564,30 +651,17 @@ fn check_qemu(settings: &QemuSettings) -> Result<(), String> {
 
 /// Catches AMT settings that could only fail on the machine.
 fn check_amt(settings: &AmtSettings) -> Result<(), String> {
-    for (key, address) in [
-        ("amt.address", &settings.address),
-        ("amt.machine_address", &settings.machine_address),
-        ("amt.lab_address", &settings.lab_address),
-    ] {
-        if address.parse::<std::net::Ipv4Addr>().is_err() {
-            return Err(format!(
-                "{key} must be an IPv4 address on the lab network, such as 10.77.0.2"
-            ));
-        }
-    }
-    let pairs: Vec<&str> = settings.mac.split(':').collect();
-    if pairs.len() != 6
-        || !pairs.iter().all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        return Err("amt.mac must be a MAC address written aa:bb:cc:dd:ee:ff".into());
-    }
-    let serial = settings.disk.trim();
-    if serial.is_empty() || serial != settings.disk || !serial.bytes().all(|b| b.is_ascii_graphic())
-    {
-        return Err(
-            "amt.disk must be the disk's serial number, as `lsblk -o NAME,SERIAL` shows it".into(),
-        );
-    }
+    check_address("amt.address", &settings.address)?;
+    check_lab_keys(
+        "amt",
+        &LabKeys {
+            machine_address: &settings.machine_address,
+            lab_address: &settings.lab_address,
+            mac: &settings.mac,
+            disk: &settings.disk,
+            boot_port: settings.boot_port,
+        },
+    )?;
     if settings.user.is_empty() {
         return Err("amt.user must name AMT's user, admin as a rule".into());
     }
@@ -597,8 +671,81 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
     if settings.console.is_empty() || settings.console.contains(char::is_whitespace) {
         return Err("amt.console must be one Linux console name, such as ttyS0,115200".into());
     }
-    crate::netboot::ports(settings.boot_port).map_err(|err| format!("amt.boot_port: {err}"))?;
     Ok(())
+}
+
+/// Catches plug settings that could only fail on the machine.
+fn check_plug(settings: &PlugSettings) -> Result<(), String> {
+    // A port after the address is for a plug behind a forward, or a test.
+    let (host, port) = settings.shelly.split_once(':').unwrap_or((&settings.shelly, "80"));
+    if host.parse::<std::net::Ipv4Addr>().is_err() || port.parse::<u16>().is_err() {
+        return Err("plug.shelly must be the plug's IPv4 address on the home network, such as \
+                    192.168.1.3"
+            .into());
+    }
+    if settings.password_file.is_some() {
+        return Err("plug.password_file: the lab cannot sign in to a plug that asks for a \
+                    password yet; turn the plug's authentication off in its web page"
+            .into());
+    }
+    check_lab_keys(
+        "plug",
+        &LabKeys {
+            machine_address: &settings.machine_address,
+            lab_address: &settings.lab_address,
+            mac: &settings.mac,
+            disk: &settings.disk,
+            boot_port: settings.boot_port,
+        },
+    )?;
+    if settings.netlog_port == 0 {
+        return Err("plug.netlog_port must be a UDP port, 6666 as a rule".into());
+    }
+    if !settings.on_watts.is_finite() || settings.on_watts <= 0.0 {
+        return Err("plug.on_watts must be more than 0: the least the machine draws while it \
+                    runs, in watts"
+            .into());
+    }
+    Ok(())
+}
+
+/// The settings of the lab network that every real machine's file has.
+struct LabKeys<'a> {
+    machine_address: &'a str,
+    lab_address: &'a str,
+    mac: &'a str,
+    disk: &'a str,
+    boot_port: u16,
+}
+
+/// Checks that `address` is an IPv4 address, as the lab network's are.
+fn check_address(key: &str, address: &str) -> Result<(), String> {
+    if address.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(format!("{key} must be an IPv4 address on the lab network, such as 10.77.0.2"));
+    }
+    Ok(())
+}
+
+/// Catches lab network settings, of a driver's section named `section`,
+/// that could only fail on the machine.
+fn check_lab_keys(section: &str, keys: &LabKeys<'_>) -> Result<(), String> {
+    check_address(&format!("{section}.machine_address"), keys.machine_address)?;
+    check_address(&format!("{section}.lab_address"), keys.lab_address)?;
+    let pairs: Vec<&str> = keys.mac.split(':').collect();
+    if pairs.len() != 6
+        || !pairs.iter().all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(format!("{section}.mac must be a MAC address written aa:bb:cc:dd:ee:ff"));
+    }
+    let serial = keys.disk.trim();
+    if serial.is_empty() || serial != keys.disk || !serial.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(format!(
+            "{section}.disk must be the disk's serial number, as `lsblk -o NAME,SERIAL` shows it"
+        ));
+    }
+    crate::netboot::ports(keys.boot_port)
+        .map(drop)
+        .map_err(|err| format!("{section}.boot_port: {err}"))
 }
 
 /// Whether `name` is a test's or machine's name: a-z, 0-9 and `-`, not
@@ -716,6 +863,89 @@ mod tests {
         let amt = real.amt.as_ref().unwrap();
         assert_eq!(amt.password_file, folder.join("optiplex-amt-password"));
         assert_eq!(real.who(Control::Usb), Who::Person);
+    }
+
+    #[test]
+    fn the_example_plug_machine_has_the_plug_s_controls() {
+        let folder = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/machines"));
+        let machines = load(folder).unwrap();
+        let m75q = machines.iter().find(|machine| machine.name == "m75q").unwrap();
+        assert_eq!(m75q.driver, DriverKind::Plug);
+        let plug = m75q.plug.as_ref().unwrap();
+        assert_eq!(plug.shelly, "192.168.1.3");
+        assert_eq!(plug.machine_address, "10.77.0.3");
+        assert_eq!(plug.netlog_port, 6666);
+    }
+
+    #[test]
+    fn a_plug_machine_has_the_plug_s_controls_and_defaults() {
+        let dir = TempDir::new("machines-plug");
+        dir.write(
+            "box.toml",
+            "about = \"a box\"\ndriver = \"plug\"\n[plug]\nshelly = \"192.168.1.3\"\n\
+             mac = \"AA:bb:cc:00:11:22\"\ndisk = \"S3Z5NB0K\"\n[controls]\nlink = \"person\"\n",
+        );
+        let machines = load(dir.path()).unwrap();
+        let real = machines.iter().find(|machine| machine.name == "box").unwrap();
+        assert_eq!(real.driver, DriverKind::Plug);
+        assert!(real.qemu.is_none() && real.amt.is_none());
+        for control in [Control::Power, Control::Cord, Control::Serial, Control::Ssh, Control::Peer]
+        {
+            assert_eq!(real.who(control), Who::Driver, "{control}");
+        }
+        assert_eq!(real.who(Control::Link), Who::Person);
+        for control in
+            [Control::Keys, Control::Mouse, Control::Screen, Control::Linux, Control::Amt]
+        {
+            assert_eq!(real.who(control), Who::None, "{control}");
+        }
+        let plug = real.plug.as_ref().unwrap();
+        assert_eq!(plug.password_file, None);
+        assert_eq!((plug.netlog_port, plug.boot_port), (6666, 7431));
+        assert!((plug.on_watts - 5.0).abs() < f64::EPSILON);
+        assert_eq!(plug.machine_address, "10.77.0.2");
+        assert_eq!(plug.lab_address, "10.77.0.1");
+        assert_eq!(plug.tftp, Path::new("/srv/dukovo-lab/tftp"));
+    }
+
+    #[test]
+    fn bad_plug_settings_say_what_is_wrong() {
+        let plug = |extra: &str| {
+            format!(
+                "about = \"x\"\ndriver = \"plug\"\n[plug]\nmac = \"aa:bb:cc:00:11:22\"\n\
+                 disk = \"D\"\n{extra}"
+            )
+        };
+        for (text, complaint) in [
+            ("about = \"x\"\ndriver = \"plug\"\n".to_string(), "needs a [plug] section"),
+            (plug(""), "missing field `shelly`"),
+            (plug("shelly = \"plug.lan\"\n"), "plug.shelly"),
+            (plug("shelly = \"192.168.1.3:x\"\n"), "plug.shelly"),
+            (plug("shelly = \"192.168.1.3\"\npassword_file = \"p\"\n"), "authentication off"),
+            (plug("shelly = \"192.168.1.3\"\nlab_address = \"lab\"\n"), "plug.lab_address"),
+            (plug("shelly = \"192.168.1.3\"\nnetlog_port = 0\n"), "plug.netlog_port"),
+            (plug("shelly = \"192.168.1.3\"\non_watts = 0.0\n"), "plug.on_watts"),
+            (plug("shelly = \"192.168.1.3\"\nbaud = 9600\n"), "unknown field `baud`"),
+            (
+                plug("shelly = \"192.168.1.3\"\n[controls]\nscreen = \"driver\"\n"),
+                "cannot do screen",
+            ),
+            (
+                plug("shelly = \"192.168.1.3\"\n").replace("\"plug\"", "\"qemu\""),
+                "[plug] is for machines whose driver is plug",
+            ),
+            (
+                plug("shelly = \"192.168.1.3\"\n").replace("\"plug\"", "\"amt\""),
+                "[plug] is for machines whose driver is plug",
+            ),
+        ] {
+            let dir = TempDir::new("machines-plug-bad");
+            dir.write("box.toml", &text);
+            let Err(Error::Usage(message)) = load(dir.path()) else {
+                panic!("{text} should not load");
+            };
+            assert!(message.contains(complaint), "{message}");
+        }
     }
 
     #[test]

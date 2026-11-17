@@ -71,7 +71,7 @@ dukovo-lab machines
 
 Each machine, its file and who does each control. With `--json`:
 `{"machines": [{"name", "about", "file", "driver", "ready", "controls":
-{"power": "driver", ...}, "qemu": {...}, "amt": {...}}]}`.
+{"power": "driver", ...}, "qemu": {...}, "amt": {...}, "plug": {...}}]}`.
 
 ## machines check
 
@@ -84,7 +84,10 @@ without changing anything: AMT's password file, AMT itself (its version,
 Admin Control Mode, the machine's power, whether it can ask the system
 to shut down), the serial port, the lab PC's address on the lab network,
 the net-boot server's port, the TFTP folder, the network GRUB, the
-writer's kit and the lab key. QEMU machines have nothing to check. Each
+writer's kit and the lab key. For a plug machine: the plug (that it
+answers, its switch and the machine's draw), the lab network, the
+net-boot server's port, the TFTP folder, the network GRUB, the writer's
+kit, the lab key and the netlog port. QEMU machines have nothing to check. Each
 check is `ok`, a `note`, or a `problem`; the command exits 3 while any
 check is a problem. With `--json`:
 `{"machines": [{"name", "checks": [{"check", "verdict", "detail"}]}]}`.

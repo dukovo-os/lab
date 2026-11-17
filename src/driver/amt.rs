@@ -30,29 +30,25 @@
 //! driver does goes in the bundle's `logs/<machine>/amt.log`, never with
 //! the passwords.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
-use std::net::IpAddr;
+use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::real::{
+    self, Check, LabSide, NetBoot, Verdict, WRITE_TIME, found, persons_job, problem, ssh_target,
+};
 use super::{Driver, Setup};
 use crate::amt::{self, Amt, PowerChange};
 use crate::bench::Kit;
 use crate::machines::AmtSettings;
-use crate::netboot::{self, Image, Offer, Outcome, Server};
+use crate::netboot::{self, Offer};
 use crate::serial::SerialReader;
 use crate::ssh;
 use crate::suite::{Button, PowerAction, Stick};
 use crate::vnc::{self, Vnc};
 use crate::{png, screen};
-
-/// The longest a fresh boot's net boot and write may take: the firmware
-/// starting twice, the writer's kernel loading, and a few hundred
-/// megabytes written and read back.
-pub const WRITE_TIME: Duration = Duration::from_secs(4 * 60);
 
 /// How long the machine is given to go off after a hard off.
 const OFF_TIME: Duration = Duration::from_secs(30);
@@ -72,9 +68,6 @@ const START_SETTLE: Duration = Duration::from_secs(10);
 
 /// How long a power state read from AMT is trusted: waits ask often.
 const POWER_FRESH: Duration = Duration::from_secs(1);
-
-/// The port the machine's SSH server listens on.
-const SSH_PORT: u16 = 22;
 
 /// How long AMT may take to see a remote screen session close, and take
 /// power changes again.
@@ -120,15 +113,10 @@ pub struct AmtDriver {
     settings: AmtSettings,
     setup: Setup,
     amt: Amt,
-    server: Server,
+    netboot: NetBoot,
     serial: Arc<SerialReader>,
     /// The current boot's serial log.
     serial_log: PathBuf,
-    /// Where this boot's script goes in the TFTP folder.
-    script: PathBuf,
-    writer: Kit,
-    /// The image under test, read once, on the first fresh boot.
-    image: Option<Arc<Image>>,
     boot: u32,
     /// The power state last read, and when.
     power: Option<(Instant, bool)>,
@@ -146,8 +134,6 @@ pub struct AmtDriver {
     /// [`FIRST_KEY_SETTLE`]).
     primed: bool,
     pointer: (u16, u16),
-    log: File,
-    started: Instant,
 }
 
 impl AmtDriver {
@@ -156,29 +142,13 @@ impl AmtDriver {
     /// reader. Leaves the machine's power as it is.
     pub fn new(settings: AmtSettings, setup: Setup) -> Result<AmtDriver, String> {
         let password = read_password(&settings.password_file)?;
-        let writer = Kit::read(&settings.writer).map_err(|err| {
-            format!(
-                "{err} (the writer's kit; `ob lab` installs it in {})",
-                settings.writer.display()
-            )
-        })?;
-        let lab: IpAddr = settings
-            .lab_address
-            .parse()
-            .map_err(|_| format!("amt.lab_address {} is not an address", settings.lab_address))?;
-        let server = Server::start(lab, settings.boot_port)?;
         fs::create_dir_all(&setup.logs)
             .and_then(|()| fs::create_dir_all(&setup.work))
             .map_err(|err| format!("making the machine's folders: {err}"))?;
+        let netboot = NetBoot::start(&lab_side(&settings), &setup.logs.join("amt.log"))?;
         // Until the first boot, what the port says goes to a scratch log.
         let before = setup.work.join("serial-before.log");
         let serial = Arc::new(SerialReader::start(&settings.serial, settings.baud, &before)?);
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(setup.logs.join("amt.log"))
-            .map_err(|err| format!("making amt.log: {err}"))?;
-        let script = netboot::script_path(&settings.tftp, &settings.mac);
         let amt = Amt::new(&settings.address, &settings.user, &password);
         let host = settings.address.split(':').next().unwrap_or_default();
         let screen_address = format!("{host}:{}", vnc::PORT);
@@ -186,12 +156,9 @@ impl AmtDriver {
             settings,
             setup,
             amt,
-            server,
+            netboot,
             serial,
             serial_log: before,
-            script,
-            writer,
-            image: None,
             boot: 0,
             power: None,
             last_start: None,
@@ -201,16 +168,12 @@ impl AmtDriver {
             screen: None,
             primed: false,
             pointer: (0, 0),
-            log,
-            started: Instant::now(),
         };
-        let ports: Vec<String> =
-            driver.server.addresses().iter().map(|address| address.port().to_string()).collect();
         driver.note(&format!(
             "AMT at {}; net-boot server at {}, ports {}; serial port {}",
             driver.settings.address,
             driver.settings.lab_address,
-            ports.join(", "),
+            driver.netboot.ports(),
             driver.settings.serial.display()
         ));
         Ok(driver)
@@ -218,15 +181,7 @@ impl AmtDriver {
 
     /// Writes a line to amt.log, with the seconds since the driver began.
     fn note(&mut self, line: &str) {
-        let at = self.started.elapsed().as_secs_f64();
-        let _ = writeln!(self.log, "{at:9.1}s {line}");
-    }
-
-    /// Writes what the net-boot server did to amt.log.
-    fn note_server(&mut self) {
-        for event in self.server.take_events() {
-            self.note(&format!("net boot: {event}"));
-        }
+        self.netboot.note(line);
     }
 
     /// Changes the power through AMT, and notes it. AMT turns power
@@ -338,51 +293,23 @@ impl AmtDriver {
     /// Boots the machine from the network once into what `offer` hands
     /// out, loading it with `cmdline`.
     fn net_boot(&mut self, what: &str, offer: Offer, cmdline: &str) -> Result<(), String> {
-        let base = self.server.offer(offer)?;
-        let cmdline = cmdline.replace("{base}", &base);
-        netboot::write_script(&self.script, &netboot::grub_script(what, &base, &cmdline))?;
-        self.note(&format!("net boot: {what}, boot script {}", self.script.display()));
+        self.netboot.begin(what, offer, cmdline)?;
         self.amt.boot_from_network_once()?;
         self.turn_on()
-    }
-
-    /// Ends a net boot: its script and offer go, so a later boot from the
-    /// network goes on to the disk.
-    fn end_net_boot(&mut self) {
-        netboot::remove_script(&self.script);
-        self.server.withdraw();
-        self.note_server();
-    }
-
-    /// The image under test, read the first time it is wanted.
-    fn image(&mut self) -> Result<Arc<Image>, String> {
-        if let Some(image) = &self.image {
-            return Ok(Arc::clone(image));
-        }
-        let started = Instant::now();
-        let image = Arc::new(Image::scan(&self.setup.image)?);
-        self.note(&format!(
-            "image {}: {} bytes, {} of data in {} runs, SHA-256 {}, read in {:.1}s",
-            self.setup.image.display(),
-            image.size,
-            image.data_bytes(),
-            image.extents.len(),
-            image.sha256,
-            started.elapsed().as_secs_f64()
-        ));
-        self.image = Some(Arc::clone(&image));
-        Ok(image)
     }
 
     /// Writes the image to the disk through the writer; returns once the
     /// writer said it wrote it and the hash was right.
     fn write_image(&mut self) -> Result<(), String> {
-        let image = self.image()?;
+        let image = self.netboot.image(&self.setup.image)?;
         let writer_log = self.setup.logs.join(format!("writer-{}.log", self.boot));
         self.serial.switch_to(&writer_log)?;
         let written = {
-            let (serial, next, script) =
-                (Arc::clone(&self.serial), self.serial_log.clone(), self.script.clone());
+            let (serial, next, script) = (
+                Arc::clone(&self.serial),
+                self.serial_log.clone(),
+                self.netboot.script().to_path_buf(),
+            );
             // Before the writer is told to restart: its next boot must not
             // find the script, and its console goes to the boot's log.
             Box::new(move || {
@@ -391,7 +318,7 @@ impl AmtDriver {
             })
         };
         let offer = Offer::Writer {
-            kit: self.writer.clone(),
+            kit: self.netboot.writer.clone(),
             image,
             disk: self.settings.disk.clone(),
             written,
@@ -400,39 +327,13 @@ impl AmtDriver {
         // file's MAC gets the machine's address on the lab's /24.
         let cmdline = format!(
             "{} dukovo.lab={{base}} dukovo.lab.ip={}/24 dukovo.lab.mac={}",
-            with_console(&self.writer.cmdline, &self.settings.console),
+            with_console(&self.netboot.writer.cmdline, &self.settings.console),
             self.settings.machine_address,
             self.settings.mac.to_ascii_lowercase()
         );
-        let deadline = Instant::now() + WRITE_TIME;
         let booted = self.net_boot("the writer", offer, &cmdline);
-        let outcome = booted.and_then(|()| {
-            loop {
-                self.note_server();
-                match self.server.outcome() {
-                    Some(Outcome::Written) => break Ok(()),
-                    Some(Outcome::Failed(why)) => break Err(why),
-                    None => {}
-                }
-                if self.setup.stop.requested() {
-                    break Err("the run was stopped".into());
-                }
-                if Instant::now() >= deadline {
-                    let minutes = WRITE_TIME.as_secs() / 60;
-                    break Err(if self.server.loaded() {
-                        format!("the writer did not finish within {minutes} minutes")
-                    } else {
-                        format!(
-                            "the machine did not load the writer within {minutes} minutes: no \
-                             request for its kernel came, so its firmware or the network GRUB \
-                             may have gone on to the disk"
-                        )
-                    });
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        });
-        self.end_net_boot();
+        let outcome = booted.and_then(|()| self.netboot.await_writer(&self.setup.stop));
+        self.netboot.finish();
         match outcome {
             Ok(()) => {
                 self.note("net boot: the disk holds the image; the machine restarts into it");
@@ -534,25 +435,6 @@ impl AmtDriver {
     }
 }
 
-/// How one of `machines check`'s checks came out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Verdict {
-    Ok,
-    /// Worth knowing, but runs go ahead.
-    Note,
-    /// Runs on the machine will not work until it is put right.
-    Problem,
-}
-
-/// One of `machines check`'s checks.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct Check {
-    pub check: &'static str,
-    pub verdict: Verdict,
-    pub detail: String,
-}
-
 /// Checks what a run on the machine needs, without changing anything:
 /// AMT's password, address and mode, its remote screen when the driver
 /// does the machine's `screen`, the serial port, the lab network, the TFTP
@@ -560,13 +442,8 @@ pub struct Check {
 pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut add = |check: &'static str, result: Result<String, (Verdict, String)>| {
-        let (verdict, detail) = match result {
-            Ok(detail) => (Verdict::Ok, detail),
-            Err((verdict, detail)) => (verdict, detail),
-        };
-        checks.push(Check { check, verdict, detail });
+        checks.push(found(check, result));
     };
-    let problem = |detail: String| (Verdict::Problem, detail);
     let password = read_password(&settings.password_file);
     add(
         "password",
@@ -643,65 +520,19 @@ pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Ch
             .map(|()| format!("{} opens, at {} baud", settings.serial.display(), settings.baud))
             .map_err(problem),
     );
-    let lab = settings.lab_address.as_str();
-    add(
-        "lab network",
-        std::net::TcpListener::bind((lab, 0))
-            .map(|_| format!("this PC has {lab}, the lab address"))
-            .map_err(|err| {
-                problem(format!(
-                    "this PC does not have {lab} ({err}): give the lab card that address"
-                ))
-            }),
-    );
-    add(
-        "boot port",
-        netboot::ports(settings.boot_port).map_err(problem).and_then(|ports| {
-            ports.iter().try_for_each(|&port| {
-                std::net::TcpListener::bind((lab, port)).map(drop).map_err(|err| {
-                    (Verdict::Note, format!("port {port} is in use ({err}): by a run going now?"))
-                })
-            })?;
-            Ok(format!(
-                "ports {} to {} are free for the net-boot server",
-                ports[0],
-                ports[ports.len() - 1]
-            ))
-        }),
-    );
-    let script = netboot::script_path(&settings.tftp, &settings.mac);
-    add(
-        "tftp",
-        netboot::write_script(&script.with_extension("check"), "# dukovo-lab machines check\n")
-            .map(|()| {
-                let _ = fs::remove_file(script.with_extension("check"));
-                format!("boot scripts can be written in {}", settings.tftp.display())
-            })
-            .map_err(problem),
-    );
-    let grub = settings.tftp.join(netboot::GRUB_FILE);
-    add(
-        "network grub",
-        if grub.is_file() {
-            Ok(format!("{} is there", grub.display()))
-        } else {
-            Err(problem(format!("{} is missing: `ob lab` puts it there", grub.display())))
-        },
-    );
-    add(
-        "writer",
-        Kit::read(&settings.writer)
-            .map(|_| format!("the writer's kit is in {}", settings.writer.display()))
-            .map_err(|err| problem(format!("{err}: `ob lab` installs it"))),
-    );
-    add(
-        "lab key",
-        match key {
-            Some(key) if key.is_file() => Ok("the lab has its key".into()),
-            _ => Err(problem("the lab has no key: run `dukovo-lab key`".into())),
-        },
-    );
+    checks.extend(real::check_lab_side(&lab_side(settings), key));
     checks
+}
+
+/// What the machine file says about the lab network.
+fn lab_side(settings: &AmtSettings) -> LabSide<'_> {
+    LabSide {
+        lab_address: &settings.lab_address,
+        boot_port: settings.boot_port,
+        tftp: &settings.tftp,
+        mac: &settings.mac,
+        writer: &settings.writer,
+    }
 }
 
 /// Reads AMT's password from its file, which only this user may read.
@@ -735,14 +566,6 @@ fn with_console(cmdline: &str, console: &str) -> String {
     let console = format!("console={console}");
     words.push(&console);
     words.join(" ")
-}
-
-/// Says that a person does `what` on a real machine.
-fn persons_job(what: &str) -> String {
-    format!(
-        "the AMT driver cannot {what}; a person does it on a real machine (\"person\" in the \
-         machine file's [controls])"
-    )
 }
 
 impl Driver for AmtDriver {
@@ -811,15 +634,15 @@ impl Driver for AmtDriver {
     }
 
     fn set_link(&mut self, _up: bool) -> Result<(), String> {
-        Err(persons_job("plug or pull the network cable"))
+        Err(persons_job("AMT", "plug or pull the network cable"))
     }
 
     fn plug_usb(&mut self, _stick: &Stick) -> Result<(), String> {
-        Err(persons_job("plug in a USB stick"))
+        Err(persons_job("AMT", "plug in a USB stick"))
     }
 
     fn unplug_usb(&mut self) -> Result<(), String> {
-        Err(persons_job("pull out a USB stick"))
+        Err(persons_job("AMT", "pull out a USB stick"))
     }
 
     fn press_keys(&mut self, combos: &[String]) -> Result<(), String> {
@@ -895,21 +718,10 @@ impl Driver for AmtDriver {
         input: Option<&str>,
         deadline: Instant,
     ) -> Result<ssh::Output, String> {
-        let key = self
-            .setup
-            .key
-            .clone()
-            .ok_or("the lab has no key: run `dukovo-lab key`, then build the image again")?;
+        let target = ssh_target(&self.setup, &self.settings.machine_address, self.boot)?;
         if !self.is_on() {
             return Err("the machine is off".into());
         }
-        let target = ssh::Target {
-            host: self.settings.machine_address.clone(),
-            port: SSH_PORT,
-            key,
-            known_hosts: self.setup.work.join(format!("known_hosts-{}", self.boot)),
-            scratch: self.setup.work.join("ssh-output"),
-        };
         target.run(command, input, deadline, &self.setup.stop)
     }
 
@@ -965,7 +777,7 @@ impl Driver for AmtDriver {
             }
             std::thread::sleep(Duration::from_millis(200));
         });
-        self.end_net_boot();
+        self.netboot.finish();
         let _ = self.hard_off();
         let _ = self.serial.switch_to(&self.setup.work.join("serial-after-twin.log"));
         self.note(&format!("Linux twin: {}", if measured.is_ok() { "measured" } else { "failed" }));
@@ -978,16 +790,10 @@ impl Driver for AmtDriver {
 
     fn shut_off(&mut self) {
         self.screen = None;
-        self.end_net_boot();
+        self.netboot.finish();
         if let Err(err) = self.hard_off() {
             self.note(&format!("shut off: {err}"));
         }
-    }
-}
-
-impl Drop for AmtDriver {
-    fn drop(&mut self) {
-        netboot::remove_script(&self.script);
     }
 }
 
@@ -999,6 +805,8 @@ mod tests {
     use crate::stop::Stop;
     use crate::testing::TempDir;
     use crate::vnc::fake::{Event, FakeVnc, pattern};
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
 
     const MAC: &str = "aa:bb:cc:00:11:22";
 
