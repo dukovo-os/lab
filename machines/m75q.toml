@@ -28,3 +28,6 @@ disk = "UNKNOWN"
 # MAC address (dhcp-host=04:7b:cb:45:b6:ed,10.77.0.3,m75q). A second real
 # machine on the lab network needs an address of its own.
 machine_address = "10.77.0.3"
+# Its own four net-boot ports: the OptiPlex takes 7431 to 7434, and two
+# machines in one run need ports of their own.
+boot_port = 7435
