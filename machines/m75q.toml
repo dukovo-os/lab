@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# An example machine file for a real machine with no AMT and no serial
+# port: a Lenovo ThinkCentre M75q Gen 2 on a Shelly smart plug, its
+# console over the network (Dukovo's netlog). Copy it to
+# ~/.config/dukovo-lab/machines/, put in the machine's MAC address, and run
+# `dukovo-lab machines check m75q`. docs/real-machines.md sets the machine
+# and the lab PC up; docs/machine-files.md lists every key.
+
+about = "Lenovo ThinkCentre M75q Gen 2, Ryzen, on a Shelly plug, console over netlog"
+driver = "plug"
+
+[plug]
+# The plug's address on the home network, which the lab PC reaches through
+# its ordinary card. Give the plug a fixed address (a DHCP reservation).
+shelly = "192.168.1.3"
+# The network card's MAC address on the lab network, from the firmware
+# setup or `ip link`.
+mac = "04:7b:cb:45:b6:ed"
+# The serial number of the disk each test's image is written to, from
+# `lsblk -o NAME,SERIAL`. No other disk is ever written. With a machine
+# that has no system to run lsblk on, leave this as it is: the first fresh
+# boot then fails, and the writer's message in logs/m75q/plug.log lists
+# the disks it found with their serial numbers.
+disk = "UNKNOWN"
+# The machine's address on the lab network, which dnsmasq hands it by its
+# MAC address (dhcp-host=04:7b:cb:45:b6:ed,10.77.0.3,m75q). A second real
+# machine on the lab network needs an address of its own.
+machine_address = "10.77.0.3"

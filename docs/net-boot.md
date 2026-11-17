@@ -58,24 +58,31 @@ order or by hand, so goes on to its disk.
 
 2. AMT is asked to boot the machine from the network once, and to turn
    it on. The firmware asks dnsmasq for an address and its boot file,
-   GRUB reads the script, and the kernel boots.
+   GRUB reads the script, and the kernel boots. A machine on a smart
+   plug (the `plug` driver) has no AMT to ask: its firmware boots from
+   the network before its disk every time, so the driver power-cycles
+   the plug, and the same follows.
 3. The script is removed as the boot ends, before the writer restarts
-   the machine, so the boot after goes on to the disk.
+   the machine, so the boot after goes on to the disk. On a plug machine
+   that boot, and every later power on, still goes to the network first,
+   finds no script, and the network GRUB leaves for the disk.
 
 The writer's command line is its kit's, then:
 
 | Word | What |
 | --- | --- |
-| `console=` | The machine file's `amt.console`. |
+| `console=` | The machine file's `amt.console`. A `plug` machine has no serial port, and its command line is the kit's own. |
 | `dukovo.lab=` | The boot's base URL, such as `http://10.77.0.1:7431/<token>/`. |
-| `dukovo.lab.ip=` | The machine's address on the lab network, with its prefix: `amt.machine_address` and `/24`, such as `10.77.0.2/24`. |
-| `dukovo.lab.mac=` | The MAC address of the card to give it, `amt.mac` in lower case. |
+| `dukovo.lab.ip=` | The machine's address on the lab network, with its prefix: the machine file's `machine_address` and `/24`, such as `10.77.0.2/24`. |
+| `dukovo.lab.mac=` | The MAC address of the card to give it, the machine file's `mac` in lower case. |
 
 The writer gives that card that address, with no gateway, and reaches
 the base URL's host directly. The Linux twin's command line is its
 kit's, then `console=`. What either prints on its console goes to the
 bundle: `logs/<machine>/writer-<n>.log` for the writer,
-`linux-boot-<n>.log` for the twin.
+`linux-boot-<n>.log` for the twin. A plug machine's writer has no
+console the lab reads: its `writer-<n>.log` holds the requests the
+writer made, and the lines it posts to `log`.
 
 ## The writer's protocol
 
@@ -85,7 +92,7 @@ Every path is under the base URL, and is 404 once the boot is over.
 | --- | --- |
 | `GET plan` | The plan, as JSON (below). |
 | `GET data` | The image's data: each extent's bytes, in the plan's order, back to back. |
-| `POST log` | A line of progress, kept in the driver's `amt.log`. Optional. |
+| `POST log` | A line of progress, kept in the driver's log (`amt.log`, `plug.log`). Optional. |
 | `POST done` | `{"sha256": "<hex>"}`: the SHA-256 of the disk's first `size` bytes, read back from the disk. 200 and `restart` when it is the image's; 409 when it is not. |
 | `POST failed` | Why, as text. 200. |
 
@@ -105,8 +112,10 @@ The writer:
 
 1. Fails unless `version` is 1.
 2. Finds the disk whose serial number is `disk`. If there is none, or
-   more than one, it fails without writing anything. No other disk is
-   ever opened for writing.
+   more than one, it fails without writing anything, and says which
+   disks it found, each with its serial number (`POST failed`, so the
+   driver's error and `writer-<n>.log` hold it). No other disk is ever
+   opened for writing.
 3. Fails unless the disk holds `size` bytes and a mebibyte more.
 4. Writes each extent at its offset as the data streams in, and zeroes
    the rest of the first `size` bytes. Then it zeroes the disk's last

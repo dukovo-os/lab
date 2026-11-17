@@ -99,7 +99,7 @@ impl Drop for SerialReader {
 }
 
 /// Makes a log, empty.
-fn open_log(path: &Path) -> Result<File, String> {
+pub fn open_log(path: &Path) -> Result<File, String> {
     if let Some(folder) = path.parent() {
         fs::create_dir_all(folder).map_err(|err| format!("{}: {err}", folder.display()))?;
     }
