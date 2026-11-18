@@ -179,11 +179,6 @@ impl AmtDriver {
         Ok(driver)
     }
 
-    /// Writes a line to amt.log, with the seconds since the driver began.
-    fn note(&mut self, line: &str) {
-        self.netboot.note(line);
-    }
-
     /// Changes the power through AMT, and notes it. AMT turns power
     /// changes down while a remote screen session is open (AMT 11.8 on an
     /// OptiPlex 7040 answers ReturnValue 2), so the session is closed
@@ -629,6 +624,15 @@ impl Driver for AmtDriver {
         }
     }
 
+    fn grows_root(&self) -> bool {
+        self.settings.grow_root
+    }
+
+    /// Writes a line to amt.log, with the seconds since the driver began.
+    fn note(&mut self, line: &str) {
+        self.netboot.note(line);
+    }
+
     fn serial_log(&self) -> &Path {
         &self.serial_log
     }
@@ -885,6 +889,7 @@ mod tests {
             tftp,
             writer: dir.path().join("writer"),
             console: "ttyS4,115200".into(),
+            grow_root: true,
         };
         let setup = Setup {
             image: make_image(&dir, 400_000),
@@ -936,6 +941,7 @@ mod tests {
     fn a_fresh_boot_writes_the_image_and_boots_the_disk() {
         let mut bench = bench("amt-fresh", false);
         bench.driver.boot_fresh().unwrap();
+        assert!(bench.driver.grows_root());
         let serial = bench.driver.serial_log().to_path_buf();
         assert!(serial.ends_with("logs/serial-1.log"));
         assert!(wait_for(&serial, "Boot complete."));

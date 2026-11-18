@@ -61,6 +61,17 @@ pub trait Driver: Send {
     /// Whether the machine is on.
     fn is_on(&mut self) -> bool;
 
+    /// Whether the runner grows the root of a fresh boot to the end of the
+    /// disk before the test starts ([`crate::run::GROW_ROOT`]): a real
+    /// machine's disk has room after the image the lab wrote, and QEMU's
+    /// disk is the image itself.
+    fn grows_root(&self) -> bool {
+        false
+    }
+
+    /// Writes a line to the driver's own log, when it keeps one.
+    fn note(&mut self, _line: &str) {}
+
     /// The current boot's serial log, which grows while the machine runs.
     fn serial_log(&self) -> &Path;
 

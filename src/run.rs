@@ -68,6 +68,16 @@ const HEARTBEAT: Duration =
 /// Why a `root` step cannot run.
 pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no password: run `dukovo-lab key`, then build the image again with `ob image --lab`";
 
+/// The command, run as root on a real machine after a fresh boot, that
+/// grows the root to the end of its disk. The lab image's root is 512 MiB,
+/// too little to install a PHP or PostgreSQL bundle on; an
+/// installed system's root takes the rest of its disk, and the image the
+/// lab writes leaves that room empty. `/system/live/spark/root` names the
+/// root's partition, which is the disk's name with a number, or with `p`
+/// and a number when the disk's name ends in a digit (`nvme0n1p2`).
+/// `storage grow` does nothing when the root already fills the disk.
+pub const GROW_ROOT: &str = "sh -c 'part=$(sed -n \"s/^disk //p\" /system/live/spark/root); case \"$part\" in *[0-9]p[0-9]*) disk=${part%p*};; *) disk=$(echo \"$part\" | sed \"s/[0-9]*$//\");; esac; storage grow \"$disk\"'";
+
 /// Why a `bench` step cannot run.
 pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given no Linux kit: `ob lab` builds one and passes it with --linux";
 
@@ -844,10 +854,50 @@ impl<'a> Worker<'a> {
         self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
         self.log.push(format!("Boot {}: serial log {}", self.boot, self.relative_serial()));
         let note = self.wait_ready(deadline)?;
+        let grown = self.grow_root(deadline)?;
         // The test that boots sees its whole boot: its serial steps may
         // check what came before the ready line.
         self.serial.rewind();
-        Ok(note)
+        Ok(match (note, grown) {
+            (Some(note), Some(grown)) => Some(format!("{note}; {grown}")),
+            (note, grown) => note.or(grown),
+        })
+    }
+
+    /// Grows the root of a real machine to the end of its disk, as the
+    /// first thing after a fresh boot, so that no test meets the lab
+    /// image's small root (see [`GROW_ROOT`]). Gives back what the command
+    /// printed, which the driver's log also holds. A root that does not
+    /// grow is an error: tests that fill it would fail for the lab's sake.
+    /// A machine with no SSH channel or no lab key has nothing to run it
+    /// with, as with [`Worker::wait_ready`]'s SSH wait.
+    fn grow_root(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+        if !self.driver.grows_root()
+            || self.machine.who(Control::Ssh) != Who::Driver
+            || !self.has_key
+        {
+            return Ok(None);
+        }
+        if self.shared.password.is_none() {
+            return Err(StepFailure::Error(
+                "growing the root needs the lab's password, and the lab has none: run \
+                 `dukovo-lab key`, then build the image again with `ob image --lab`, or set \
+                 grow_root = false in the machine file"
+                    .into(),
+            ));
+        }
+        let (output, shown) = self.execute(GROW_ROOT, true, None, deadline)?;
+        self.driver.note(&format!("grow root: {shown}"));
+        match output.status {
+            Some(0) => Ok(Some(shown)),
+            Some(status) => Err(StepFailure::Error(format!(
+                "the root could not be grown to the end of the disk (exit status {status}): {}",
+                output.text.trim()
+            ))),
+            None => Err(StepFailure::Error(
+                "the root was not grown to the end of the disk before the time limit".into(),
+            )),
+        }
     }
 
     /// Boots the install stick with a blank disk, and waits for nothing:
@@ -938,7 +988,7 @@ impl<'a> Worker<'a> {
             Step::Browser(browser) => self.run_browser(test, browser, deadline),
             Step::Serve(serve) => self.serve(test, serve, deadline),
             Step::Bench(bench) => self.bench(bench, deadline),
-            Step::Serial(text) => self.wait_serial(text, deadline),
+            Step::Serial { text, .. } => self.wait_serial(text, deadline),
             Step::Power(action) => self.power(*action, deadline),
             Step::Link(up) => self.driver.set_link(*up).map(|()| None).map_err(StepFailure::Error),
             Step::PlugUsb(stick) => {

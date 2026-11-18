@@ -216,7 +216,13 @@ pub enum Step {
     /// Runs a command over SSH and checks what it did.
     Run(Command),
     /// Waits for text on the serial console, after the last text found.
-    Serial(String),
+    /// `early` says the text comes from the firmware, GRUB, or the system
+    /// before its network is up or after it goes down, which only a
+    /// console that starts with the power-on shows.
+    Serial {
+        text: String,
+        early: bool,
+    },
     Power(PowerAction),
     /// Plugs the network cable in (`true`) or pulls it (`false`).
     Link(bool),
@@ -520,7 +526,8 @@ impl Step {
     pub fn control(&self) -> Option<Control> {
         match self {
             Step::Run(_) => Some(Control::Ssh),
-            Step::Serial(_) => Some(Control::Serial),
+            Step::Serial { early: true, .. } => Some(Control::EarlyConsole),
+            Step::Serial { .. } => Some(Control::Serial),
             Step::Power(PowerAction::Cut) => Some(Control::Cord),
             Step::Power(_) | Step::WaitOff => Some(Control::Power),
             Step::Link(_) => Some(Control::Link),
@@ -550,7 +557,12 @@ impl Step {
     pub fn describe(&self) -> String {
         match self {
             Step::Run(command) => describe_command(command),
-            Step::Serial(text) => format!("wait for \"{text}\" on the serial console"),
+            Step::Serial { text, early: false } => {
+                format!("wait for \"{text}\" on the serial console")
+            }
+            Step::Serial { text, early: true } => {
+                format!("wait for \"{text}\" on the console from the power-on")
+            }
             Step::Power(action) => match action {
                 PowerAction::On => "power on".into(),
                 PowerAction::Off => "shut down and wait until off".into(),
@@ -860,6 +872,7 @@ struct StepFile {
     expect: Option<OneOrMore>,
     expect_not: Option<OneOrMore>,
     serial: Option<String>,
+    early: Option<bool>,
     power: Option<PowerAction>,
     link: Option<LinkState>,
     usb: Option<UsbAction>,
@@ -1232,6 +1245,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     {
         return Err(format!("input holds at most {} KiB", INPUT_MAX / 1024));
     }
+    only_with("early", step.early.is_some(), "serial")?;
     only_with("background", step.background.is_some(), "host")?;
     if step.ready.is_some() && !background {
         return Err("ready goes only with host and background = true".into());
@@ -1307,7 +1321,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         if text.is_empty() {
             return Err("serial needs the text to wait for".into());
         }
-        return Ok(Step::Serial(text));
+        return Ok(Step::Serial { text, early: step.early.unwrap_or(false) });
     }
     if let Some(action) = step.power {
         return Ok(Step::Power(action));
@@ -1827,7 +1841,7 @@ expect = "1 received"
         assert_eq!(test.time, Duration::from_secs(180));
         assert!(!test.fresh);
         assert_eq!(test.steps[0], Step::Link(false));
-        assert_eq!(test.steps[1], Step::Serial("link down".into()));
+        assert_eq!(test.steps[1], Step::Serial { text: "link down".into(), early: false });
         assert_eq!(
             test.steps[3],
             Step::Run(Command {
@@ -2551,6 +2565,49 @@ expect = "1 received"
         assert_eq!(test.fit(&machine), Fit::Runs);
         machine.controls.insert(Control::VirtioScsi, Who::None);
         assert_eq!(test.fit(&machine).skip_reason().unwrap(), "the machine has no virtio-scsi");
+    }
+
+    #[test]
+    fn an_early_serial_step_needs_the_console_from_the_power_on() {
+        let dir = TempDir::new("suite-early");
+        dir.write(
+            "boot/early.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nserial = \"GNU GRUB\"\nearly = true\n",
+        );
+        dir.write(
+            "boot/late.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nserial = \"link down\"\n",
+        );
+        let tests = load(dir.path()).unwrap();
+        let (early, late) = (&tests[0], &tests[1]);
+        assert_eq!(early.steps[0], Step::Serial { text: "GNU GRUB".into(), early: true });
+        assert!(early.controls().contains(&Control::EarlyConsole));
+        assert!(!late.controls().contains(&Control::EarlyConsole));
+        // QEMU and AMT have it; a plug machine's netlog console starts with
+        // the network, so the test is skipped there and the other is not.
+        dir.write(
+            "machines/plugbox.toml",
+            "about = \"x\"\ndriver = \"plug\"\n[plug]\nshelly = \"192.168.1.3\"\n\
+             mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n",
+        );
+        let machines = crate::machines::load(&dir.path().join("machines")).unwrap();
+        let plug = machines.iter().find(|machine| machine.name == "plugbox").unwrap();
+        assert_eq!(early.fit(plug), Fit::Lacks(vec![Control::EarlyConsole]));
+        assert_eq!(early.fit(plug).skip_reason().unwrap(), "the machine has no early-console");
+        assert_eq!(late.fit(plug), Fit::Runs);
+        let qemu = machines.iter().find(|machine| machine.name == "qemu").unwrap();
+        assert_eq!(early.fit(qemu), Fit::Runs);
+    }
+
+    #[test]
+    fn early_goes_only_with_serial() {
+        let dir = TempDir::new("suite-early-bad");
+        dir.write(
+            "boot/early.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\nearly = true\n",
+        );
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("early goes only with serial"), "{why}");
     }
 
     #[test]
