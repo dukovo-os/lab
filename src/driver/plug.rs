@@ -88,6 +88,9 @@ pub struct PlugDriver {
     /// waits ([`START_SETTLE`]).
     last_start: Option<Instant>,
     start_settle: Duration,
+    /// When the plug was last switched off: it is switched on again only
+    /// [`CYCLE_OFF`] after.
+    last_stop: Option<Instant>,
 }
 
 impl PlugDriver {
@@ -118,6 +121,7 @@ impl PlugDriver {
             boot: 0,
             power: None,
             last_start: None,
+            last_stop: None,
             start_settle: START_SETTLE,
         };
         driver.note(&format!(
@@ -150,6 +154,20 @@ impl PlugDriver {
             ));
             std::thread::sleep(rest);
         }
+        // A test that pulls the cord and powers the machine on again asks
+        // for both at once; switched on 0.1 s after it went off, the M75q's
+        // supply never let go, and the machine never started again.
+        if let Some(stopped) = self.last_stop
+            && on
+            && stopped.elapsed() < CYCLE_OFF
+        {
+            let rest = CYCLE_OFF - stopped.elapsed();
+            self.note(&format!(
+                "power: waiting {:.1} s after the plug was switched off before switching it on",
+                rest.as_secs_f64()
+            ));
+            std::thread::sleep(rest);
+        }
         let word = |on: bool| if on { "on" } else { "off" };
         match self.plug.set(on) {
             Ok(was_on) => {
@@ -157,6 +175,7 @@ impl PlugDriver {
                 if on {
                     self.last_start = Some(Instant::now());
                 } else {
+                    self.last_stop = Some(Instant::now());
                     self.power = Some((Instant::now(), false));
                 }
                 Ok(())
@@ -204,10 +223,9 @@ impl PlugDriver {
         Ok(())
     }
 
-    /// Cuts the power, waits, and turns it on: a reset.
+    /// Cuts the power and turns it on again, [`CYCLE_OFF`] later: a reset.
     fn cycle(&mut self) -> Result<(), String> {
         self.switch(false)?;
-        std::thread::sleep(CYCLE_OFF);
         self.turn_on()
     }
 
@@ -381,6 +399,10 @@ impl Driver for PlugDriver {
 
     fn grows_root(&self) -> bool {
         self.settings.grow_root
+    }
+
+    fn sets_clock(&self) -> bool {
+        true
     }
 
     /// Writes a line to plug.log, with the seconds since the driver began.
@@ -668,6 +690,17 @@ mod tests {
         let before = sets(&bench.fake).len();
         bench.driver.power(PowerAction::Cut, soon()).unwrap();
         assert_eq!(sets(&bench.fake).len(), before);
+    }
+
+    #[test]
+    fn a_power_on_right_after_a_cut_waits_until_the_plug_has_been_off_long_enough() {
+        let mut bench = bench("plug-cut-on", false);
+        bench.driver.power(PowerAction::On, soon()).unwrap();
+        bench.driver.power(PowerAction::Cut, soon()).unwrap();
+        let cut = Instant::now();
+        bench.driver.power(PowerAction::On, soon()).unwrap();
+        assert!(cut.elapsed() >= CYCLE_OFF, "on after {:?}", cut.elapsed());
+        assert_eq!(sets(&bench.fake)[1..], ["Set on=false", "Set on=true"]);
     }
 
     #[test]

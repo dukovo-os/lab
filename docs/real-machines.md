@@ -146,6 +146,17 @@ false failures. It needs the lab's key and password (`dukovo-lab key`).
 it off. QEMU does not grow: its disk is the image itself, with no room
 after the root.
 
+## The clock is set to the lab PC's
+
+A real machine keeps its real-time clock from one test to the next, and
+the lab network reaches no time server. A test that sets the clock years
+ahead and fails before putting it back would leave every test after it
+a clock past the expiry of the update server's signatures and of the
+lab's certificates. So after each fresh boot, right after the root
+grows, the runner sets the machine's clock to the lab PC's, as root, with
+`timedatectl set-time`; a clock that cannot be set fails the boot. QEMU
+machines start each boot from the lab PC's clock, and are left alone.
+
 ## Safety
 
 - AMT's password stays in its file: it is never written to a log, a

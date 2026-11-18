@@ -628,6 +628,10 @@ impl Driver for AmtDriver {
         self.settings.grow_root
     }
 
+    fn sets_clock(&self) -> bool {
+        true
+    }
+
     /// Writes a line to amt.log, with the seconds since the driver began.
     fn note(&mut self, line: &str) {
         self.netboot.note(line);

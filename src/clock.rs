@@ -37,6 +37,12 @@ impl Utc {
         (year, month, day, in_day / 3600, in_day / 60 % 60, in_day % 60)
     }
 
+    /// As `timedatectl set-time` takes it: `2026-11-07 15:30:12`.
+    pub fn timedatectl(self) -> String {
+        let (year, month, day, hour, minute, second) = self.fields();
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+    }
+
     /// RFC 3339, as `2026-11-07T15:30:12Z`.
     pub fn rfc3339(self) -> String {
         let (year, month, day, hour, minute, second) = self.fields();
@@ -106,6 +112,11 @@ pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn timedatectl_takes_the_date_and_time_with_a_space() {
+        assert_eq!(Utc::from_seconds(1_794_942_612).timedatectl(), "2026-11-17 19:10:12");
+    }
     use super::*;
 
     #[test]
