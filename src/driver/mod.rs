@@ -69,6 +69,16 @@ pub trait Driver: Send {
         false
     }
 
+    /// Whether the runner sets the clock of a fresh boot to the lab PC's
+    /// before the test starts ([`crate::run::SET_CLOCK`]): a real machine
+    /// keeps its real-time clock from one run to the next, and a test that
+    /// set it years ahead and failed before putting it back leaves the
+    /// next tests a clock past every signature's expiry. A QEMU machine's
+    /// clock starts from the lab PC's at each boot.
+    fn sets_clock(&self) -> bool {
+        false
+    }
+
     /// Writes a line to the driver's own log, when it keeps one.
     fn note(&mut self, _line: &str) {}
 

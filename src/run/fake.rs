@@ -49,6 +49,9 @@ struct FakeMachine {
     /// `grows-badly` do, and the second's `storage grow` fails.
     grows_root: bool,
     grow_fails: bool,
+    /// Whether it asks for its clock to be set after a fresh boot, as a
+    /// real machine's driver does; the machine named `clocked` does.
+    sets_clock: bool,
 }
 
 /// The characters the fake console draws, in the test font.
@@ -176,6 +179,10 @@ impl Driver for FakeMachine {
 
     fn grows_root(&self) -> bool {
         self.grows_root
+    }
+
+    fn sets_clock(&self) -> bool {
+        self.sets_clock
     }
 
     /// Keeps the driver's lines in a log of its own, as a real driver's.
@@ -316,6 +323,11 @@ impl Driver for FakeMachine {
             cmd if cmd.starts_with("elevate -S sh -c 'part=") => match (input, self.grow_fails) {
                 (Some("sesame\n"), false) => (Some(0), "storage: grown\n".into()),
                 (Some("sesame\n"), true) => (Some(1), "storage: no room after the root\n".into()),
+                _ => (Some(1), "elevate: a password is needed\n".into()),
+            },
+            // The clock set to the lab PC's, as root.
+            cmd if cmd.starts_with("elevate -S timedatectl set-time '") => match input {
+                Some("sesame\n") => (Some(0), String::new()),
                 _ => (Some(1), "elevate: a password is needed\n".into()),
             },
             // As Dukovo's elevate -S: the password is a line of the input.
@@ -478,6 +490,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         real: machine.name == "real",
         grows_root: machine.name.starts_with("grows"),
         grow_fails: machine.name == "grows-badly",
+        sets_clock: machine.name == "clocked",
     }))
 }
 
@@ -1655,6 +1668,29 @@ fn a_real_machine_s_root_grows_after_a_fresh_boot_and_before_the_test() {
     assert!(grown.contains("storage: grown"), "{grown}");
     assert!(!grown.contains("sesame"), "{grown}");
     assert!(!driver_log("qemu").contains("storage"));
+}
+
+#[test]
+fn a_real_machine_s_clock_is_set_to_the_lab_pc_s_after_a_fresh_boot() {
+    let setting = setting_with(&[(
+        "features/uname.toml",
+        "about = \"uname\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    )]);
+    let mut clocked = setting.qemu.clone();
+    clocked.name = "clocked".into();
+    let before = crate::clock::Utc::now().timedatectl();
+    let (done, _) = run_with_password(&setting, vec![&clocked, &setting.qemu]);
+    assert_eq!(done.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
+    let log = fs::read_to_string(done.bundle.join("logs/clocked/driver.log")).unwrap();
+    let lines: Vec<&str> = log.lines().filter(|line| line.starts_with("ran ")).collect();
+    assert_eq!(lines.len(), 3, "{log}");
+    assert_eq!(lines[0], "ran true");
+    // The lab PC's time, to the minute: the run takes less than one.
+    let set = lines[1].strip_prefix("ran elevate -S timedatectl set-time '").unwrap();
+    assert_eq!(set[..16], before[..16], "{log}");
+    assert_eq!(lines[2], "ran uname");
+    let qemu = fs::read_to_string(done.bundle.join("logs/qemu/driver.log")).unwrap();
+    assert!(!qemu.contains("timedatectl"), "{qemu}");
 }
 
 #[test]

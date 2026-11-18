@@ -78,6 +78,12 @@ pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no passwo
 /// `storage grow` does nothing when the root already fills the disk.
 pub const GROW_ROOT: &str = "sh -c 'part=$(sed -n \"s/^disk //p\" /system/live/spark/root); case \"$part\" in *[0-9]p[0-9]*) disk=${part%p*};; *) disk=$(echo \"$part\" | sed \"s/[0-9]*$//\");; esac; storage grow \"$disk\"'";
 
+/// The command, given the lab PC's time in UTC, that sets a real machine's
+/// clock after a fresh boot ([`crate::driver::Driver::sets_clock`]). The
+/// lab network reaches no time server, so the machine's clock is whatever
+/// its real-time clock kept from the last test.
+pub const SET_CLOCK: &str = "timedatectl set-time";
+
 /// Why a `bench` step cannot run.
 pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given no Linux kit: `ob lab` builds one and passes it with --linux";
 
@@ -855,6 +861,7 @@ impl<'a> Worker<'a> {
         self.log.push(format!("Boot {}: serial log {}", self.boot, self.relative_serial()));
         let note = self.wait_ready(deadline)?;
         let grown = self.grow_root(deadline)?;
+        self.set_clock(deadline)?;
         // The test that boots sees its whole boot: its serial steps may
         // check what came before the ready line.
         self.serial.rewind();
@@ -896,6 +903,33 @@ impl<'a> Worker<'a> {
             ))),
             None => Err(StepFailure::Error(
                 "the root was not grown to the end of the disk before the time limit".into(),
+            )),
+        }
+    }
+
+    /// Sets a real machine's clock to the lab PC's, as root, after a fresh
+    /// boot (see [`SET_CLOCK`]), on the same terms as [`Worker::grow_root`].
+    /// A clock that cannot be set is an error: the tests after it would
+    /// fail on certificates and signatures for the lab's sake.
+    fn set_clock(&mut self, deadline: Instant) -> Result<(), StepFailure> {
+        if !self.driver.sets_clock()
+            || self.machine.who(Control::Ssh) != Who::Driver
+            || !self.has_key
+            || self.shared.password.is_none()
+        {
+            return Ok(());
+        }
+        let command = format!("{SET_CLOCK} '{}'", crate::clock::Utc::now().timedatectl());
+        let (output, shown) = self.execute(&command, true, None, deadline)?;
+        self.driver.note(&format!("set clock: {shown}"));
+        match output.status {
+            Some(0) => Ok(()),
+            Some(status) => Err(StepFailure::Error(format!(
+                "the machine's clock could not be set to the lab PC's (exit status {status}): {}",
+                output.text.trim()
+            ))),
+            None => Err(StepFailure::Error(
+                "the machine's clock was not set before the time limit".into(),
             )),
         }
     }
