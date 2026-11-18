@@ -33,6 +33,12 @@ pub enum Control {
     Cord,
     /// Reading the serial console.
     Serial,
+    /// The machine's console from the moment it powers on: the firmware's,
+    /// GRUB's and the kernel's first and last lines, as a serial cable
+    /// gives. A console that starts with the network (netlog) has none of
+    /// them.
+    #[serde(rename = "early-console")]
+    EarlyConsole,
     /// Plugging and pulling the network cable.
     Link,
     /// Plugging and pulling a USB stick.
@@ -90,10 +96,11 @@ pub enum Control {
 
 impl Control {
     /// Every control, in the order lists show them.
-    pub const ALL: [Control; 21] = [
+    pub const ALL: [Control; 22] = [
         Control::Power,
         Control::Cord,
         Control::Serial,
+        Control::EarlyConsole,
         Control::Link,
         Control::Usb,
         Control::Card,
@@ -120,6 +127,7 @@ impl Control {
             Control::Power => "power",
             Control::Cord => "cord",
             Control::Serial => "serial",
+            Control::EarlyConsole => "early-console",
             Control::Link => "link",
             Control::Usb => "usb",
             Control::Card => "card",
@@ -316,6 +324,10 @@ pub struct AmtSettings {
     /// twin: `console=` gets this.
     #[serde(default = "default_console")]
     pub console: String,
+    /// Whether a fresh boot's root is grown to the end of the disk before
+    /// the test starts (see [`GROW_ROOT`](crate::run::GROW_ROOT)).
+    #[serde(default = "default_grow_root")]
+    pub grow_root: bool,
 }
 
 fn default_amt_user() -> String {
@@ -385,8 +397,15 @@ pub struct PlugSettings {
     /// is on with the machine drawing less means the machine shut down.
     #[serde(default = "default_on_watts")]
     pub on_watts: f64,
+    /// Whether a fresh boot's root is grown to the end of the disk before
+    /// the test starts (see [`GROW_ROOT`](crate::run::GROW_ROOT)).
+    #[serde(default = "default_grow_root")]
+    pub grow_root: bool,
 }
 
+fn default_grow_root() -> bool {
+    true
+}
 fn default_netlog_port() -> u16 {
     6666
 }
@@ -455,13 +474,15 @@ fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
             .collect(),
         // AMT does power and the power cut (its hard off, which the system
         // gets no warning of), and its remote screen the keys, mouse and
-        // screen; the serial cable does the console, the lab network SSH
-        // and the lab PC's side, and net boot the Linux twin. Cables,
-        // sticks, cards and discs are a person's to handle.
+        // screen; the serial cable does the console, from the firmware's
+        // first line to the system's last; the lab network does SSH and
+        // the lab PC's side, and net boot the Linux twin. Cables, sticks,
+        // cards and discs are a person's to handle.
         DriverKind::Amt => [
             Control::Power,
             Control::Cord,
             Control::Serial,
+            Control::EarlyConsole,
             Control::Keys,
             Control::Mouse,
             Control::Screen,
@@ -568,6 +589,13 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         if control == Control::Amt && who == Who::Person {
             return Err(bad(
                 "amt is \"driver\" or \"none\": a person cannot stand in for AMT".into()
+            ));
+        }
+        // Reading the console from the power-on is a cable's or nothing:
+        // no one at the machine can read what the firmware printed.
+        if control == Control::EarlyConsole && who == Who::Person {
+            return Err(bad(
+                "early-console is \"driver\" or \"none\": a person cannot read the console from the power-on".into(),
             ));
         }
         if matches!(control, Control::GuestAgent | Control::VirtioScsi) && who == Who::Person {
@@ -906,6 +934,78 @@ mod tests {
         assert_eq!(plug.machine_address, "10.77.0.2");
         assert_eq!(plug.lab_address, "10.77.0.1");
         assert_eq!(plug.tftp, Path::new("/srv/dukovo-lab/tftp"));
+    }
+
+    #[test]
+    fn real_machines_grow_their_root_unless_the_file_says_not() {
+        let dir = TempDir::new("machines-grow-root");
+        let plug = "driver = \"plug\"\n[plug]\nshelly = \"192.168.1.3\"\n\
+                    mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n";
+        let amt = "driver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\npassword_file = \"p\"\n\
+                   mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nserial = \"/dev/ttyUSB0\"\n";
+        for (name, settings) in [("plug", plug), ("amt", amt)] {
+            dir.write(&format!("{name}-default.toml"), &format!("about = \"x\"\n{settings}"));
+            dir.write(
+                &format!("{name}-off.toml"),
+                &format!("about = \"x\"\n{settings}grow_root = false\n"),
+            );
+        }
+        let machines = load(dir.path()).unwrap();
+        let grows = |name: &str| {
+            let machine = machines.iter().find(|machine| machine.name == name).unwrap();
+            match (&machine.plug, &machine.amt) {
+                (Some(plug), _) => plug.grow_root,
+                (_, Some(amt)) => amt.grow_root,
+                _ => unreachable!("{name} is a real machine"),
+            }
+        };
+        assert!(grows("plug-default") && grows("amt-default"));
+        assert!(!grows("plug-off") && !grows("amt-off"));
+    }
+
+    #[test]
+    fn the_console_from_the_power_on_is_amt_s_and_qemu_s_alone() {
+        let dir = TempDir::new("machines-early-console");
+        dir.write(
+            "plugbox.toml",
+            "about = \"x\"\ndriver = \"plug\"\n[plug]\nshelly = \"192.168.1.3\"\n\
+             mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n",
+        );
+        dir.write(
+            "amtbox.toml",
+            "about = \"x\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\n\
+             password_file = \"p\"\nmac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n\
+             serial = \"/dev/ttyUSB0\"\n",
+        );
+        let machines = load(dir.path()).unwrap();
+        let who = |name: &str| {
+            machines.iter().find(|machine| machine.name == name).unwrap().who(Control::EarlyConsole)
+        };
+        assert_eq!(who("qemu"), Who::Driver);
+        assert_eq!(who("amtbox"), Who::Driver);
+        assert_eq!(who("plugbox"), Who::None);
+        assert_eq!(Control::EarlyConsole.name(), "early-console");
+        // A machine file names it with the same spelling.
+        dir.write(
+            "amtbox.toml",
+            "about = \"x\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\n\
+             password_file = \"p\"\nmac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n\
+             serial = \"/dev/ttyUSB0\"\n[controls]\nearly-console = \"none\"\n",
+        );
+        let machines = load(dir.path()).unwrap();
+        let amt = machines.iter().find(|machine| machine.name == "amtbox").unwrap();
+        assert_eq!(amt.who(Control::EarlyConsole), Who::None);
+        // A person cannot read what the firmware printed.
+        dir.write(
+            "amtbox.toml",
+            "about = \"x\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\n\
+             password_file = \"p\"\nmac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n\
+             serial = \"/dev/ttyUSB0\"\n[controls]\nearly-console = \"person\"\n",
+        );
+        let Err(Error::Usage(message)) = load(dir.path()) else {
+            panic!("a person cannot do early-console");
+        };
+        assert!(message.contains("early-console is \"driver\" or \"none\""), "{message}");
     }
 
     #[test]

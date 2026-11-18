@@ -44,6 +44,11 @@ struct FakeMachine {
     /// Whether its Linux twin is the machine itself, as a real machine's
     /// is; the machine named `real`'s is.
     real: bool,
+    /// Whether it asks for its root to be grown after a fresh boot, as a
+    /// real machine's driver does; the machines named `grows` and
+    /// `grows-badly` do, and the second's `storage grow` fails.
+    grows_root: bool,
+    grow_fails: bool,
 }
 
 /// The characters the fake console draws, in the test font.
@@ -169,6 +174,18 @@ impl Driver for FakeMachine {
         self.on
     }
 
+    fn grows_root(&self) -> bool {
+        self.grows_root
+    }
+
+    /// Keeps the driver's lines in a log of its own, as a real driver's.
+    fn note(&mut self, line: &str) {
+        fs::create_dir_all(&self.logs).unwrap();
+        let path = self.logs.join("driver.log");
+        let mut log = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        writeln!(log, "{line}").unwrap();
+    }
+
     fn serial_log(&self) -> &Path {
         &self.serial
     }
@@ -292,7 +309,15 @@ impl Driver for FakeMachine {
         input: Option<&str>,
         deadline: Instant,
     ) -> Result<Output, String> {
+        self.note(&format!("ran {command}"));
         let (status, text) = match command {
+            // The root's growth, as root: `storage grow` fails on a disk
+            // with no room.
+            cmd if cmd.starts_with("elevate -S sh -c 'part=") => match (input, self.grow_fails) {
+                (Some("sesame\n"), false) => (Some(0), "storage: grown\n".into()),
+                (Some("sesame\n"), true) => (Some(1), "storage: no room after the root\n".into()),
+                _ => (Some(1), "elevate: a password is needed\n".into()),
+            },
             // As Dukovo's elevate -S: the password is a line of the input.
             // This one says it back, as a careless command might.
             "elevate -S id" => match input {
@@ -451,6 +476,8 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         floppy_drive: false,
         attacker_on: false,
         real: machine.name == "real",
+        grows_root: machine.name.starts_with("grows"),
+        grow_fails: machine.name == "grows-badly",
     }))
 }
 
@@ -1600,4 +1627,92 @@ fn a_run_step_may_not_name_the_lab_pc_s_own_places() {
         let err = format!("{:?}", crate::suite::load(&dir.path().join("tests")).unwrap_err());
         assert!(err.contains(wrong), "{step}: {err}");
     }
+}
+
+#[test]
+fn a_real_machine_s_root_grows_after_a_fresh_boot_and_before_the_test() {
+    let setting = setting_with(&[(
+        "features/uname.toml",
+        "about = \"uname\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    )]);
+    let mut grows = setting.qemu.clone();
+    grows.name = "grows".into();
+    // A machine whose driver does not grow the root (QEMU's, or a real
+    // machine file with grow_root = false) never gets the command.
+    let (done, results) = run_with_password(&setting, vec![&grows, &setting.qemu]);
+    assert_eq!(done.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
+    assert_eq!(results.len(), 2);
+    let driver_log = |machine: &str| {
+        fs::read_to_string(done.bundle.join(format!("logs/{machine}/driver.log"))).unwrap()
+    };
+    let grown = driver_log("grows");
+    let lines: Vec<&str> = grown.lines().filter(|line| line.starts_with("ran ")).collect();
+    assert_eq!(lines.len(), 3, "{grown}");
+    assert_eq!(lines[0], "ran true");
+    assert_eq!(lines[1], format!("ran elevate -S {GROW_ROOT}"));
+    assert_eq!(lines[2], "ran uname");
+    assert!(grown.contains("grow root: # sh -c 'part="), "{grown}");
+    assert!(grown.contains("storage: grown"), "{grown}");
+    assert!(!grown.contains("sesame"), "{grown}");
+    assert!(!driver_log("qemu").contains("storage"));
+}
+
+#[test]
+fn a_root_that_does_not_grow_fails_the_fresh_boot_with_the_command_s_output() {
+    let setting = setting_with(&[(
+        "features/uname.toml",
+        "about = \"uname\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    )]);
+    let mut grows = setting.qemu.clone();
+    grows.name = "grows-badly".into();
+    let (done, results) = run_with_password(&setting, vec![&grows]);
+    assert_eq!(done.summary, Summary { passed: 0, failed: 0, skipped: 0, errors: 1 });
+    let why = results[0].reason.clone().unwrap();
+    assert!(why.contains("could not be grown"), "{why}");
+    assert!(why.contains("storage: no room after the root"), "{why}");
+    // The test's own step never ran.
+    let log = fs::read_to_string(done.bundle.join("logs/grows-badly/driver.log")).unwrap();
+    assert!(!log.contains("ran uname"), "{log}");
+}
+
+#[test]
+fn growing_the_root_needs_the_lab_password() {
+    let setting = setting_with(&[(
+        "features/uname.toml",
+        "about = \"uname\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    )]);
+    let mut grows = setting.qemu.clone();
+    grows.name = "grows".into();
+    let (done, results) = run_on(&setting, vec![&grows]);
+    assert_eq!(done.summary, Summary { passed: 0, failed: 0, skipped: 0, errors: 1 });
+    let why = results[0].reason.clone().unwrap();
+    assert!(why.contains("growing the root needs the lab's password"), "{why}");
+}
+
+/// A run with the lab password, which a root step gives `elevate`.
+fn run_with_password(setting: &Setting, machines: Vec<&Machine>) -> (Done, Vec<ResultRecord>) {
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines,
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        with_person: false,
+        linux: None,
+        fonts: None,
+        browsers: None,
+        stick: None,
+        dvd: None,
+        ob: None,
+        preset: None,
+        schedule: None,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    (Done { summary: ended.summary, bundle }, results.results)
 }

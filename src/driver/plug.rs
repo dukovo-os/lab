@@ -130,11 +130,6 @@ impl PlugDriver {
         Ok(driver)
     }
 
-    /// Writes a line to plug.log, with the seconds since the driver began.
-    fn note(&mut self, line: &str) {
-        self.netboot.note(line);
-    }
-
     /// Whether a reading of the plug is a machine that runs.
     fn runs(&self, status: PlugStatus) -> bool {
         status.output && status.watts >= self.settings.on_watts
@@ -384,6 +379,15 @@ impl Driver for PlugDriver {
         }
     }
 
+    fn grows_root(&self) -> bool {
+        self.settings.grow_root
+    }
+
+    /// Writes a line to plug.log, with the seconds since the driver began.
+    fn note(&mut self, line: &str) {
+        self.netboot.note(line);
+    }
+
     fn serial_log(&self) -> &Path {
         &self.console_log
     }
@@ -556,6 +560,7 @@ mod tests {
             writer: dir.path().join("writer"),
             netlog_port,
             on_watts: 5.0,
+            grow_root: true,
         };
         let setup = Setup {
             image: make_image(&dir, 400_000),
@@ -596,6 +601,7 @@ mod tests {
     fn a_fresh_boot_writes_the_image_by_cycling_the_power() {
         let mut bench = bench("plug-fresh", false);
         bench.driver.boot_fresh().unwrap();
+        assert!(bench.driver.grows_root());
         let serial = bench.driver.serial_log().to_path_buf();
         assert!(serial.ends_with("logs/serial-1.log"));
         assert!(wait_for(&serial, "[    1.000000] Boot complete."));

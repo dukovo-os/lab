@@ -106,6 +106,7 @@ and needs the lab card's address.
 | `power = "cut"` (`cord`) | AMT's hard off: the system gets no warning, as when the cord is pulled. |
 | `power = "button"` and `"off"` | AMT asks the system to shut down, as the power button does. AMT does this only when the system answers it, which Dukovo does not yet, so these steps fail here; `machines check` says so. |
 | `serial` | The serial cable: each boot's console is `logs/<machine>/serial-<n>.log`. |
+| `early-console` | The same cable: it carries the firmware's and GRUB's lines and the system's last lines before a power-off, which a `serial` step with `early = true` waits for. |
 | `ssh` | The machine's own address on the lab network. |
 | `peer` | The lab PC is `{peer}` (`10.77.0.1`) and the machine `{machine}` (`10.77.0.2`); the machine's ports are reached as they are. |
 | `amt` | `{amt}` is AMT's own address (`10.77.0.10`), for a test that checks AMT keeps answering while the system runs. |
@@ -126,6 +127,25 @@ you steps, with those controls set to `person` in the machine file.
 Booting the install stick or DVD, and the attacker, are not done on
 real machines yet; tests that need them are skipped there.
 
+## The root grows to the disk's end
+
+The image the lab writes has a 512 MiB root with about 285 MB free
+after a boot, and leaves the rest of the disk empty. That is too little
+for a PHP or PostgreSQL bundle or a website, which fill it and fail with
+`ENOSPC`, so after each fresh boot, once the machine is ready and SSH
+answers, and before the test's first step, the runner grows the root to
+the disk's end with Dukovo's own `storage grow`, as root over SSH, as a
+`root = true` step runs. It finds the root's disk from
+`/system/live/spark/root`, and does nothing when the root already fills
+the disk. The command and what it printed are in the driver's log
+(`amt.log`, `plug.log`) and the test's log. When it fails, the fresh
+boot fails with its output: a lab whose roots do not grow gives tests
+false failures. It needs the lab's key and password (`dukovo-lab key`).
+
+`grow_root = false` under `[amt]` or `[plug]` in the machine file turns
+it off. QEMU does not grow: its disk is the image itself, with no room
+after the root.
+
 ## Safety
 
 - AMT's password stays in its file: it is never written to a log, a
@@ -141,8 +161,8 @@ real machines yet; tests that need them are skipped there.
 ## When something goes wrong
 
 - `logs/<machine>/amt.log` in the run's bundle says what the driver did:
-  each power change, each net boot, each request the writer made, and
-  each remote screen session.
+  each power change, each net boot, each request the writer made, each
+  remote screen session, and what growing the root printed.
 - `logs/<machine>/writer-<n>.log` is the writer's console for boot `n`.
   When it and `serial-<n>.log` stay empty while `amt.log` shows the
   writer at work, the machine file's `console` names another port than
@@ -234,7 +254,7 @@ written before that.
 | `power = "button"` and `"off"` | Not available: a plug cannot ask the system to shut down, so these steps fail here, as on an AMT machine that does not answer; `machines check` says so. |
 | `serial` | The netlog: each boot's console is `logs/<machine>/serial-<n>.log`, one line to a record, as a serial log reads. |
 | `ssh`, `peer` | As for AMT: the machine's address and the lab PC's on the lab network. |
-| `keys`, `mouse`, `screen`, `linux` | `none`: tests that need them are skipped. |
+| `early-console`, `keys`, `mouse`, `screen`, `linux` | `none`: tests that need them are skipped. A `serial` step with `early = true` needs `early-console`: the netlog starts once the network is up and stops when it goes down, so it shows neither the firmware's and GRUB's lines nor the system's last lines before a power-off. |
 
 The lab listens for one machine's netlog on one UDP port, so a run drives
 one plug machine at a time. A second one needs its own `machine_address`,

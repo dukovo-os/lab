@@ -45,7 +45,11 @@ one for a real machine on a Shelly smart plug (see
 ## Controls
 
 A control is a way the lab acts on a machine: `power`, `cord` (pulling
-the power cord), `serial`, `link` (the network cable), `usb` (a USB
+the power cord), `serial`, `early-console` (the console from the moment
+the machine powers on: the firmware's, GRUB's and the kernel's first and
+last lines, as a serial cable gives; a console that starts with the
+network, as netlog does, has none of them), `link` (the network cable),
+`usb` (a USB
 stick), `card` (a memory card in a card reader), `sd` (a memory card in
 the machine's own SD card slot), `disc` (a disc in an
 optical drive), `burner` (a blank disc in an optical drive that writes
@@ -72,10 +76,11 @@ adapter). Each is done by one of:
 
 A machine starts with every control its driver can do (QEMU can do all
 of them) set to `driver`. `[controls]` can hand one to a person or take
-it away, but cannot make a driver do what it cannot. `linux`, `attack`,
-`peer`, `amt`, `guest-agent` and `virtio-scsi` are `driver` or `none`: a
-person cannot measure Linux, run the attacker, stand in for the lab PC's
-side or for AMT, or add a virtual machine's devices.
+it away, but cannot make a driver do what it cannot. `early-console`,
+`linux`, `attack`, `peer`, `amt`, `guest-agent` and `virtio-scsi` are
+`driver` or `none`: a person cannot read the console from the power-on,
+measure Linux, run the attacker, stand in for the lab PC's side or for
+AMT, or add a virtual machine's devices.
 
 So one test file serves every machine: plugging in a USB stick is
 automatic on QEMU, a Needs you step on a real machine.
@@ -85,8 +90,8 @@ What each driver does by itself:
 | Driver | Controls |
 | --- | --- |
 | `qemu` | All of them but `amt`. |
-| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial`, `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
-| `plug` | `power` (the plug switches the machine on, and a reset is the plug off and on again; the power button and a graceful `off` are not available), `cord` (the plug off: a hard power loss the system gets no warning of), `serial` (the console over netlog), `ssh` and `peer`. `keys`, `mouse`, `screen`, `linux` and `amt` are `none`. Cables, sticks, cards and discs can be handed to a person. |
+| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial` and `early-console` (the serial cable, which carries the firmware's and GRUB's lines too), `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
+| `plug` | `power` (the plug switches the machine on, and a reset is the plug off and on again; the power button and a graceful `off` are not available), `cord` (the plug off: a hard power loss the system gets no warning of), `serial` (the console over netlog, which starts once the network is up and stops when it goes down), `ssh` and `peer`. `early-console`, `keys`, `mouse`, `screen`, `linux` and `amt` are `none`. Cables, sticks, cards and discs can be handed to a person. |
 
 ## QEMU hardware
 
@@ -125,6 +130,7 @@ lab network. [Real machines](real-machines.md) sets one up.
 | `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
 | `console` | `ttyS0,115200` | The machine's serial port as Linux names it, for the writer and the Linux twin. A board's own ports are `ttyS0` to `ttyS3`; PCI ports come after, from `ttyS4`, and with Serial-over-LAN on, AMT's own port is the first of them, so a serial card's first port is then `ttyS5`. |
+| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. QEMU has no such setting: its disk is the image itself, with no room after the root. |
 
 ## Plug settings
 
@@ -146,3 +152,4 @@ sets one up.
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
 | `netlog_port` | `6666` | The UDP port the lab PC listens on for the machine's netlog. The lab image sends to 6666, so change this only with the image. A run listens on one port, so only one plug machine runs at a time. |
 | `on_watts` | `5.0` | The least the machine draws while it runs, in watts. A plug that is on with the machine drawing less means the machine shut itself down. |
+| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. QEMU has no such setting: its disk is the image itself, with no room after the root. |
