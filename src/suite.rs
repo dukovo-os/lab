@@ -577,7 +577,7 @@ impl Step {
                 format!("plug in a USB stick holding {name}")
             }
             Step::PlugUsb(Stick::Blank(bytes)) => {
-                format!("plug in a blank USB stick of {}", format_size(*bytes))
+                format!("plug in a blank USB stick of {} or more", format_size(*bytes))
             }
             Step::UnplugUsb => "pull the USB stick".into(),
             Step::InsertCard(reader, Stick::Image(image)) => {
@@ -2020,7 +2020,7 @@ expect = "1 received"
         assert_eq!(tests[0].steps[0], Step::PlugUsb(Stick::Image(image)));
         assert_eq!(tests[0].steps[1], Step::UnplugUsb);
         assert_eq!(tests[0].steps[2], Step::PlugUsb(Stick::Blank(64 << 20)));
-        assert_eq!(tests[0].steps[2].describe(), "plug in a blank USB stick of 64M");
+        assert_eq!(tests[0].steps[2].describe(), "plug in a blank USB stick of 64M or more");
         assert_eq!(parse_size("2G"), Some(2 << 30));
         for size in ["64", "64K", "0M", "8G", "-1M", "M"] {
             dir.write(
