@@ -69,9 +69,12 @@ object as in `list`, less `last_milliseconds`.
 dukovo-lab machines
 ```
 
-Each machine, its file and who does each control. With `--json`:
-`{"machines": [{"name", "about", "file", "driver", "ready", "controls":
-{"power": "driver", ...}, "qemu": {...}, "amt": {...}, "plug": {...}}]}`.
+Each machine, its file and who does each control, and its pool if it has
+one (`pool: optiplex`, with `a spare a run on the pool leaves out` for a
+spare; see [Machine files](machine-files.md#pools)). With `--json`:
+`{"machines": [{"name", "about", "file", "driver", "ready", "pool", "spare",
+"controls": {"power": "driver", ...}, "qemu": {...}, "amt": {...},
+"plug": {...}}]}`; `pool` and `spare` are left out when there is none.
 
 ## machines check
 
@@ -108,6 +111,33 @@ side, and writes a results bundle (below). Tests are named by id
 (`network/link-pull`) or by category (`network`); each runs once, in the
 order given. `--preset` runs a preset's tests instead. Tests a machine
 cannot run are skipped there with the reason.
+
+`--machine` takes machine names and pools, separated by commas. A machine
+named on its own runs every test. A pool is written `pool:` and its name,
+such as `--machine qemu,pool:optiplex`: the pool's machines, but its
+spares (`spare = true`, see [Machine files](machine-files.md#pools)),
+share the pool's tests out. A machine cannot be named both on its own and
+as a member of a picked pool, and a pool is picked once.
+
+A pool has one queue of tests. Each of its machines takes the next test
+when it is free, longest first by how long the test took last time on the
+pool's machines, or by its time limit when it has not run there before, so
+that no machine is left with a long test at the end. Each test runs once,
+on one machine: `results` and the bundle say which (`machine`), and a test
+that shares a boot does so with the test before it on that machine, as
+anywhere. A test the pool's machines cannot run (they lack a control it
+needs, or it needs a person and `--with-person` is not given) is skipped
+once for the pool, with `pool:<name>` as its machine.
+
+A machine of a pool that will not start, or that is benched by its health
+check, takes no more tests, and the rest of the pool carries on with the
+queue. A `machine-out` event says so, with the reason. Only when every
+machine of the pool is out are its remaining tests skipped, each with
+`no machine of pool:<name> was left to run this test:` and why each
+machine left. The same holds for a test taken by a machine that was then
+benched: it is an `error` as on any machine, and is not run again. run.json
+lists each pool and its members (`pools`), and its machines are every
+machine that took part.
 
 A Needs you test (one with a control a person does on that machine) is
 skipped unless `--with-person` is given. With it, each step a person
@@ -188,6 +218,7 @@ its time in `at`:
 {"event":"test-started","machine":"qemu","test":"boot/reaches-ready","at":"..."}
 {"event":"step-ended","machine":"qemu","test":"boot/reaches-ready","step":"run `whoami`, exit status 0, output has \"lab\"","result":"pass","milliseconds":800,"note":"$ whoami\nlab","lab_pc_load":0.31,"at":"..."}
 {"event":"person-needed","machine":"optiplex","test":"network/cable-pull","step":"pull the network cable","done":"dukovo-lab done 20261107-153012-4f2a --machine optiplex","at":"..."}
+{"event":"machine-out","machine":"optiplex-3","reason":"optiplex-3 was benched: its health check failed twice (...)","at":"..."}
 {"event":"test-ended","machine":"qemu","test":"boot/reaches-ready","result":"pass","reason":null,"milliseconds":41000,"boot":1,"log":"logs/qemu/boot-reaches-ready.log","screenshots":[],"at":"..."}
 {"event":"run-ended","id":"20261107-153012-4f2a","bundle":"...","summary":{"passed":1,"failed":0,"skipped":0,"errors":0},"stopped":false,"findings":[],"at":"..."}
 ```
@@ -213,7 +244,9 @@ Some reasons are worth knowing:
   nothing about Dukovo. The reason names the check and what to do.
 - `<machine> was benched: its health check failed twice (...)` is a
   `skip`: the machine failed two fresh boots' health checks in a row, and
-  its remaining tests are not run. The other machines carry on. See
+  its remaining tests are not run. The other machines carry on, and the
+  tests a pool's benched machine did not take are taken by the rest of the
+  pool. See
   [Real machines](real-machines.md#the-health-check). More kinds of event may be
 added, so skip the ones you do not know. The same lines go to
 `events.jsonl` in the bundle, with or without `--json`.
@@ -252,7 +285,9 @@ answers. With `--json`:
  "left_seconds": 2460, "recent": [<the last 40 events>], "output": null}
 ```
 
-A test's `state` is `queued`, `running`, or its result. `left_seconds`
+A test's `state` is `queued`, `running`, or its result. A test of a pool
+that no machine has taken yet is `queued` with `pool:<name>` as its
+machine, and moves to the machine that takes it. `left_seconds`
 is an estimate from how long the same tests took on the same machines
 the last time they ran to their end, and is null when any of them has
 not run there. `output` holds a dead detached run's last messages of its
@@ -440,7 +475,7 @@ elevate ([test files](test-files.md#running-as-root)). With `--json`:
 | 1 | A test failed. |
 | 2 | A bad argument, test file or machine file; nothing ran. |
 | 3 | The harness or a machine broke, so some results say nothing about Dukovo. |
-| 4 | A machine the run needs is busy with another run; nothing ran. |
+| 4 | A machine the run needs, a pool's machines included, is busy with another run; nothing ran. |
 
 With `--json`, statuses 2, 3 and 4 also print `{"error": "<what>", "status": <n>}`.
 

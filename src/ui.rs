@@ -42,7 +42,7 @@ use std::time::SystemTime;
 use serde_json::{Value, json};
 
 use crate::http::{Request, Response, read_request, write_response};
-use crate::machines::is_plain_name;
+use crate::machines::{is_machine_ref, is_plain_name};
 use crate::{Arguments, Error, findings, send, store};
 
 /// The port `ui` listens on unless told otherwise.
@@ -400,7 +400,7 @@ impl Page {
             args.extend(tests);
         }
         let machines = strings("machines").unwrap_or_default();
-        if machines.is_empty() || !machines.iter().all(|machine| is_plain_name(machine)) {
+        if machines.is_empty() || !machines.iter().all(|machine| is_machine_ref(machine)) {
             return bad("pick machines to run on");
         }
         args.extend(["--machine".into(), machines.join(",")]);
@@ -523,7 +523,7 @@ impl Page {
             args.extend(tests);
         }
         let machines = strings("machines");
-        if machines.is_empty() || !machines.iter().all(|machine| is_plain_name(machine)) {
+        if machines.is_empty() || !machines.iter().all(|machine| is_machine_ref(machine)) {
             return bad("pick the machines the schedule runs on");
         }
         args.extend(["--machine".into(), machines.join(",")]);

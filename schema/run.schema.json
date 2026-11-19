@@ -31,6 +31,19 @@
         }
       }
     },
+    "pools": {
+      "description": "The pools the run shared its tests out among, each test of a pool running once on one of its members; left out when there were none. The members are also in machines.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "members"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "members": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
     "tests": { "description": "Test ids, in the order they ran.", "type": "array", "items": { "type": "string" } },
     "preset": { "description": "The preset the tests came from, if they did.", "type": ["string", "null"] },
     "schedule": { "description": "The schedule that started the run, if one did; left out otherwise.", "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },

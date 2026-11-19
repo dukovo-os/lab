@@ -9,6 +9,10 @@
 
 about = "Dell OptiPlex 7040 SFF, Core i5-6500, Intel AMT"
 driver = "amt"
+# Machines of one pool are interchangeable: the same hardware and controls.
+# `run --machine pool:optiplex` shares the tests out among them. Add
+# spare = true to keep a machine out of such a run.
+pool = "optiplex"
 
 [amt]
 # AMT's address, set in MEBx (Ctrl+P as the machine starts).

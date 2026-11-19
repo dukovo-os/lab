@@ -52,6 +52,7 @@ mod zone;
 #[cfg(test)]
 mod testing;
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -131,7 +132,9 @@ Options for run:
   --ob <file>      Dukovo's ob, whose `ob disc-drive` holds a music CD in a
                    QEMU machine's emulated USB CD drive (`ob lab` gives its
                    own)
-  --machine <a,b>  The machines to run on (default: qemu)
+  --machine <a,b>  The machines to run on (default: qemu). Each runs every
+                   test; pool:<name> is a pool of machines that share the
+                   tests out among them, such as qemu,pool:optiplex
   --build <text>   The build's name for the bundle, such as \"0.13.0 fd2a9e8\"
   --all            Every test
   --preset <name>  The tests of a preset in presets.toml
@@ -580,6 +583,10 @@ fn list_machines(arguments: &Arguments) -> Result<u8, Error> {
         let file =
             machine.file.as_ref().map_or("built in".into(), |file| file.display().to_string());
         println!("{}: {} ({file})", machine.name, machine.about);
+        if let Some(pool) = &machine.pool {
+            let spare = if machine.spare { ", a spare a run on the pool leaves out" } else { "" };
+            println!("  pool: {pool}{spare}");
+        }
         for who in [machines::Who::Driver, machines::Who::Person, machines::Who::None] {
             let controls: Vec<&str> = machine
                 .controls
@@ -681,7 +688,8 @@ fn print_checks(checks: &[driver::real::Check]) {
 /// The tests and machines of a run, and what it was given.
 struct Picked<'a> {
     tests: Vec<&'a Test>,
-    machines: Vec<&'a Machine>,
+    /// The machines named, and the pools named with their machines.
+    machines: machines::Pick<'a>,
     /// The run being resumed, when this run resumes one.
     resume: Option<resume::Resume>,
     preset: Option<String>,
@@ -707,7 +715,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     let key = ssh::key_path(&arguments.config_dir()?);
     let key = key.is_file().then_some(key);
     if key.is_none() {
-        refuse_commands_without_key(&picked, &machines, options.with_person)?;
+        refuse_commands_without_key(&picked, &machines.every(), options.with_person)?;
     }
     let password =
         ssh::read_password(&ssh::password_path(&arguments.config_dir()?)).map_err(Error::Usage)?;
@@ -753,16 +761,24 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         return Err(Error::Usage(format!("Dukovo's ob {} does not exist", ob.display())));
     }
     if arguments.detach {
-        return detach(arguments, &store, &machines);
+        return detach(arguments, &store, &machines.every());
     }
     if let Some(id) = &arguments.run_id
         && !store::valid_run_id(id)
     {
         return Err(Error::Usage(format!("--run-id {id} is not a run id")));
     }
+    // Only a pool's queue is ordered by how long tests took before.
+    let typical = if machines.pools.is_empty() {
+        HashMap::new()
+    } else {
+        status::typical_durations(&store, None)
+    };
     let request = run::Request {
         tests: picked,
-        machines,
+        machines: machines.direct,
+        pools: machines.pools,
+        typical,
         image,
         build: arguments.build.clone(),
         store,
@@ -818,7 +834,7 @@ fn pick_requested<'a>(
         }
         _ => return Err(Error::Usage("give tests, --all or --preset: only one".into())),
     };
-    let machines = machines::select(all_machines, arguments.machine.as_deref().unwrap_or("qemu"))?;
+    let machines = machines::pick(all_machines, arguments.machine.as_deref().unwrap_or("qemu"))?;
     let given = |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string());
     let options = bundle::RunOptions {
         with_person: arguments.with_person,
@@ -854,7 +870,9 @@ fn pick_unfinished<'a>(
         ));
     }
     let plan = resume::plan(store, id, image, arguments.build.as_deref())?;
-    let machines = machines::select(all_machines, &plan.machines().join(","))?;
+    let named: Vec<String> =
+        plan.machines().into_iter().map(String::from).chain(plan.pools()).collect();
+    let machines = machines::pick(all_machines, &named.join(","))?;
     let names: Vec<String> = plan.tests().into_iter().map(String::from).collect();
     let picked = suite::select(tests, &names)?;
     let first = plan.record.options.clone().unwrap_or_default();

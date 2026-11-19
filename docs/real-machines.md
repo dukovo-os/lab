@@ -202,6 +202,52 @@ The console is not checked: the runner waits for the machine's ready line
 on the console before the check, so a boot that reaches it has shown its
 console lines already. A console that shows nothing fails the boot.
 
+## Several identical machines
+
+Identical machines share a round: three OptiPlex 7040s that share one test
+list finish in about a third of the time one machine takes. Each machine has
+a file of its own, and they name one pool:
+
+```toml
+pool = "optiplex"
+```
+
+To add `optiplex-2`, `optiplex-3` and `optiplex-4`, copy `optiplex-1.toml`
+(the example in the repository is [machines/optiplex.toml](../machines/optiplex.toml))
+to `optiplex-2.toml` and so on, and change what belongs to the machine
+alone:
+
+- `[amt]` `address`: the machine's AMT address, set in its MEBx, and a
+  `password_file` of its own if its AMT password differs.
+- `mac`: its network card's address, which dnsmasq also hands the
+  machine's address by (`dhcp-host=<mac>,<machine_address>,<name>`), so
+  give each machine its own `machine_address` as well.
+- `disk`: the serial number of its disk, from `lsblk -o NAME,SERIAL`.
+- `serial`: its own serial cable's port, best by its `/dev/serial/by-id/`
+  name, as USB serial ports are renumbered when cables move.
+- `boot_port`: the first of its four net-boot ports. Machines in one run
+  need ports of their own, so each machine's is four more than the one
+  before.
+
+Keep `pool = "optiplex"` and the `[controls]` the same in every file: a
+pool whose machines differ in a control is refused when the machine files
+are read, naming the machine and the control. Then check each machine
+(`dukovo-lab machines check optiplex-2`) and run on the pool:
+
+```sh
+dukovo-lab run --all --machine pool:optiplex --image ...
+```
+
+A machine named on its own, such as `optiplex-1`, still runs every test.
+Mark a machine `spare = true` to keep it for reruns and bisects: a run on
+the pool leaves it out, and it is named directly when wanted. Plug
+machines in a pool each need their own `netlog_port`, `machine_address` and
+`boot_port` (see [A machine on a smart plug](#a-machine-on-a-smart-plug)).
+
+If one machine of a pool will not start, or its health check benches it,
+the others take its share of the queue and the run says which machine left
+and why (a `machine-out` event). See [run](commands.md#run).
+
 ## Safety
 
 - AMT's password stays in its file: it is never written to a log, a

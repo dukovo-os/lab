@@ -12,8 +12,14 @@
 //! a person must do it, or it cannot be done there at all. That one table
 //! decides which tests run on a machine, which wait for a person (the
 //! runner's Needs you group) and which are skipped.
+//!
+//! A machine file may name a pool. The machines of a pool are
+//! interchangeable, so a run on the pool (`pool:<name>`) shares its tests
+//! out among them instead of running every test on each. [`load`] holds
+//! the members of a pool to the same controls, as a test run on whichever
+//! member is free must fit all of them alike.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -434,6 +440,15 @@ pub struct Machine {
     /// Text on the serial console that says the machine has booted.
     pub ready: String,
     pub controls: BTreeMap<Control, Who>,
+    /// The pool the machine belongs to: machines of one pool have the
+    /// same hardware and controls, and a run on the pool shares its tests
+    /// among them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Whether a run on the pool leaves the machine out, keeping it for
+    /// reruns and bisects.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub spare: bool,
     /// For a QEMU machine.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qemu: Option<QemuSettings>,
@@ -460,6 +475,8 @@ impl Machine {
             driver: DriverKind::Qemu,
             ready: DEFAULT_READY.into(),
             controls: driver_controls(&DriverKind::Qemu),
+            pool: None,
+            spare: false,
             qemu: Some(QemuSettings::default()),
             amt: None,
             plug: None,
@@ -521,6 +538,9 @@ struct MachineFile {
     ready: Option<String>,
     #[serde(default)]
     controls: BTreeMap<Control, Who>,
+    pool: Option<String>,
+    #[serde(default)]
+    spare: bool,
     qemu: Option<QemuSettings>,
     amt: Option<AmtSettings>,
     plug: Option<PlugSettings>,
@@ -546,7 +566,44 @@ pub fn load(dir: &Path) -> Result<Vec<Machine>, Error> {
         machines.push(Machine::built_in_qemu());
     }
     machines.sort_by(|a, b| a.name.cmp(&b.name));
+    check_pools(&machines)?;
     Ok(machines)
+}
+
+fn word(who: Who) -> String {
+    format!("{who:?}").to_lowercase()
+}
+
+/// Holds every machine of a pool to the controls of the pool's first
+/// machine, by name: a test that fits one must fit them all, as it runs
+/// on whichever is free.
+fn check_pools(machines: &[Machine]) -> Result<(), Error> {
+    let mut first: BTreeMap<&str, &Machine> = BTreeMap::new();
+    for machine in machines {
+        let Some(pool) = machine.pool.as_deref() else { continue };
+        let Some(&leader) = first.get(pool) else {
+            first.insert(pool, machine);
+            continue;
+        };
+        for control in Control::ALL {
+            let (who, leader_who) = (machine.who(control), leader.who(control));
+            if who != leader_who {
+                let (who, leader_who) = (word(who), word(leader_who));
+                let file = machine
+                    .file
+                    .as_ref()
+                    .map_or(String::new(), |file| format!("{}: ", file.display()));
+                return Err(Error::Usage(format!(
+                    "{file}machine {} is in the pool \"{pool}\" but its {control} control is \
+                     {who}, and {}'s is {leader_who}: the machines of a pool must have the \
+                     same controls, so change [controls] in one of the files or give one of the \
+                     machines another pool",
+                    machine.name, leader.name,
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reads one machine file.
@@ -560,6 +617,16 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
     let file: MachineFile = toml::from_str(&text).map_err(|err| bad(err.to_string()))?;
     if file.about.trim().is_empty() || file.about.contains('\n') {
         return Err(bad("about must be one line saying what the machine is".into()));
+    }
+    if let Some(pool) = &file.pool
+        && !is_plain_name(pool)
+    {
+        return Err(bad("pool may hold only a-z, 0-9 and -".into()));
+    }
+    if file.spare && file.pool.is_none() {
+        return Err(bad(
+            "spare = true needs a pool: a spare is kept out of a run on its pool".into()
+        ));
     }
     let mut controls = driver_controls(&file.driver);
     for (control, who) in file.controls {
@@ -658,6 +725,8 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         driver: file.driver,
         ready: file.ready.unwrap_or_else(|| DEFAULT_READY.into()),
         controls,
+        pool: file.pool,
+        spare: file.spare,
         qemu,
         amt,
         plug,
@@ -793,17 +862,124 @@ pub fn is_plain_name(name: &str) -> bool {
 pub fn select<'a>(machines: &'a [Machine], names: &str) -> Result<Vec<&'a Machine>, Error> {
     let mut picked: Vec<&Machine> = Vec::new();
     for name in names.split(',').map(str::trim) {
-        let machine = machines.iter().find(|machine| machine.name == name).ok_or_else(|| {
-            let known: Vec<&str> = machines.iter().map(|machine| machine.name.as_str()).collect();
-            Error::Usage(format!(
-                "no machine named \"{name}\"; the machines are {}",
-                known.join(", ")
-            ))
-        })?;
+        let machine = find(machines, name, false)?;
         if picked.iter().any(|already| already.name == machine.name) {
             return Err(Error::Usage(format!("machine \"{name}\" is picked twice")));
         }
         picked.push(machine);
+    }
+    Ok(picked)
+}
+
+fn find<'a>(machines: &'a [Machine], name: &str, pools_too: bool) -> Result<&'a Machine, Error> {
+    machines.iter().find(|machine| machine.name == name).ok_or_else(|| {
+        let known: Vec<&str> = machines.iter().map(|machine| machine.name.as_str()).collect();
+        let pools = pool_names(machines);
+        let pools = if pools_too && !pools.is_empty() {
+            format!(" and the pools are {}", pools.join(", "))
+        } else {
+            String::new()
+        };
+        Error::Usage(format!(
+            "no machine named \"{name}\"; the machines are {}{pools}",
+            known.join(", ")
+        ))
+    })
+}
+
+/// The pools the machines name, as `--machine` writes them.
+fn pool_names(machines: &[Machine]) -> Vec<String> {
+    let pools: BTreeSet<&str> =
+        machines.iter().filter_map(|machine| machine.pool.as_deref()).collect();
+    pools.into_iter().map(|pool| format!("{POOL_PREFIX}{pool}")).collect()
+}
+
+/// What `--machine pool:<name>` is written with before the pool's name:
+/// a colon cannot be in a machine's name, so the two never clash.
+pub const POOL_PREFIX: &str = "pool:";
+
+/// Whether `name` is a machine's name or a pool as `--machine` writes it.
+pub fn is_machine_ref(name: &str) -> bool {
+    is_plain_name(name.strip_prefix(POOL_PREFIX).unwrap_or(name))
+}
+
+/// A pool a run shares its tests out among.
+#[derive(Clone, Debug)]
+pub struct Pool<'a> {
+    pub name: String,
+    /// The machines that take part: the pool's machines but its spares.
+    pub members: Vec<&'a Machine>,
+}
+
+impl Pool<'_> {
+    /// How results and events name the pool, as `--machine` does.
+    pub fn label(&self) -> String {
+        format!("{POOL_PREFIX}{}", self.name)
+    }
+}
+
+/// What a `--machine` list names: machines that each run every test, and
+/// pools whose machines share their tests out.
+#[derive(Debug, Default)]
+pub struct Pick<'a> {
+    pub direct: Vec<&'a Machine>,
+    pub pools: Vec<Pool<'a>>,
+}
+
+impl<'a> Pick<'a> {
+    /// Every machine the run uses: those named, then each pool's members.
+    pub fn every(&self) -> Vec<&'a Machine> {
+        let members = self.pools.iter().flat_map(|pool| pool.members.iter().copied());
+        self.direct.iter().copied().chain(members).collect()
+    }
+}
+
+/// Picks the machines and pools a comma-separated list names. A pool is
+/// written `pool:<name>`. A spare machine named on its own runs every
+/// test; a pool leaves it out.
+pub fn pick<'a>(machines: &'a [Machine], names: &str) -> Result<Pick<'a>, Error> {
+    let mut picked = Pick::default();
+    for name in names.split(',').map(str::trim) {
+        let Some(pool) = name.strip_prefix(POOL_PREFIX) else {
+            let machine = find(machines, name, true)?;
+            if picked.direct.iter().any(|already| already.name == machine.name) {
+                return Err(Error::Usage(format!("machine \"{name}\" is picked twice")));
+            }
+            picked.direct.push(machine);
+            continue;
+        };
+        let in_pool = || machines.iter().filter(|machine| machine.pool.as_deref() == Some(pool));
+        if in_pool().next().is_none() {
+            let known = pool_names(machines);
+            return Err(Error::Usage(format!(
+                "no pool named \"{pool}\"; {}",
+                if known.is_empty() {
+                    "no machine file has pool = \"...\" yet".to_string()
+                } else {
+                    format!("the pools are {}", known.join(", "))
+                }
+            )));
+        }
+        let members: Vec<&Machine> = in_pool().filter(|machine| !machine.spare).collect();
+        if members.is_empty() {
+            return Err(Error::Usage(format!(
+                "every machine of the pool \"{pool}\" is a spare, so a run on it has no machine \
+                 to use: name a spare directly to run on it, or take spare = true out of a file"
+            )));
+        }
+        if picked.pools.iter().any(|already| already.name == pool) {
+            return Err(Error::Usage(format!("pool \"{pool}\" is picked twice")));
+        }
+        picked.pools.push(Pool { name: pool.to_string(), members });
+    }
+    for pool in &picked.pools {
+        if let Some(machine) = picked.direct.iter().find(|machine| pool.members.contains(machine)) {
+            return Err(Error::Usage(format!(
+                "machine \"{}\" is picked twice: by name and as a machine of {}",
+                machine.name,
+                pool.label()
+            )));
+        }
     }
     Ok(picked)
 }
@@ -893,6 +1069,7 @@ mod tests {
         let example = machines.iter().find(|machine| machine.name == "qemu-bios").unwrap();
         assert_eq!(example.qemu.as_ref().unwrap().firmware, Firmware::Bios);
         let real = machines.iter().find(|machine| machine.name == "optiplex").unwrap();
+        assert_eq!(real.pool.as_deref(), Some("optiplex"));
         let amt = real.amt.as_ref().unwrap();
         assert_eq!(amt.password_file, folder.join("optiplex-amt-password"));
         assert_eq!(real.who(Control::Usb), Who::Person);
@@ -1150,6 +1327,112 @@ mod tests {
             };
             assert!(message.contains(complaint), "{message}");
         }
+    }
+
+    /// A QEMU machine file in the pool `pool`, with the extra lines.
+    fn pooled(pool: &str, extra: &str) -> String {
+        format!("about = \"x\"\ndriver = \"qemu\"\npool = \"{pool}\"\n{extra}")
+    }
+
+    #[test]
+    fn a_machine_file_names_a_pool_and_says_whether_it_is_a_spare() {
+        let dir = TempDir::new("machines-pool");
+        dir.write("box-1.toml", &pooled("boxes", ""));
+        dir.write("box-2.toml", &pooled("boxes", "spare = true\n"));
+        dir.write("alone.toml", "about = \"x\"\ndriver = \"qemu\"\n");
+        let machines = load(dir.path()).unwrap();
+        let get = |name: &str| machines.iter().find(|machine| machine.name == name).unwrap();
+        assert_eq!((get("box-1").pool.as_deref(), get("box-1").spare), (Some("boxes"), false));
+        assert_eq!((get("box-2").pool.as_deref(), get("box-2").spare), (Some("boxes"), true));
+        assert_eq!((get("alone").pool.as_deref(), get("alone").spare), (None, false));
+        assert_eq!(get("qemu").pool, None);
+    }
+
+    #[test]
+    fn a_pool_whose_machines_differ_in_a_control_is_an_error_naming_the_machine_and_control() {
+        let dir = TempDir::new("machines-pool-differs");
+        dir.write("box-1.toml", &pooled("boxes", "[controls]\nusb = \"person\"\n"));
+        dir.write("box-2.toml", &pooled("boxes", "[controls]\nusb = \"none\"\n"));
+        let Err(Error::Usage(message)) = load(dir.path()) else {
+            panic!("a pool of machines with different controls should not load");
+        };
+        assert!(
+            message.contains("box-2.toml")
+                && message.contains("machine box-2 is in the pool \"boxes\"")
+                && message.contains("its usb control is none, and box-1's is person"),
+            "{message}"
+        );
+        // The same controls, written differently, are the same.
+        dir.write(
+            "box-2.toml",
+            &pooled("boxes", "[controls]\nusb = \"person\"\nlink = \"driver\"\n"),
+        );
+        assert!(load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn bad_pool_settings_say_what_is_wrong() {
+        for (text, complaint) in [
+            (pooled("Big Pool", ""), "pool may hold only a-z"),
+            (
+                "about = \"x\"\ndriver = \"qemu\"\nspare = true\n".to_string(),
+                "spare = true needs a pool",
+            ),
+        ] {
+            let dir = TempDir::new("machines-pool-bad");
+            dir.write("box.toml", &text);
+            let Err(Error::Usage(message)) = load(dir.path()) else {
+                panic!("{text} should not load");
+            };
+            assert!(message.contains(complaint), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_pool_is_picked_as_its_machines_but_its_spares() {
+        let dir = TempDir::new("machines-pick-pool");
+        dir.write("box-1.toml", &pooled("boxes", ""));
+        dir.write("box-2.toml", &pooled("boxes", ""));
+        dir.write("box-3.toml", &pooled("boxes", "spare = true\n"));
+        let machines = load(dir.path()).unwrap();
+        let names = |picked: &[&Machine]| -> Vec<String> {
+            picked.iter().map(|machine| machine.name.clone()).collect()
+        };
+        let picked = pick(&machines, "qemu,pool:boxes").unwrap();
+        assert_eq!(names(&picked.direct), ["qemu"]);
+        assert_eq!(picked.pools.len(), 1);
+        assert_eq!(picked.pools[0].label(), "pool:boxes");
+        assert_eq!(names(&picked.pools[0].members), ["box-1", "box-2"]);
+        assert_eq!(names(&picked.every()), ["qemu", "box-1", "box-2"]);
+        // A spare named on its own runs every test.
+        let picked = pick(&machines, "box-3, pool:boxes").unwrap();
+        assert_eq!(names(&picked.direct), ["box-3"]);
+        assert_eq!(names(&picked.pools[0].members), ["box-1", "box-2"]);
+    }
+
+    #[test]
+    fn a_pool_that_is_not_there_or_is_picked_twice_is_refused() {
+        let dir = TempDir::new("machines-pick-pool-bad");
+        dir.write("box-1.toml", &pooled("boxes", ""));
+        dir.write("lone.toml", &pooled("spares", "spare = true\n"));
+        let machines = load(dir.path()).unwrap();
+        let refused = |names: &str| match pick(&machines, names) {
+            Err(Error::Usage(message)) => message,
+            other => panic!("{names} should be refused, got {other:?}"),
+        };
+        assert!(refused("pool:crates").contains("the pools are pool:boxes, pool:spares"));
+        assert!(refused("pool:boxes,pool:boxes").contains("picked twice"));
+        assert!(refused("box-1,pool:boxes").contains("picked twice"));
+        assert!(refused("pool:spares").contains("is a spare"));
+        let unknown = refused("crates");
+        assert!(
+            unknown.contains("the machines are box-1, lone, qemu and the pools are"),
+            "{unknown}"
+        );
+        assert!(is_machine_ref("pool:boxes") && is_machine_ref("box-1"));
+        assert!(
+            !is_machine_ref("pool:") && !is_machine_ref("pool:Boxes") && !is_machine_ref("a:b")
+        );
     }
 
     #[test]
