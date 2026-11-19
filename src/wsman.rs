@@ -31,6 +31,13 @@ const MESSAGE_TIME: Duration = Duration::from_secs(20);
 /// dozes, and the first connection is refused while it wakes (seen on an
 /// OptiPlex 7040 with AMT 11.8): a few seconds later it answers again.
 const WAKE_TIME: Duration = Duration::from_secs(20);
+/// How many times a message is sent in all when the network fails it, and
+/// how long the gap between tries is. A lab network that drops one
+/// connection usually carries the next; AMT's own answers, a refusal or a
+/// ReturnValue, are never sent again.
+const TRIES: u32 = 3;
+const TRY_GAP: Duration =
+    if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(2) };
 
 pub const ADDRESSING: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
 pub const WSMAN: &str = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd";
@@ -183,16 +190,7 @@ impl Client {
             if let Some(authorization) = self.authorization() {
                 headers.push(("Authorization", authorization));
             }
-            let answer = http::send(
-                &self.address,
-                "POST",
-                "/wsman",
-                &headers,
-                message,
-                MESSAGE_TIME,
-                WAKE_TIME,
-            )
-            .map_err(|err| format!("AMT at {}: {err}", self.address))?;
+            let answer = self.send(&headers, message)?;
             if answer.status != 401 {
                 return Ok(answer);
             }
@@ -212,6 +210,44 @@ impl Client {
              file's amt.user and the password in its amt.password_file",
             self.address
         ))
+    }
+
+    /// Sends `message` once, and again, [`TRY_GAP`] later, each time the
+    /// network fails it (no connection, a timeout, a connection dropped
+    /// before the answer), up to [`TRIES`] times in all. The last failure
+    /// is the error.
+    fn send(&self, headers: &[(&str, String)], message: &[u8]) -> Result<http::Answer, String> {
+        let mut tried = 1;
+        loop {
+            // The wake wait is for the first try: a machine still refusing
+            // after it is not dozing, and a call to one that is off the
+            // network would otherwise wait it out three times over.
+            let patience = if tried == 1 { WAKE_TIME } else { Duration::ZERO };
+            let failure = match http::try_send(
+                &self.address,
+                "POST",
+                "/wsman",
+                headers,
+                message,
+                MESSAGE_TIME,
+                patience,
+            ) {
+                Ok(answer) => return Ok(answer),
+                Err(failure) => failure,
+            };
+            if !failure.network {
+                return Err(format!("AMT at {}: {}", self.address, failure.message));
+            }
+            if tried == TRIES {
+                return Err(format!(
+                    "AMT at {}: {} (tried {TRIES} times: check that the machine is on the lab \
+                     network and that AMT answers there)",
+                    self.address, failure.message
+                ));
+            }
+            tried += 1;
+            std::thread::sleep(TRY_GAP);
+        }
     }
 
     /// The Authorization header for the next message, from the challenge

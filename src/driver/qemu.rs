@@ -128,6 +128,14 @@ const OVMF_PATHS: &[(&str, &str)] = &[
     ("/usr/share/edk2-ovmf/x64/OVMF_CODE.fd", "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd"),
 ];
 
+/// The virtual size of each boot's disk. The image's own disk is about
+/// 1 GiB with a 512 MiB root, too little for a test that installs a PHP
+/// or PostgreSQL bundle or a website; the overlay is sparse, so the room
+/// after the image costs nothing until the root grows into it
+/// ([`Driver::grows_root`]). A disk this size must stay larger than any
+/// image the lab builds, as an overlay cannot be smaller than its image.
+const DISK_SIZE: &str = "8G";
+
 /// How long a hard power-off may take before QEMU is killed.
 const QUIT_TIME: Duration = Duration::from_secs(10);
 
@@ -440,7 +448,7 @@ impl Qemu {
     }
 
     /// Makes this boot's disk: an overlay whose reads fall through to the
-    /// image and whose writes stay in the overlay.
+    /// image and whose writes stay in the overlay, [`DISK_SIZE`] long.
     fn make_disk(&self) -> Result<(), String> {
         let image = fs::canonicalize(&self.setup.image)
             .map_err(|err| format!("the image {}: {err}", self.setup.image.display()))?;
@@ -448,7 +456,16 @@ impl Qemu {
             if image.extension().is_some_and(|ext| ext == "qcow2") { "qcow2" } else { "raw" };
         let disk = self.disk();
         Self::qemu_img(
-            &["-f", "qcow2", "-F", format, "-b", &image.to_string_lossy(), &disk.to_string_lossy()],
+            &[
+                "-f",
+                "qcow2",
+                "-F",
+                format,
+                "-b",
+                &image.to_string_lossy(),
+                &disk.to_string_lossy(),
+                DISK_SIZE,
+            ],
             &format!("a disk over {}", image.display()),
         )
     }
@@ -1185,6 +1202,10 @@ impl Driver for Qemu {
         }
     }
 
+    fn grows_root(&self) -> bool {
+        self.settings.grow_root
+    }
+
     fn is_on(&mut self) -> bool {
         let Some(running) = &mut self.running else { return false };
         match running.child.try_wait() {
@@ -1254,6 +1275,35 @@ impl Driver for Qemu {
             let _ = fs::remove_file(overlay);
         }
         Ok(())
+    }
+
+    fn take_out_media(&mut self) -> Vec<Result<String, String>> {
+        let mut taken = Vec::new();
+        if let Some(number) = self.stick {
+            let what = format!("USB stick {number} plugged in");
+            taken.push(
+                self.unplug_usb().map(|()| what.clone()).map_err(|err| format!("{what}: {err}")),
+            );
+        }
+        if let Some(number) = self.card {
+            let what = format!("memory card {number} in the card reader");
+            taken.push(
+                self.remove_card().map(|()| what.clone()).map_err(|err| format!("{what}: {err}")),
+            );
+        }
+        if self.disc.is_some() {
+            let what = "a disc in the optical drive".to_string();
+            taken.push(
+                self.eject_disc().map(|()| what.clone()).map_err(|err| format!("{what}: {err}")),
+            );
+        }
+        if let Some((number, _)) = self.floppy {
+            let what = format!("floppy disk {number} in the floppy drive");
+            taken.push(
+                self.eject_floppy().map(|()| what.clone()).map_err(|err| format!("{what}: {err}")),
+            );
+        }
+        taken
     }
 
     fn want_card_reader(&mut self, reader: Option<Reader>) {
@@ -1821,6 +1871,9 @@ mod tests {
         assert_eq!(fs::metadata(&blank).unwrap().len(), 2 << 20);
         qemu.unplug_usb().unwrap();
         assert!(!blank.exists(), "a pulled stick's file goes");
+        qemu.plug_usb(&stick).unwrap();
+        assert_eq!(qemu.take_out_media(), [Ok("USB stick 3 plugged in".to_string())]);
+        assert!(qemu.take_out_media().is_empty(), "nothing is left to take out");
         qemu.plug_usb(&stick).unwrap();
 
         qemu.press_keys(&["shift-a".into(), "ret".into()]).unwrap();

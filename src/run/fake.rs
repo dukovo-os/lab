@@ -41,6 +41,12 @@ struct FakeMachine {
     disc_drive: bool,
     /// Whether the next boot gives the machine a floppy drive.
     floppy_drive: bool,
+    /// USB sticks plugged in so far, to name the next, and the one in now.
+    /// A real driver refuses a second stick while one is in; the machine
+    /// named `jammed` cannot let one go.
+    sticks: u32,
+    stick: Option<u32>,
+    jammed: bool,
     /// Whether its Linux twin is the machine itself, as a real machine's
     /// is; the machine named `real`'s is.
     real: bool,
@@ -79,6 +85,8 @@ impl FakeMachine {
         self.on = true;
         // A new boot starts with no attacker up, as a real machine does.
         self.attacker_on = false;
+        // A stick plugged in while the machine ran goes with that boot.
+        self.stick = None;
         self.say(FAKE_GEOMETRY);
     }
 
@@ -144,6 +152,9 @@ impl Driver for FakeMachine {
     fn boot_stick(&mut self, stick: &Path, disk: u64) -> Result<(), String> {
         assert!(stick.is_file(), "the stick is given a second name, not lost");
         self.new_serial();
+        // The install stick is in, as the machine's next stick.
+        self.sticks += 1;
+        self.stick = Some(self.sticks);
         self.say(&format!("live: a blank disk of {disk} bytes"));
         self.screen = vec!["Install Dukovo".into()];
         Ok(())
@@ -203,11 +214,25 @@ impl Driver for FakeMachine {
     }
 
     fn plug_usb(&mut self, _stick: &crate::suite::Stick) -> Result<(), String> {
+        if let Some(stick) = self.stick {
+            return Err(format!("USB stick {stick} is still plugged in; pull it first"));
+        }
+        self.sticks += 1;
+        self.stick = Some(self.sticks);
         Ok(())
     }
 
     fn unplug_usb(&mut self) -> Result<(), String> {
-        Ok(())
+        if self.jammed {
+            return Err("the guest would not let go of the device".into());
+        }
+        self.stick.take().map(drop).ok_or_else(|| "no USB stick is plugged in".into())
+    }
+
+    fn take_out_media(&mut self) -> Vec<Result<String, String>> {
+        let Some(number) = self.stick else { return Vec::new() };
+        let what = format!("USB stick {number} plugged in");
+        vec![self.unplug_usb().map(|()| what.clone()).map_err(|err| format!("{what}: {err}"))]
     }
 
     fn want_card_reader(&mut self, reader: Option<crate::suite::Reader>) {
@@ -487,6 +512,9 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         disc_drive: false,
         floppy_drive: false,
         attacker_on: false,
+        sticks: 0,
+        stick: None,
+        jammed: machine.name == "jammed",
         real: machine.name == "real",
         grows_root: machine.name.starts_with("grows"),
         grow_fails: machine.name == "grows-badly",
@@ -575,6 +603,7 @@ fn run_with(
         id: Some(
             id.map_or_else(|| crate::bundle::new_run_id(crate::clock::Utc::now()), String::from),
         ),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
@@ -722,6 +751,7 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let kit = crate::bench::Kit::read(&kit_dir).unwrap();
     let with_kit = request(Some(kit.clone()), vec![&setting.qemu]);
@@ -816,6 +846,7 @@ fn root_steps_give_elevate_the_password_and_never_show_it() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     assert_eq!(ended.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
@@ -874,6 +905,7 @@ fn attack_steps_run_on_a_private_lab_network() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
@@ -940,6 +972,7 @@ fn card_tests_boot_with_a_card_reader_of_their_own() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
@@ -1006,6 +1039,7 @@ fn disc_tests_boot_with_an_optical_drive_of_their_own() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
@@ -1065,6 +1099,7 @@ fn floppy_tests_boot_with_a_floppy_drive_of_their_own() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
@@ -1158,6 +1193,7 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let with_both = request(
         Some(crate::screen::Font::read_dir(&fonts).unwrap()),
@@ -1220,6 +1256,90 @@ fn screen_steps_read_the_console_type_on_it_and_boot_the_install_stick() {
     // the installer's tests do, each saying how to get one.
     let ended = run(&request(None, None, None), &Reporter::silent(), &start_fake).unwrap();
     assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 5, errors: 1 });
+}
+
+/// Two tests that each plug in a stick and never pull it: the second
+/// fails to plug its own while the first's is in.
+const STICK_TESTS: &[(&str, &str)] = &[
+    (
+        "drivers/a-leaves.toml",
+        "about = \"leaves a stick in\"\ntime = \"1m\"\n[[step]]\nusb = \"plug\"\nblank = \"16M\"\n",
+    ),
+    (
+        "drivers/b-plugs.toml",
+        "about = \"plugs a stick\"\ntime = \"1m\"\n[[step]]\nusb = \"plug\"\nblank = \"16M\"\n",
+    ),
+];
+
+fn log_of(done: &Done, result: &ResultRecord) -> String {
+    fs::read_to_string(done.bundle.join(result.log.as_ref().unwrap())).unwrap()
+}
+
+#[test]
+fn a_stick_left_in_is_pulled_when_the_test_ends() {
+    let setting = setting_with(STICK_TESTS);
+    let (ended, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(
+        outcomes(&results, "qemu"),
+        [
+            ("drivers/a-leaves".into(), Outcome::Pass, Some(1)),
+            ("drivers/b-plugs".into(), Outcome::Pass, Some(1)),
+        ],
+        "the next test shares the boot and plugs its own stick in"
+    );
+    let log = log_of(&ended, &results[0]);
+    assert!(log.contains("The test left USB stick 1 plugged in; the lab took it out."), "{log}");
+    let log = log_of(&ended, &results[1]);
+    assert!(log.contains("The test left USB stick 2 plugged in; the lab took it out."), "{log}");
+}
+
+#[test]
+fn a_failed_test_leaves_its_stick_to_the_next_boot() {
+    let setting = setting_with(&[
+        (
+            "drivers/a-fails.toml",
+            "about = \"plugs a stick and fails\"\ntime = \"1m\"\n[[step]]\nusb = \"plug\"\nblank = \"16M\"\n\
+             [[step]]\nrun = \"false\"\n",
+        ),
+        STICK_TESTS[1],
+    ]);
+    let (ended, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(
+        outcomes(&results, "qemu"),
+        [
+            ("drivers/a-fails".into(), Outcome::Fail, Some(1)),
+            ("drivers/b-plugs".into(), Outcome::Pass, Some(2)),
+        ]
+    );
+    let log = log_of(&ended, &results[0]);
+    assert!(
+        !log.contains("the lab took it out"),
+        "a failed boot is not shared, so nothing is pulled: {log}"
+    );
+}
+
+#[test]
+fn a_stick_that_will_not_come_out_ends_the_shared_boot() {
+    let setting = setting_with(STICK_TESTS);
+    let mut jammed = setting.qemu.clone();
+    jammed.name = "jammed".into();
+    let (ended, results) = run_on(&setting, vec![&jammed]);
+    assert_eq!(
+        outcomes(&results, "jammed"),
+        [
+            ("drivers/a-leaves".into(), Outcome::Pass, Some(1)),
+            ("drivers/b-plugs".into(), Outcome::Pass, Some(2)),
+        ],
+        "the next test boots afresh, whose ports are empty"
+    );
+    let log = log_of(&ended, &results[0]);
+    assert!(
+        log.contains(
+            "The lab could not take out what the test left in (USB stick 1 plugged in: \
+             the guest would not let go of the device); the next test boots afresh."
+        ),
+        "{log}"
+    );
 }
 
 #[test]
@@ -1309,6 +1429,62 @@ fn a_stopped_run_skips_what_it_did_not_finish() {
         serde_json::from_str(&fs::read_to_string(ended.bundle.join("run.json")).unwrap()).unwrap();
     assert!(run.stopped);
     assert!(!crate::store::is_running(&store, id), "the run let go of its lock");
+}
+
+#[test]
+fn a_resumed_run_runs_only_what_the_stopped_run_did_not_finish() {
+    let setting = setting_with(&[
+        ("features/uname.toml", TESTS[1].1),
+        ("stress/hang.toml", "about = \"hangs\"\ntime = \"1s\"\n[[step]]\nrun = \"hang\"\n"),
+        ("stress/later.toml", "about = \"later\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+    ]);
+    let id = "20261107-153012-0002";
+    let store = setting.dir.path().join("store");
+    let asker = store.clone();
+    when_events_say(
+        store.clone(),
+        id,
+        "\"event\":\"test-started\",\"machine\":\"qemu\",\"test\":\"stress/hang\"",
+        move || crate::store::request_stop(&asker, id).unwrap(),
+    );
+    let (_, first) = run_with(&setting, vec![&setting.qemu], true, Some(id));
+    assert_eq!(
+        first.iter().map(|r| r.result).collect::<Vec<_>>(),
+        [Outcome::Pass, Outcome::Skip, Outcome::Skip]
+    );
+
+    let image = Path::new("dukovo.img");
+    let resume = crate::resume::plan(&store, id, image, Some("0.13.0 test")).unwrap();
+    let names: Vec<String> = resume.tests().into_iter().map(String::from).collect();
+    let request = Request {
+        tests: crate::suite::select(&setting.tests, &names).unwrap(),
+        machines: vec![&setting.qemu],
+        image: image.into(),
+        build: Some("0.13.0 test".into()),
+        store: store.clone(),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        with_person: true,
+        resume: Some(resume),
+        id: Some("20261107-153013-0003".into()),
+        ..Request::default()
+    };
+    run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&store, "20261107-153013-0003");
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    assert_eq!(
+        outcomes(&results.results, "qemu"),
+        [
+            ("stress/hang".into(), Outcome::Fail, Some(1)),
+            ("stress/later".into(), Outcome::Pass, Some(2)),
+        ]
+    );
+    let run: RunRecord =
+        serde_json::from_str(&fs::read_to_string(bundle.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run.resumes.as_deref(), Some(id));
+    assert_eq!(run.tests, ["stress/hang", "stress/later"]);
+    assert_eq!(run.build.as_deref(), Some("0.13.0 test"));
+    assert!(run.options.unwrap().with_person, "the options the run had are recorded");
 }
 
 #[test]
@@ -1442,6 +1618,7 @@ fn host_steps_run_the_lab_pc_side_and_end_its_servers() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     assert!(setting.tests.iter().all(|test| test.controls().contains(&Control::Peer)));
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
@@ -1553,6 +1730,7 @@ fn browser_steps_run_the_runner_in_each_engine_and_skip_without_a_kit() {
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let results_of = |request: &Request<'_>| {
         run(request, &Reporter::silent(), &start_fake).unwrap();
@@ -1745,6 +1923,7 @@ fn run_with_password(setting: &Setting, machines: Vec<&Machine>) -> (Done, Vec<R
         preset: None,
         schedule: None,
         id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
     };
     let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
     let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());

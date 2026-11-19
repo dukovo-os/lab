@@ -499,6 +499,8 @@ mod tests {
             schedule: None,
             summary: None,
             stopped: false,
+            resumes: None,
+            options: None,
         }
     }
 

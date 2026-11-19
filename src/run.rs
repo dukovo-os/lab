@@ -36,8 +36,8 @@ use crate::Error;
 use crate::bench::{self, Kit, Row};
 use crate::browser;
 use crate::bundle::{
-    Bundle, MachineRecord, Outcome, ResultRecord, RunRecord, SCHEMA, StepRecord, Summary,
-    new_run_id,
+    Bundle, MachineRecord, Outcome, ResultRecord, RunOptions, RunRecord, SCHEMA, StepRecord,
+    Summary, new_run_id,
 };
 use crate::clock::Utc;
 use crate::driver::{ATTACKER_ON_SEGMENT, Driver, Setup, TARGET_ON_SEGMENT};
@@ -45,6 +45,7 @@ use crate::findings;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
 use crate::peer::{self, Job, Ports, Readiness, SKIP_STATUS, Token};
+use crate::resume::Resume;
 use crate::screen::{self, Font};
 use crate::ssh;
 use crate::stop::Stop;
@@ -55,9 +56,10 @@ use crate::suite::{
 };
 use crate::units::format_duration;
 
-/// What a stopped test's result says.
-const STOPPED_DURING: &str = "the run was stopped during this test";
-const STOPPED_BEFORE: &str = "the run was stopped before this test";
+/// What a stopped test's result says; a run that is resumed runs again the
+/// tests with these results.
+pub const STOPPED_DURING: &str = "the run was stopped during this test";
+pub const STOPPED_BEFORE: &str = "the run was stopped before this test";
 
 /// How often a step that is still running reports it is alive (a
 /// `step-progress` event), so a long step — a soak, a slow boot — is not
@@ -169,6 +171,7 @@ fn check_run(
 }
 
 /// What to run.
+#[derive(Default)]
 pub struct Request<'a> {
     pub tests: Vec<&'a Test>,
     pub machines: Vec<&'a Machine>,
@@ -187,8 +190,12 @@ pub struct Request<'a> {
     pub with_person: bool,
     /// The Linux that performance tests hold Dukovo to, when given.
     pub linux: Option<Kit>,
+    /// The folder the Linux kit was read from, for run.json.
+    pub linux_folder: Option<PathBuf>,
     /// The console's fonts, for steps that read the screen, when given.
     pub fonts: Option<Vec<Font>>,
+    /// The folder the fonts were read from, for run.json.
+    pub fonts_folder: Option<PathBuf>,
     /// The browser kit, for steps that drive a browser, when given.
     pub browsers: Option<PathBuf>,
     /// The install stick's image, for tests that boot it, when given.
@@ -202,6 +209,9 @@ pub struct Request<'a> {
     pub preset: Option<String>,
     /// The schedule that started the run, for run.json.
     pub schedule: Option<String>,
+    /// The run this one resumes, with the tests it has left: each machine
+    /// runs only the ones named for it.
+    pub resume: Option<Resume>,
     /// The run's id, when the caller chose it (a detached run's parent
     /// does, to name the run before it starts); else a new one.
     pub id: Option<String>,
@@ -269,6 +279,16 @@ pub fn run(
         tests: request.tests.iter().map(|test| test.id.clone()).collect(),
         preset: request.preset.clone(),
         schedule: request.schedule.clone(),
+        resumes: request.resume.as_ref().map(|resume| resume.run.clone()),
+        options: Some(RunOptions {
+            with_person: request.with_person,
+            linux: given(request.linux_folder.as_deref()),
+            fonts: given(request.fonts_folder.as_deref()),
+            browsers: given(request.browsers.as_deref()),
+            stick: given(request.stick.as_deref()),
+            dvd: given(request.dvd.as_deref()),
+            ob: given(request.ob.as_deref()),
+        }),
         summary: None,
         stopped: false,
     };
@@ -337,8 +357,18 @@ pub fn run(
                     stop: stop.clone(),
                 };
                 let shared = &shared;
-                let tests = &request.tests;
-                scope.spawn(move || run_machine(machine, tests, setup, shared, start))
+                let tests: Vec<&Test> = request
+                    .tests
+                    .iter()
+                    .copied()
+                    .filter(|test| {
+                        request
+                            .resume
+                            .as_ref()
+                            .is_none_or(|resume| resume.has_left(&machine.name, &test.id))
+                    })
+                    .collect();
+                scope.spawn(move || run_machine(machine, &tests, setup, shared, start))
             })
             .collect();
         workers
@@ -382,6 +412,11 @@ impl Drop for SetOnDrop<'_> {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }
+}
+
+/// `path` as run.json names it, when one was given.
+fn given(path: Option<&Path>) -> Option<String> {
+    path.map(|path| path.display().to_string())
 }
 
 /// Keeps the image under test (or the install stick) the same for the
@@ -724,6 +759,9 @@ impl<'a> Worker<'a> {
             && self.driver.is_on()
             && test.boot == Boot::Image
             && !own_boot;
+        if self.reusable {
+            self.take_out_media();
+        }
         let log = self.write_log(test, result, reason.as_deref());
         let milliseconds = started.elapsed().as_millis() as u64;
         let boot = (self.boot > 0).then_some(self.boot);
@@ -748,6 +786,26 @@ impl<'a> Worker<'a> {
             log,
             steps,
             screenshots,
+        }
+    }
+
+    /// Takes out what the test left in the machine's ports and drives, which
+    /// the next test, sharing the boot, would otherwise find in the way.
+    /// A boot where something would not come out is not shared: a fresh
+    /// boot has the machine's ports empty again.
+    fn take_out_media(&mut self) {
+        for outcome in self.driver.take_out_media() {
+            match outcome {
+                Ok(what) => {
+                    self.log.push(format!("The test left {what}; the lab took it out."));
+                }
+                Err(why) => {
+                    self.log.push(format!(
+                        "The lab could not take out what the test left in ({why}); the next test boots afresh."
+                    ));
+                    self.reusable = false;
+                }
+            }
         }
     }
 
