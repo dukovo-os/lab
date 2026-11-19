@@ -957,9 +957,14 @@ impl Qemu {
                     DiskBus::Virtio => "virtio-blk-pci",
                 }
             ),
-            // Its own way in, over user networking as the machine's is.
+            // Its own way in, over user networking as the machine's is,
+            // and no way out: `restrict=on` keeps the forward that lets the
+            // lab in over SSH and drops every connection the attacker
+            // opens, so an attack test can reach only the machine on the
+            // private network, never the lab PC, the home network or the
+            // internet.
             "-netdev".into(),
-            format!("user,id={NETDEV},hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+            format!("user,id={NETDEV},restrict=on,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
             "-device".into(),
             format!("{},netdev={NETDEV}", self.settings.nic),
             // The private network: it connects to the machine's open port.
