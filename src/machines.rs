@@ -241,6 +241,10 @@ pub struct QemuSettings {
     /// several times slower than under KVM.
     #[serde(default = "default_tcg_slowdown")]
     pub tcg_slowdown: u32,
+    /// Whether a fresh boot's root is grown to the end of the disk before
+    /// the test starts (see [`GROW_ROOT`](crate::run::GROW_ROOT)).
+    #[serde(default = "default_grow_root")]
+    pub grow_root: bool,
 }
 
 fn default_firmware() -> Firmware {
@@ -275,6 +279,7 @@ impl Default for QemuSettings {
             disk: default_disk(),
             nic: default_nic(),
             tcg_slowdown: default_tcg_slowdown(),
+            grow_root: default_grow_root(),
         }
     }
 }
@@ -961,6 +966,19 @@ mod tests {
         };
         assert!(grows("plug-default") && grows("amt-default"));
         assert!(!grows("plug-off") && !grows("amt-off"));
+    }
+
+    #[test]
+    fn a_qemu_machine_grows_its_root_unless_the_file_says_not() {
+        let dir = TempDir::new("machines-qemu-grow-root");
+        dir.write("on.toml", "about = \"x\"\ndriver = \"qemu\"\n");
+        dir.write("off.toml", "about = \"x\"\ndriver = \"qemu\"\n[qemu]\ngrow_root = false\n");
+        let machines = load(dir.path()).unwrap();
+        let grows = |name: &str| {
+            let machine = machines.iter().find(|machine| machine.name == name).unwrap();
+            machine.qemu.clone().unwrap_or_default().grow_root
+        };
+        assert!(grows("on") && !grows("off"));
     }
 
     #[test]

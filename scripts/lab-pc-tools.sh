@@ -27,13 +27,17 @@ apt-get install -y --no-install-recommends \
 	nfs-common nfs-ganesha nfs-ganesha-vfs \
 	restic prometheus chrony \
 	krb5-kdc krb5-admin-server \
-	wireguard-tools \
+	wireguard-tools golang-1.24-go \
 	libavif16 fonts-ipafont-gothic xfonts-cyrillic
 
 for unit in nfs-ganesha prometheus krb5-kdc krb5-admin-server \
 	rpcbind.socket rpcbind; do
 	systemctl disable --now "$unit" 2>/dev/null || true
 done
+
+# Pebble, the ACME server the certificate tests run, needs Go 1.24 or
+# later; Ubuntu 24.04's golang-go is 1.22.
+ln -sf /usr/lib/go-1.24/bin/go /usr/local/bin/go
 
 # Mailpit is not packaged: its release, checked against the digest
 # GitHub records for it.

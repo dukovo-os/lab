@@ -44,9 +44,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::driver::real::{Check, Verdict};
 use crate::machines::is_plain_name;
 use crate::ssh::Output;
 use crate::stop::Stop;
+use crate::suite::Test;
 
 /// The exit status with which a host command says the lab PC cannot do
 /// its part of the test (a kernel with no NFS client, say): the test is
@@ -210,6 +212,50 @@ pub fn missing_programs(names: &[String]) -> Vec<String> {
         .filter(|name| !folders.iter().any(|folder| runnable(folder.join(name))))
         .cloned()
         .collect()
+}
+
+/// `machines check`'s line for the lab PC's programs: `ok` when every
+/// program a test's `host_needs` names is there, else a note naming each
+/// one that is not, with how many tests need it. A test whose program is
+/// missing is skipped by a run, so it is a note and not a problem.
+pub fn check_programs(tests: &[Test]) -> Check {
+    let mut needed: BTreeMap<&str, usize> = BTreeMap::new();
+    for test in tests {
+        let mut names: Vec<&str> = test.host_needs.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            *needed.entry(name).or_default() += 1;
+        }
+    }
+    let names: Vec<String> = needed.keys().map(|name| (*name).to_string()).collect();
+    let missing = missing_programs(&names);
+    if missing.is_empty() {
+        return Check {
+            check: "programs",
+            verdict: Verdict::Ok,
+            detail: format!(
+                "the lab PC has every program the tests run on it ({} named)",
+                names.len()
+            ),
+        };
+    }
+    let lacking: Vec<String> = missing
+        .iter()
+        .map(|name| {
+            let count = needed[name.as_str()];
+            format!("{name} ({count} test{})", if count == 1 { "" } else { "s" })
+        })
+        .collect();
+    Check {
+        check: "programs",
+        verdict: Verdict::Note,
+        detail: format!(
+            "the lab PC has no {}, so the tests that need them are skipped: install them with \
+             `sudo sh scripts/lab-pc-tools.sh`",
+            lacking.join(", ")
+        ),
+    }
 }
 
 /// Why a host step cannot run as root.
@@ -549,6 +595,38 @@ mod tests {
         let kdc = ports.get("kdc").unwrap();
         assert_eq!(ports.get("kdc").unwrap(), kdc);
         assert_ne!(ports.get("smb").unwrap(), kdc);
+    }
+
+    #[test]
+    fn the_lab_pc_s_missing_programs_are_named_with_the_tests_that_need_them() {
+        let dir = crate::testing::TempDir::new("peer-programs");
+        let test = |name: &str, needs: &str| {
+            dir.write(
+                &format!("tests/features/{name}.toml"),
+                &format!(
+                    "about = \"x\"\ntime = \"1m\"\nhost_needs = {needs}\n[[step]]\nhost = \"true\"\n"
+                ),
+            );
+        };
+        test("a", "[\"sh\"]");
+        let tests = crate::suite::load(&dir.path().join("tests")).unwrap();
+        let check = check_programs(&tests);
+        assert_eq!(
+            (check.verdict, check.detail.as_str()),
+            (Verdict::Ok, "the lab PC has every program the tests run on it (1 named)")
+        );
+
+        test("b", "[\"no-such-server-anywhere\", \"sh\"]");
+        test("c", "[\"no-such-server-anywhere\", \"no-other-server-here\"]");
+        let tests = crate::suite::load(&dir.path().join("tests")).unwrap();
+        let check = check_programs(&tests);
+        assert_eq!(check.verdict, Verdict::Note);
+        assert_eq!(
+            check.detail,
+            "the lab PC has no no-other-server-here (1 test), no-such-server-anywhere (2 tests), \
+             so the tests that need them are skipped: install them with \
+             `sudo sh scripts/lab-pc-tools.sh`"
+        );
     }
 
     /// Whether no process has the id `pid` any more (or it is a zombie

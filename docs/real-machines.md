@@ -96,6 +96,15 @@ and needs the lab card's address.
    `ok`, a `note`, or a `PROBLEM` that stops runs there, and says how to
    put it right; it exits 3 while there is a problem.
 
+### The lab PC's programs
+
+Some tests run the far side of what they check on the lab PC: an NFS
+server, a KDC, a mail catcher, WireGuard. A test whose program the lab PC
+lacks is skipped, saying so. `sudo sh scripts/lab-pc-tools.sh` installs
+them all on a Debian, Ubuntu or Mint lab PC; `dukovo-lab machines check`
+ends with a line that says `ok` when every program is there, or names
+each missing program and how many tests need it.
+
 ## What the driver does
 
 | Control | How |
@@ -142,9 +151,10 @@ the disk. The command and what it printed are in the driver's log
 boot fails with its output: a lab whose roots do not grow gives tests
 false failures. It needs the lab's key and password (`dukovo-lab key`).
 
-`grow_root = false` under `[amt]` or `[plug]` in the machine file turns
-it off. QEMU does not grow: its disk is the image itself, with no room
-after the root.
+`grow_root = false` under `[amt]`, `[plug]` or `[qemu]` in the machine
+file turns it off. A QEMU machine grows its root the same way: each boot's
+disk is an 8 GiB overlay over the image, with the room after the root
+that the image itself lacks.
 
 ## The clock is set to the lab PC's
 

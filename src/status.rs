@@ -22,6 +22,10 @@ use crate::bundle::{Outcome, ResultRecord, ResultsFile, RunRecord, StepRecord};
 use crate::clock::Utc;
 use crate::store;
 
+/// What a test says that a run's process ended in, which a run resumed
+/// runs again.
+pub const DIED_DURING: &str = "the run's process ended during this test";
+
 /// How many of the last events a status carries, for following a run.
 const RECENT_EVENTS: usize = 40;
 
@@ -253,7 +257,7 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
         waiting.clear();
         for entry in tests.iter_mut().filter(|entry| entry.state == TestStateKind::Running) {
             entry.state = TestStateKind::Error;
-            entry.reason = Some("the run's process ended during this test".into());
+            entry.reason = Some(DIED_DURING.into());
         }
     }
 
@@ -503,6 +507,8 @@ mod tests {
             schedule: None,
             summary: None,
             stopped: false,
+            resumes: None,
+            options: None,
         }
     }
 

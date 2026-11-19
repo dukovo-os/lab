@@ -104,6 +104,7 @@ What each driver does by itself:
 | `disk` | `sata` | `sata` (AHCI, as the OptiPlex in AHCI mode), `nvme` or `virtio`. |
 | `nic` | `virtio-net-pci` | The network card, as a QEMU device name such as `e1000e`. |
 | `tcg_slowdown` | `4` | How many times longer tests may take without KVM. |
+| `grow_root` | `true` | Whether each fresh boot grows the root to the end of its disk, an 8 GiB overlay over the image, before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)); a test that installs a bundle needs the room. |
 
 QEMU needs `qemu-system-x86`, `qemu-utils` and, for UEFI, `ovmf` (the
 Mint and Ubuntu package names). OVMF is looked for where distributions
@@ -130,7 +131,7 @@ lab network. [Real machines](real-machines.md) sets one up.
 | `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
 | `console` | `ttyS0,115200` | The machine's serial port as Linux names it, for the writer and the Linux twin. A board's own ports are `ttyS0` to `ttyS3`; PCI ports come after, from `ttyS4`, and with Serial-over-LAN on, AMT's own port is the first of them, so a serial card's first port is then `ttyS5`. |
-| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. QEMU has no such setting: its disk is the image itself, with no room after the root. |
+| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. A QEMU machine's disk is an 8 GiB overlay over the image, and its `[qemu]` section takes the same setting. |
 
 ## Plug settings
 
@@ -152,4 +153,4 @@ sets one up.
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
 | `netlog_port` | `6666` | The UDP port the lab PC listens on for the machine's netlog. The lab image sends to 6666, so change this only with the image. A run listens on one port, so only one plug machine runs at a time. |
 | `on_watts` | `5.0` | The least the machine draws while it runs, in watts. A plug that is on with the machine drawing less means the machine shut itself down. |
-| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. QEMU has no such setting: its disk is the image itself, with no room after the root. |
+| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. A QEMU machine's disk is an 8 GiB overlay over the image, and its `[qemu]` section takes the same setting. |

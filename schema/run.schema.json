@@ -34,6 +34,21 @@
     "tests": { "description": "Test ids, in the order they ran.", "type": "array", "items": { "type": "string" } },
     "preset": { "description": "The preset the tests came from, if they did.", "type": ["string", "null"] },
     "schedule": { "description": "The schedule that started the run, if one did; left out otherwise.", "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "resumes": { "description": "The run this one resumes (dukovo-lab run --resume), whose unfinished tests it ran; left out otherwise.", "type": "string", "pattern": "^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$" },
+    "options": {
+      "description": "What the run was given besides its image and build, which a resume gives again; left out of runs from before it was recorded.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "with_person": { "type": "boolean" },
+        "linux": { "type": "string" },
+        "fonts": { "type": "string" },
+        "browsers": { "type": "string" },
+        "stick": { "type": "string" },
+        "dvd": { "type": "string" },
+        "ob": { "type": "string" }
+      }
+    },
     "stopped": { "description": "Whether dukovo-lab stop cut the run short.", "type": "boolean" },
     "summary": {
       "description": "Counts of results, once the run has ended.",

@@ -100,6 +100,7 @@ dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
                [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
                [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
                [--with-person] [--detach]
+dukovo-lab run --resume <run> --image <file> [--build <text>] [--detach]
 ```
 
 Runs the tests on each machine (default `qemu`), the machines side by
@@ -115,6 +116,28 @@ waits until someone runs the `done` command the line gives, or presses
 Done on the runner page. If no one does by the test's time limit, the
 test is skipped, not failed. Only give `--with-person` when someone is
 at the machines.
+
+`--resume <run>` starts a new run of the tests that run did not finish,
+and only those: the ones skipped because the run was stopped (before or
+during the test) or that its process died in or never reached. It runs
+them on the machines they were left on (a machine with nothing left is
+not started), with the options the first run had, which its run.json
+records: `--with-person`, the preset and the kits (`--linux`, `--fonts`,
+`--browsers`, `--stick`, `--dvd`, `--ob`); a kit given now fills in one the
+run had none of. Give no tests, `--all`, `--preset` or `--machine` with
+it. The new run's run.json names the run it resumes (`resumes`), and
+`--resume` refuses, saying why, when:
+
+- the run is still going (`dukovo-lab status` shows it);
+- every test of the run ran to its end;
+- `--build` or `--image` is not the run's own build and image:
+  `dukovo-lab runs --json` shows each run's build and image. Check out the
+  run's build and rebuild the image (`ob lab`) to resume it. A run given no
+  `--build` has only its image's path to go by, so its image is also
+  refused when the file is newer than the run (`ls -l` shows its time).
+
+The first run's bundle is not changed. Resuming a run twice runs its
+unfinished tests twice.
 
 A machine runs one run at a time. When a picked machine is busy with
 another run, `run` exits 4 and runs nothing.
@@ -415,7 +438,10 @@ logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.
 screenshots/<machine>/    <category>-<test>-<name>.png, and .txt: the screen's text, with --fonts
 ```
 
-A run a schedule started names it in run.json (`schedule`). Once a run
+A run a schedule started names it in run.json (`schedule`), and a run
+that resumes another names that (`resumes`). run.json also records the
+options the run was given (`options`: `with_person` and the kits' folders
+and files), which a resume gives again. Once a run
 is sent, its bundle also holds `sent.json` (when, the commit,
 and which findings), which stays on the lab PC. Findings live beside the
 runs, in `findings/<id>.json` in the store.
@@ -448,6 +474,8 @@ JSON. Times are UTC, in RFC 3339.
 | An engine is skipped saying it would not start on the lab PC | A system library the engine needs is missing. On Linux, `sudo npx --prefix out/lab-browsers playwright install-deps` installs them. |
 | Installer tests are skipped saying the run was given no stick | Give `--stick` with the install stick's image (`ob image` builds it as `out/dukovo-<version>-x86_64.img`); `ob lab` builds and passes it. |
 | Installer tests are skipped saying the run was given no DVD | Give `--dvd` with the install DVD's ISO (`ob image --iso` builds it as `out/dukovo-<version>-x86_64.iso`); `ob lab` builds and passes it. |
+| An AMT call fails "tried 3 times" | The network dropped, refused or timed out each of three tries, 2 seconds apart. AMT's own refusals (a `ReturnValue`) are not tried again. Check the lab network and the machine's AMT with `dukovo-lab machines check`. |
+| `run --resume` refuses: build or image differs | A resume tests what the first run did. See [run](#run). |
 | `run` exits 4: a machine is busy | Another run is using it. `dukovo-lab status` shows that run; wait for it or `dukovo-lab stop` it. |
 | `status` says a run `died` | Its process ended part way (killed, crashed, or the PC went down). `results` has what it finished; a detached run's own last messages are in `status`'s `output`. |
 | `send` exits 2: there is no lab-results clone | Make it once: `git clone git@github.com:dukovo-os/lab-results.git ~/.local/share/dukovo-lab/lab-results` (`ob lab` does this for you). The lab PC's GitHub account needs push access. |

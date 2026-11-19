@@ -54,12 +54,40 @@ pub struct RunRecord {
     /// The schedule that started it, if one did (see schedule.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<String>,
+    /// The run this one resumes (`dukovo-lab run --resume`): its tests are
+    /// the ones that run did not finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes: Option<String>,
+    /// What the run was given besides its image and build, which a resume
+    /// gives again. Runs from before it was recorded have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<RunOptions>,
     /// Counts of results, once the run has ended.
     pub summary: Option<Summary>,
     /// Whether `dukovo-lab stop` cut the run short; the tests it did not
     /// finish are skipped, with the reason.
     #[serde(default)]
     pub stopped: bool,
+}
+
+/// The options a run was given, in run.json: whether a person was at the
+/// machines and the folders and files of its kits, as given.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct RunOptions {
+    #[serde(default)]
+    pub with_person: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fonts: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browsers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stick: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dvd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ob: Option<String>,
 }
 
 /// A machine in run.json.
@@ -239,6 +267,8 @@ mod tests {
             schedule: None,
             summary: None,
             stopped: false,
+            resumes: None,
+            options: None,
         };
         let bundle = Bundle::create(store.path(), record.clone()).unwrap();
         let path = store.path().join("runs/2026-11-07").join(&id).join("run.json");

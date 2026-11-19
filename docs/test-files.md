@@ -80,7 +80,7 @@ Each step has exactly one action key, and only the options that go with it.
 | `power = "cut"` | | Pulls the power cord: the system gets no warning. | cord |
 | `link = "down"` or `"up"` | | Pulls or plugs in the network cable. | link |
 | `usb = "plug"` | `image` or `blank` | Plugs in a USB stick: a copy of `image`, a file in the test's folder, or with `blank = "64M"` an empty stick of that size, from `1M` to `4G` (`K`, `M` or `G`). | usb |
-| `usb = "unplug"` | | Pulls the stick out. | usb |
+| `usb = "unplug"` | | Pulls the stick out. A stick, card or disc a test leaves in is taken out by the lab when the test ends on a QEMU machine, so the next test that shares the boot starts with the ports empty; the test's log says so. On a real machine a person plugs and pulls, and what they leave stays. | usb |
 | `card = "insert"` | `image` or `blank` | Puts a memory card in the card reader: a copy of `image`, or with `blank = "64M"` an empty card of that size, as `usb = "plug"` takes them. The reader stays plugged in; only the card comes and goes. See [Card reader tests](#card-reader-tests). | card |
 | `card = "remove"` | | Takes the card out of the reader, whether or not the machine let go of it. | card |
 | `card = "reinsert"` | | Puts the card taken out last back in, holding what the machine wrote on it. | card |

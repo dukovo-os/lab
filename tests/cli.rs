@@ -593,6 +593,9 @@ fn machines_check_says_what_a_real_machine_lacks() {
     assert_eq!(verdict("writer").as_deref(), Some("problem"));
     // QEMU machines have nothing to check.
     assert!(verdicts("qemu").is_empty());
+    // The lab PC's programs are one more check, whichever machines are named.
+    assert_eq!(answer["lab_pc"]["check"], "programs");
+    assert!(["ok", "note"].contains(&answer["lab_pc"]["verdict"].as_str().unwrap()), "{answer}");
     // One machine by name; an unknown one is a usage error.
     let (status, _) = setting.run(&["machines", "check", "qemu"]);
     assert_eq!(status, Some(0));

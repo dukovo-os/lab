@@ -64,7 +64,7 @@ pub trait Driver: Send {
     /// Whether the runner grows the root of a fresh boot to the end of the
     /// disk before the test starts ([`crate::run::GROW_ROOT`]): a real
     /// machine's disk has room after the image the lab wrote, and QEMU's
-    /// disk is the image itself.
+    /// disk is made larger than the image for it.
     fn grows_root(&self) -> bool {
         false
     }
@@ -188,6 +188,17 @@ pub trait Driver: Send {
     /// holding what the machine wrote on it.
     fn reinsert_floppy(&mut self) -> Result<(), String> {
         Err("this machine's driver cannot put a floppy disk in its drive".into())
+    }
+
+    /// Takes out whatever a test left in the machine's USB port, card
+    /// reader, optical drive or floppy drive, so that the next test, which
+    /// shares the boot, finds them empty: a second USB stick cannot be
+    /// plugged in while the first is. Gives each thing taken out as the
+    /// test left it ("USB stick 4 plugged in"), or why it would not come
+    /// out. A driver whose media a person handles leaves them where they
+    /// are.
+    fn take_out_media(&mut self) -> Vec<Result<String, String>> {
+        Vec::new()
     }
 
     /// Presses each key combination in turn.

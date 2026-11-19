@@ -359,6 +359,9 @@ pub mod fake {
         pub screen_busy: Option<Busy>,
         /// Whether AMT answers: when not, it hangs up on each request.
         pub answering: bool,
+        /// How many of the next connections it hangs up on before an
+        /// answer, as a lab network that drops them does.
+        pub dropped_connections: u32,
         /// How many power state reads after a turn on still say off, as
         /// AMT's do while the machine starts.
         pub off_after_on: u32,
@@ -421,6 +424,7 @@ pub mod fake {
                 on_boot: None,
                 screen_busy: None,
                 answering: true,
+                dropped_connections: 0,
                 off_after_on: 0,
                 off_reads: 0,
                 ignored_hard_offs: 0,
@@ -487,6 +491,10 @@ pub mod fake {
         let Ok(request) = http::read_request(stream) else { return };
         let mut state_now = state.lock().unwrap();
         if !state_now.answering {
+            return;
+        }
+        if state_now.dropped_connections > 0 {
+            state_now.dropped_connections -= 1;
             return;
         }
         if request.path != "/wsman" || !signed_in(&request, state_now.nonce) {
@@ -768,6 +776,39 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert!(unique.len() > 45);
+    }
+
+    #[test]
+    fn a_call_is_sent_again_when_the_connection_drops() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        // Two connections dropped: the third carries the call.
+        fake.state.lock().unwrap().dropped_connections = 2;
+        amt.change_power(PowerChange::On).unwrap();
+        assert_eq!(fake.state.lock().unwrap().dropped_connections, 0);
+        assert_eq!(fake.calls(), ["RequestPowerStateChange 2"], "AMT took the call once");
+    }
+
+    #[test]
+    fn a_call_that_the_network_fails_three_times_gives_the_last_error() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        fake.state.lock().unwrap().dropped_connections = 3;
+        let err = amt.power_state().unwrap_err();
+        assert!(err.starts_with(&format!("AMT at {}: reading", fake.address)), "{err}");
+        assert!(err.contains("the answer is cut short") && err.contains("tried 3 times"), "{err}");
+        assert_eq!(fake.state.lock().unwrap().dropped_connections, 0, "three connections made");
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn amt_s_own_refusal_is_not_sent_again() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        // The machine has no agent to shut it down, so AMT answers 1.
+        let err = amt.change_power(PowerChange::SoftOff).unwrap_err();
+        assert!(err.contains("returned 1") && !err.contains("tried"), "{err}");
+        assert_eq!(fake.calls(), ["RequestPowerStateChange 12"]);
     }
 
     #[test]

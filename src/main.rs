@@ -29,6 +29,7 @@ mod output;
 mod peer;
 mod png;
 mod qmp;
+mod resume;
 mod run;
 mod schedule;
 mod screen;
@@ -72,10 +73,12 @@ Commands:
   machines         The machines and who does each of their controls
   machines check [<machine>...]
                    Checks what runs on real machines need: AMT, the
-                   serial port, the lab network, net boot and the key
-  run <test or category>... | --all | --preset <name>
+                   serial port, the lab network, net boot and the key; and
+                   the programs the tests run on this PC
+  run <test or category>... | --all | --preset <name> | --resume <run>
                    Runs tests on one or more machines at once, and writes
-                   a results bundle
+                   a results bundle; --resume runs what a stopped run
+                   did not finish
   status [<run>]   How a run is going, or how it went (default: the run
                    going now, else the last)
   stop [<run>]     Stops a run part way; what it did not finish is skipped
@@ -130,6 +133,8 @@ Options for run:
   --build <text>   The build's name for the bundle, such as \"0.13.0 fd2a9e8\"
   --all            Every test
   --preset <name>  The tests of a preset in presets.toml
+  --resume <run>   Run the tests that run did not finish, on its machines,
+                   with its options; needs its image and build
   --with-person    Also run Needs you tests, asking a person to do their steps
   --detach         Start the run in the background, print its id and return
 
@@ -231,6 +236,8 @@ struct Arguments {
     title: Option<String>,
     /// run: the schedule that started it.
     schedule: Option<String>,
+    /// run: the run whose unfinished tests this run runs.
+    resume: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -291,6 +298,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--days" => arguments.days = Some(value("--days")?),
             "--title" => arguments.title = Some(value("--title")?),
             "--schedule" => arguments.schedule = Some(value("--schedule")?),
+            "--resume" => arguments.resume = Some(value("--resume")?),
             "--each-build" => arguments.each_build = true,
             "--send" => arguments.send = true,
             "--hold" => arguments.hold = true,
@@ -614,16 +622,18 @@ fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> 
         };
         results.push((machine, checks));
     }
+    let programs = lab_pc_programs(arguments);
     let problems = results
         .iter()
         .flat_map(|(_, checks)| checks)
+        .chain(std::iter::once(&programs))
         .any(|check| check.verdict == driver::real::Verdict::Problem);
     if arguments.json {
         let machines: Vec<Value> = results
             .iter()
             .map(|(machine, checks)| json!({ "name": machine.name, "checks": checks }))
             .collect();
-        println!("{}", json!({ "machines": machines }));
+        println!("{}", json!({ "machines": machines, "lab_pc": programs }));
     } else {
         for (machine, checks) in &results {
             if checks.is_empty() {
@@ -631,55 +641,71 @@ fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> 
                 continue;
             }
             println!("{}: {}", machine.name, machine.about);
-            for check in checks {
-                let verdict = match check.verdict {
-                    driver::real::Verdict::Ok => "ok",
-                    driver::real::Verdict::Note => "note",
-                    driver::real::Verdict::Problem => "PROBLEM",
-                };
-                println!("  {verdict:<8} {:<13} {}", check.check, check.detail);
-            }
+            print_checks(checks);
         }
+        println!("lab PC: the programs the tests run on it");
+        print_checks(&[programs]);
     }
     Ok(if problems { 3 } else { 0 })
+}
+
+/// `machines check`'s line for the lab PC's programs. When the tests
+/// cannot be read, it says so as a note: the rest of the command needs
+/// no tests.
+fn lab_pc_programs(arguments: &Arguments) -> driver::real::Check {
+    match arguments.load_tests() {
+        Ok(tests) => peer::check_programs(&tests),
+        Err(Error::Usage(why) | Error::Harness(why) | Error::Busy(why)) => driver::real::Check {
+            check: "programs",
+            verdict: driver::real::Verdict::Note,
+            detail: format!(
+                "the tests could not be read, so the programs they need are not checked: {why}"
+            ),
+        },
+    }
+}
+
+fn print_checks(checks: &[driver::real::Check]) {
+    for check in checks {
+        let verdict = match check.verdict {
+            driver::real::Verdict::Ok => "ok",
+            driver::real::Verdict::Note => "note",
+            driver::real::Verdict::Problem => "PROBLEM",
+        };
+        println!("  {verdict:<8} {:<13} {}", check.check, check.detail);
+    }
+}
+
+/// The tests and machines of a run, and what it was given.
+struct Picked<'a> {
+    tests: Vec<&'a Test>,
+    machines: Vec<&'a Machine>,
+    /// The run being resumed, when this run resumes one.
+    resume: Option<resume::Resume>,
+    preset: Option<String>,
+    options: bundle::RunOptions,
 }
 
 /// `run`: runs tests and writes a bundle.
 fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     let tests = arguments.load_tests()?;
-    let presets = arguments.load_presets(&tests)?;
-    let picked = match (arguments.all, arguments.names.is_empty(), &arguments.preset) {
-        (true, true, None) => tests.iter().collect(),
-        (false, false, None) => suite::select(&tests, &arguments.names)?,
-        (false, true, Some(name)) => {
-            let preset = presets.iter().find(|preset| preset.name == *name).ok_or_else(|| {
-                let known: Vec<&str> = presets.iter().map(|preset| preset.name.as_str()).collect();
-                Error::Usage(format!(
-                    "no preset named \"{name}\"; the presets are: {}",
-                    if known.is_empty() { "none".to_string() } else { known.join(", ") }
-                ))
-            })?;
-            suite::select(&tests, &preset.tests)?
-        }
-        (false, true, None) => {
-            return Err(Error::Usage(
-                "name the tests or categories to run, or give --all or --preset".into(),
-            ));
-        }
-        _ => return Err(Error::Usage("give tests, --all or --preset: only one".into())),
-    };
     let all_machines = arguments.load_machines()?;
-    let machines = machines::select(&all_machines, arguments.machine.as_deref().unwrap_or("qemu"))?;
     let image = arguments.image.clone().ok_or_else(|| {
         Error::Usage("run needs --image, the image to test (`ob lab` gives it)".into())
     })?;
     if !image.is_file() {
         return Err(Error::Usage(format!("the image {} does not exist", image.display())));
     }
+    let store = arguments.store_dir()?;
+    let picked = match &arguments.resume {
+        Some(id) => pick_unfinished(arguments, &store, id, &image, &tests, &all_machines)?,
+        None => pick_requested(arguments, &tests, &all_machines)?,
+    };
+    let Picked { tests: picked, machines, resume, preset, options } = picked;
     let key = ssh::key_path(&arguments.config_dir()?);
     let key = key.is_file().then_some(key);
     if key.is_none() {
-        refuse_commands_without_key(&picked, &machines, arguments.with_person)?;
+        refuse_commands_without_key(&picked, &machines, options.with_person)?;
     }
     let password =
         ssh::read_password(&ssh::password_path(&arguments.config_dir()?)).map_err(Error::Usage)?;
@@ -687,38 +713,43 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         refuse_password_without_one(&picked)?;
     }
     // Without a kit, performance tests skip, saying how to get one.
-    let linux = match &arguments.linux {
+    let linux_folder = options.linux.as_deref().map(PathBuf::from);
+    let linux = match &linux_folder {
         Some(dir) => Some(bench::Kit::read(dir).map_err(Error::Usage)?),
         None => None,
     };
     // Without fonts, steps that read the screen skip; without a browser
     // kit, steps that drive a browser; without a stick, tests that boot
     // it; each says how to get one.
-    let fonts = match &arguments.fonts {
+    let fonts_folder = options.fonts.as_deref().map(PathBuf::from);
+    let fonts = match &fonts_folder {
         Some(dir) => Some(screen::Font::read_dir(dir).map_err(Error::Usage)?),
         None => None,
     };
-    if let Some(browsers) = &arguments.browsers
+    let browsers = options.browsers.as_deref().map(PathBuf::from);
+    if let Some(browsers) = &browsers
         && !browsers.is_dir()
     {
         return Err(Error::Usage(format!("the browser kit {} does not exist", browsers.display())));
     }
-    if let Some(stick) = &arguments.stick
+    let stick = options.stick.as_deref().map(PathBuf::from);
+    if let Some(stick) = &stick
         && !stick.is_file()
     {
         return Err(Error::Usage(format!("the install stick {} does not exist", stick.display())));
     }
-    if let Some(dvd) = &arguments.dvd
+    let dvd = options.dvd.as_deref().map(PathBuf::from);
+    if let Some(dvd) = &dvd
         && !dvd.is_file()
     {
         return Err(Error::Usage(format!("the install DVD {} does not exist", dvd.display())));
     }
-    if let Some(ob) = &arguments.ob
+    let ob = options.ob.as_deref().map(PathBuf::from);
+    if let Some(ob) = &ob
         && !ob.is_file()
     {
         return Err(Error::Usage(format!("Dukovo's ob {} does not exist", ob.display())));
     }
-    let store = arguments.store_dir()?;
     if arguments.detach {
         return detach(arguments, &store, &machines);
     }
@@ -735,15 +766,18 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         store,
         key,
         password,
-        with_person: arguments.with_person,
+        with_person: options.with_person,
         linux,
+        linux_folder,
         fonts,
-        browsers: arguments.browsers.clone(),
-        stick: arguments.stick.clone(),
-        dvd: arguments.dvd.clone(),
-        ob: arguments.ob.clone(),
-        preset: arguments.preset.clone(),
+        fonts_folder,
+        browsers,
+        stick,
+        dvd,
+        ob,
+        preset,
         schedule: arguments.schedule.clone(),
+        resume,
         id: arguments.run_id.clone(),
     };
     let reporter = output::Reporter::new(arguments.json);
@@ -753,6 +787,89 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         summary if summary.failed > 0 => 1,
         _ => 0,
     })
+}
+
+/// The tests and machines the command line names, with its options.
+fn pick_requested<'a>(
+    arguments: &Arguments,
+    tests: &'a [Test],
+    all_machines: &'a [Machine],
+) -> Result<Picked<'a>, Error> {
+    let presets = arguments.load_presets(tests)?;
+    let picked = match (arguments.all, arguments.names.is_empty(), &arguments.preset) {
+        (true, true, None) => tests.iter().collect(),
+        (false, false, None) => suite::select(tests, &arguments.names)?,
+        (false, true, Some(name)) => {
+            let preset = presets.iter().find(|preset| preset.name == *name).ok_or_else(|| {
+                let known: Vec<&str> = presets.iter().map(|preset| preset.name.as_str()).collect();
+                Error::Usage(format!(
+                    "no preset named \"{name}\"; the presets are: {}",
+                    if known.is_empty() { "none".to_string() } else { known.join(", ") }
+                ))
+            })?;
+            suite::select(tests, &preset.tests)?
+        }
+        (false, true, None) => {
+            return Err(Error::Usage(
+                "name the tests or categories to run, or give --all, --preset or --resume".into(),
+            ));
+        }
+        _ => return Err(Error::Usage("give tests, --all or --preset: only one".into())),
+    };
+    let machines = machines::select(all_machines, arguments.machine.as_deref().unwrap_or("qemu"))?;
+    let given = |path: &Option<PathBuf>| path.as_ref().map(|path| path.display().to_string());
+    let options = bundle::RunOptions {
+        with_person: arguments.with_person,
+        linux: given(&arguments.linux),
+        fonts: given(&arguments.fonts),
+        browsers: given(&arguments.browsers),
+        stick: given(&arguments.stick),
+        dvd: given(&arguments.dvd),
+        ob: given(&arguments.ob),
+    };
+    Ok(Picked { tests: picked, machines, resume: None, preset: arguments.preset.clone(), options })
+}
+
+/// The tests run `id` did not finish, on the machines it left them on,
+/// with the options it had. An option given on the command line fills in
+/// one the run had none of (and `--with-person` adds the person); the
+/// image and the build must be the run's own.
+fn pick_unfinished<'a>(
+    arguments: &Arguments,
+    store: &Path,
+    id: &str,
+    image: &Path,
+    tests: &'a [Test],
+    all_machines: &'a [Machine],
+) -> Result<Picked<'a>, Error> {
+    if !arguments.names.is_empty()
+        || arguments.all
+        || arguments.preset.is_some()
+        || arguments.machine.is_some()
+    {
+        return Err(Error::Usage(
+            "--resume runs the tests and machines of that run: give no tests, --all, --preset or --machine with it".into(),
+        ));
+    }
+    let plan = resume::plan(store, id, image, arguments.build.as_deref())?;
+    let machines = machines::select(all_machines, &plan.machines().join(","))?;
+    let names: Vec<String> = plan.tests().into_iter().map(String::from).collect();
+    let picked = suite::select(tests, &names)?;
+    let first = plan.record.options.clone().unwrap_or_default();
+    let given = |now: &Option<PathBuf>, before: &Option<String>| {
+        now.as_ref().map(|path| path.display().to_string()).or_else(|| before.clone())
+    };
+    let options = bundle::RunOptions {
+        with_person: first.with_person || arguments.with_person,
+        linux: given(&arguments.linux, &first.linux),
+        fonts: given(&arguments.fonts, &first.fonts),
+        browsers: given(&arguments.browsers, &first.browsers),
+        stick: given(&arguments.stick, &first.stick),
+        dvd: given(&arguments.dvd, &first.dvd),
+        ob: given(&arguments.ob, &first.ob),
+    };
+    let preset = plan.record.preset.clone();
+    Ok(Picked { tests: picked, machines, resume: Some(plan), preset, options })
 }
 
 /// Stops a run before it starts when a test that would run has to run

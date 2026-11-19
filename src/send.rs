@@ -394,6 +394,8 @@ mod tests {
             schedule: None,
             summary: None,
             stopped: false,
+            resumes: None,
+            options: None,
         };
         let bundle = Bundle::create(store, record.clone()).unwrap();
         let results = [ResultRecord {

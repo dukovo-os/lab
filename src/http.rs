@@ -230,6 +230,28 @@ impl Answer {
     }
 }
 
+/// Why [`try_send`] failed.
+#[derive(Debug)]
+pub struct Failure {
+    /// What went wrong, in a sentence that names the address.
+    pub message: String,
+    /// Whether the network failed it: no connection could be made, or one
+    /// timed out or dropped before a whole answer came. Sending the same
+    /// request again may then work. A server's answer that is not HTTP,
+    /// or an address that does not resolve, will not mend.
+    pub network: bool,
+}
+
+impl Failure {
+    fn network(message: impl std::fmt::Display) -> Failure {
+        Failure { message: message.to_string(), network: true }
+    }
+
+    fn malformed(message: impl std::fmt::Display) -> Failure {
+        Failure { message: message.to_string(), network: false }
+    }
+}
+
 /// Sends one request to `address` (`host:port`) and reads the whole
 /// answer, giving up when connecting or any read takes longer than
 /// `time`. A server that refuses the connection outright is tried again
@@ -245,11 +267,25 @@ pub fn send(
     time: Duration,
     patience: Duration,
 ) -> Result<Answer, String> {
+    try_send(address, method, path, headers, body, time, patience)
+        .map_err(|failure| failure.message)
+}
+
+/// As [`send`], saying whether a failure was the network's.
+pub fn try_send(
+    address: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &[u8],
+    time: Duration,
+    patience: Duration,
+) -> Result<Answer, Failure> {
     let to = address
         .to_socket_addrs()
-        .map_err(|err| format!("{address}: {err}"))?
+        .map_err(|err| Failure::malformed(format!("{address}: {err}")))?
         .next()
-        .ok_or_else(|| format!("{address}: no address"))?;
+        .ok_or_else(|| Failure::malformed(format!("{address}: no address")))?;
     let deadline = Instant::now() + patience;
     let mut stream = loop {
         match TcpStream::connect_timeout(&to, time) {
@@ -257,11 +293,13 @@ pub fn send(
             Err(err) if err.kind() == ErrorKind::ConnectionRefused && Instant::now() < deadline => {
                 std::thread::sleep(REFUSED_GAP);
             }
-            Err(err) => return Err(format!("connecting to {address}: {err}")),
+            Err(err) => return Err(Failure::network(format!("connecting to {address}: {err}"))),
         }
     };
-    stream.set_read_timeout(Some(time)).map_err(|err| err.to_string())?;
-    stream.set_write_timeout(Some(time)).map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(time))
+        .and_then(|()| stream.set_write_timeout(Some(time)))
+        .map_err(Failure::malformed)?;
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
@@ -273,20 +311,27 @@ pub fn send(
     stream
         .write_all(head.as_bytes())
         .and_then(|()| stream.write_all(body))
-        .map_err(|err| format!("sending to {address}: {err}"))?;
-    read_answer(&mut BufReader::new(stream.take(ANSWER_LIMIT as u64 + 64 * 1024)))
-        .map_err(|err| format!("reading {address}'s answer: {err}"))
+        .map_err(|err| Failure::network(format!("sending to {address}: {err}")))?;
+    read_answer(&mut BufReader::new(stream.take(ANSWER_LIMIT as u64 + 64 * 1024))).map_err(
+        |failure| Failure {
+            message: format!("reading {address}'s answer: {}", failure.message),
+            network: failure.network,
+        },
+    )
 }
 
 /// Reads an answer: its head, then a body of Content-Length bytes, in
 /// chunks, or up to the end of the connection.
-fn read_answer(reader: &mut impl BufRead) -> Result<Answer, String> {
+fn read_answer(reader: &mut impl BufRead) -> Result<Answer, Failure> {
     let mut line = String::new();
-    let mut next_line = |line: &mut String| -> Result<(), String> {
+    let mut next_line = |line: &mut String| -> Result<(), Failure> {
         line.clear();
-        let read = reader.read_line(line).map_err(|err| err.to_string())?;
-        if read == 0 || line.len() > HEAD_LIMIT {
-            return Err("the answer is cut short".into());
+        let read = reader.read_line(line).map_err(Failure::network)?;
+        if read == 0 {
+            return Err(Failure::network("the answer is cut short"));
+        }
+        if line.len() > HEAD_LIMIT {
+            return Err(Failure::malformed("the answer's head is too long"));
         }
         Ok(())
     };
@@ -295,7 +340,7 @@ fn read_answer(reader: &mut impl BufRead) -> Result<Answer, String> {
         .split_whitespace()
         .nth(1)
         .and_then(|status| status.parse().ok())
-        .ok_or_else(|| format!("a bad status line: {}", line.trim()))?;
+        .ok_or_else(|| Failure::malformed(format!("a bad status line: {}", line.trim())))?;
     let mut headers = Vec::new();
     loop {
         next_line(&mut line)?;
@@ -303,7 +348,7 @@ fn read_answer(reader: &mut impl BufRead) -> Result<Answer, String> {
         if line.is_empty() {
             break;
         }
-        let (name, value) = line.split_once(':').ok_or("a bad header line")?;
+        let (name, value) = line.split_once(':').ok_or(Failure::malformed("a bad header line"))?;
         headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
     let mut answer = Answer { status, headers, body: Vec::new() };
@@ -313,44 +358,45 @@ fn read_answer(reader: &mut impl BufRead) -> Result<Answer, String> {
     if chunked {
         answer.body = read_chunks(reader)?;
     } else if let Some(length) = answer.header("content-length") {
-        let length: usize = length.parse().map_err(|_| "a bad Content-Length")?;
+        let length: usize =
+            length.parse().map_err(|_| Failure::malformed("a bad Content-Length"))?;
         if length > ANSWER_LIMIT {
-            return Err("the answer is too long".into());
+            return Err(Failure::malformed("the answer is too long"));
         }
         answer.body = vec![0; length];
-        reader.read_exact(&mut answer.body).map_err(|err| err.to_string())?;
+        reader.read_exact(&mut answer.body).map_err(Failure::network)?;
     } else {
-        reader.read_to_end(&mut answer.body).map_err(|err| err.to_string())?;
+        reader.read_to_end(&mut answer.body).map_err(Failure::network)?;
     }
     Ok(answer)
 }
 
 /// Reads a chunked body, and the trailer after it.
-fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+fn read_chunks(reader: &mut impl BufRead) -> Result<Vec<u8>, Failure> {
     let mut body = Vec::new();
     let mut line = String::new();
     loop {
         line.clear();
-        reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        reader.read_line(&mut line).map_err(Failure::network)?;
         let size = line.trim().split(';').next().unwrap_or_default();
         let size = usize::from_str_radix(size, 16)
-            .map_err(|_| format!("a bad chunk size: {}", line.trim()))?;
+            .map_err(|_| Failure::malformed(format!("a bad chunk size: {}", line.trim())))?;
         if size == 0 {
             break;
         }
         if body.len() + size > ANSWER_LIMIT {
-            return Err("the answer is too long".into());
+            return Err(Failure::malformed("the answer is too long"));
         }
         let start = body.len();
         body.resize(start + size, 0);
-        reader.read_exact(&mut body[start..]).map_err(|err| err.to_string())?;
+        reader.read_exact(&mut body[start..]).map_err(Failure::network)?;
         line.clear();
-        reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        reader.read_line(&mut line).map_err(Failure::network)?;
     }
     // The trailer, ended by an empty line.
     loop {
         line.clear();
-        let read = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        let read = reader.read_line(&mut line).map_err(Failure::network)?;
         if read == 0 || line.trim().is_empty() {
             return Ok(body);
         }
