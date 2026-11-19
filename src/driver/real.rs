@@ -255,6 +255,7 @@ pub fn ssh_target(setup: &Setup, address: &str, boot: u32) -> Result<ssh::Target
     Ok(ssh::Target {
         host: address.to_string(),
         port: SSH_PORT,
+        user: ssh::LAB_ACCOUNT.into(),
         key,
         known_hosts: setup.work.join(format!("known_hosts-{boot}")),
         scratch: setup.work.join("ssh-output"),

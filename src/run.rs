@@ -47,21 +47,22 @@ use crate::bundle::{
     StepRecord, Summary, new_run_id,
 };
 use crate::clock::Utc;
-use crate::driver::{ATTACKER_ON_SEGMENT, Driver, Setup, TARGET_ON_SEGMENT};
+use crate::driver::{ATTACKER_ON_SEGMENT, Driver, SEGMENT_PREFIX_LENGTH, Setup, TARGET_ON_SEGMENT};
 use crate::findings;
 use crate::health;
 use crate::load;
 use crate::machines::{Control, Machine, Pool, Who};
 use crate::output::{Event, Reporter, short_note};
 use crate::peer::{self, Job, Ports, Readiness, SKIP_STATUS, Token};
+use crate::redteam::RedteamKit;
 use crate::resume::Resume;
 use crate::screen::{self, Font};
 use crate::ssh;
 use crate::stop::Stop;
 use crate::store::Running;
 use crate::suite::{
-    Bench, Boot, Browser, Command, Engine, Fit, PASSWORD_TOKEN, PowerAction, Serve, Step,
-    TARGET_TOKEN, Test,
+    AttackerKind, Bench, Boot, Browser, Command, Engine, Fit, PASSWORD_TOKEN, PowerAction,
+    SAVED_PREFIX, Serve, Step, TARGET_TOKEN, Test, saved_names,
 };
 use crate::units::{describe_duration, format_duration};
 
@@ -119,12 +120,15 @@ pub const NO_DVD: &str = "this test boots the install DVD, and the run was given
 /// Why a `bench` step's numbers are kept but not held to Linux's.
 pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers (no KVM), so they are kept but not held to Linux's";
 
+/// Why a test that attacks from Linux is skipped when the run has no kit.
+pub const NO_REDTEAM: &str = "this test attacks from Linux, and the run was given no red-team kit: `ob lab redteam-kit` builds one and `ob lab` passes it with --redteam";
+
 /// The command that gives a machine the address `ip` on net1, the private
 /// network, and sets that port up. Both run in one shell, so that when it
 /// is run as root (through `elevate`, which elevates only its first
 /// command) the port is set up as root too.
 fn address_setup(ip: &str) -> String {
-    format!("sh -c 'ip address add {ip}/24 dev net1 && ip link set net1 up'")
+    format!("sh -c 'ip address add {ip}/{SEGMENT_PREFIX_LENGTH} dev net1 && ip link set net1 up'")
 }
 
 /// Holds `output` of a `run`, `attack` or `host` command to what the
@@ -213,6 +217,11 @@ pub struct Request<'a> {
     pub linux: Option<Kit>,
     /// The folder the Linux kit was read from, for run.json.
     pub linux_folder: Option<PathBuf>,
+    /// The Linux the attacker boots from for tests that attack with
+    /// `attacker = "linux"`, when given.
+    pub redteam: Option<RedteamKit>,
+    /// The folder the red-team kit was read from, for run.json.
+    pub redteam_folder: Option<PathBuf>,
     /// The console's fonts, for steps that read the screen, when given.
     pub fonts: Option<Vec<Font>>,
     /// The folder the fonts were read from, for run.json.
@@ -259,6 +268,7 @@ struct Shared<'a> {
     with_person: bool,
     password: Option<&'a str>,
     linux: Option<&'a Kit>,
+    redteam: Option<&'a RedteamKit>,
     /// Held while a machine measures performance, so that machines run
     /// side by side never time each other's load.
     measuring: &'a Mutex<()>,
@@ -323,6 +333,7 @@ pub fn run(
         options: Some(RunOptions {
             with_person: request.with_person,
             linux: given(request.linux_folder.as_deref()),
+            redteam: given(request.redteam_folder.as_deref()),
             fonts: given(request.fonts_folder.as_deref()),
             browsers: given(request.browsers.as_deref()),
             stick: given(request.stick.as_deref()),
@@ -361,6 +372,7 @@ pub fn run(
         with_person: request.with_person,
         password: request.password.as_deref(),
         linux: request.linux.as_ref(),
+        redteam: request.redteam.as_ref(),
         measuring: &measuring,
         fonts: request.fonts.as_deref(),
         browsers: request.browsers.as_deref(),
@@ -390,6 +402,7 @@ pub fn run(
             // By number, not name: socket paths must stay short.
             sockets: sockets.join(index.to_string()),
             key: request.key.clone(),
+            redteam: request.redteam.clone(),
             ob: request.ob.clone(),
             stop: stop.clone(),
         };
@@ -955,6 +968,11 @@ struct Worker<'a> {
     /// Whether this boot's attacker is up and both sides have their
     /// addresses on the private network; set up on the first attack step.
     attacker_ready: bool,
+    /// What the test's steps kept with `save`, by name.
+    saved: BTreeMap<String, String>,
+    /// Whether the test being run attacks from the red-team kit's Linux
+    /// instead of a Dukovo guest.
+    linux_attacker: bool,
     /// The test's side on the lab PC: see [`PeerSide`].
     peer: PeerSide,
     /// How host steps run as root, found the first time one does (as
@@ -1017,6 +1035,8 @@ impl<'a> Worker<'a> {
             linux: None,
             screen_file,
             attacker_ready: false,
+            saved: BTreeMap::new(),
+            linux_attacker: false,
             peer: PeerSide { base: peer_folder, ..PeerSide::default() },
             host_root: None,
             unhealthy: 0,
@@ -1045,6 +1065,9 @@ impl<'a> Worker<'a> {
         // driver which kind of boot to give before it boots.
         let attacks = test.controls().contains(&Control::Attack);
         self.driver.want_attacker(attacks);
+        self.saved.clear();
+        self.linux_attacker = attacks && test.attacker == AttackerKind::Linux;
+        self.driver.want_linux_attacker(self.linux_attacker);
         // So does a test that puts cards in a card reader, whose reader,
         // an empty drive, a disk test must not find either.
         let reader = test.card_reader();
@@ -1702,7 +1725,9 @@ impl<'a> Worker<'a> {
         {
             return Err(self.stalled(after, &shown));
         }
-        check_run(&command, &output, shown)
+        let checked = check_run(&command, &output, shown)?;
+        self.keep(command.save.as_deref(), &output);
+        Ok(checked)
     }
 
     /// The failure of a step that was silent for `after`: the first line
@@ -1751,7 +1776,9 @@ impl<'a> Worker<'a> {
                 output.text.trim()
             )));
         }
-        check_command(&command, &output, shown, false)
+        let checked = check_command(&command, &output, shown, false)?;
+        self.keep(command.save.as_deref(), &output);
+        Ok(checked)
     }
 
     /// Runs a `browser` step's script in each of its engines on the lab PC,
@@ -2018,21 +2045,55 @@ impl<'a> Worker<'a> {
         })
     }
 
+    /// Keeps `output`, trimmed, under `name` for the later steps of the
+    /// test, when the step that made it says to.
+    fn keep(&mut self, name: Option<&str>, output: &ssh::Output) {
+        if let Some(name) = name {
+            self.saved.insert(name.to_string(), output.text.trim().to_string());
+        }
+    }
+
+    /// `text` with each `{saved:NAME}` replaced by what an earlier step
+    /// kept under NAME.
+    fn fill_saved(&self, text: &str) -> Result<String, StepFailure> {
+        let mut filled = text.to_string();
+        for name in saved_names(text) {
+            let Some(value) = self.saved.get(name) else {
+                return Err(StepFailure::Error(format!(
+                    "{{saved:{name}}} has no value: no earlier step of this test kept one"
+                )));
+            };
+            filled = filled.replace(&format!("{SAVED_PREFIX}{name}}}"), value);
+        }
+        Ok(filled)
+    }
+
+    /// `text` with its placeholders and saved values filled in.
+    fn fill_text(&mut self, text: &str) -> Result<String, StepFailure> {
+        let text = self.fill(text)?;
+        self.fill_saved(&text)
+    }
+
     /// `command` with the placeholders of its command and checks filled in.
     fn fill_command(&mut self, command: &Command) -> Result<Command, StepFailure> {
         Ok(Command {
-            command: self.fill(&command.command)?,
+            command: self.fill_text(&command.command)?,
             exit: command.exit,
-            expect: command.expect.iter().map(|text| self.fill(text)).collect::<Result<_, _>>()?,
+            expect: command
+                .expect
+                .iter()
+                .map(|text| self.fill_text(text))
+                .collect::<Result<_, _>>()?,
             expect_not: command
                 .expect_not
                 .iter()
-                .map(|text| self.fill(text))
+                .map(|text| self.fill_text(text))
                 .collect::<Result<_, _>>()?,
             root: command.root,
-            input: command.input.as_deref().map(|input| self.fill(input)).transpose()?,
+            input: command.input.as_deref().map(|input| self.fill_text(input)).transpose()?,
             or_skip: command.or_skip.clone(),
             stall: command.stall,
+            save: command.save.clone(),
         })
     }
 
@@ -2089,26 +2150,23 @@ impl<'a> Worker<'a> {
         self.ready_attacker(deadline)?;
         // `{target}` is the machine under test's address on the private
         // network, in the command and in the text its output must hold.
+        let resolve =
+            |text: &String| self.fill_saved(&text.replace(TARGET_TOKEN, TARGET_ON_SEGMENT));
         let resolved = Command {
-            command: command.command.replace(TARGET_TOKEN, TARGET_ON_SEGMENT),
+            command: resolve(&command.command)?,
             exit: command.exit,
-            expect: command
-                .expect
-                .iter()
-                .map(|text| text.replace(TARGET_TOKEN, TARGET_ON_SEGMENT))
-                .collect(),
-            expect_not: command
-                .expect_not
-                .iter()
-                .map(|text| text.replace(TARGET_TOKEN, TARGET_ON_SEGMENT))
-                .collect(),
+            expect: command.expect.iter().map(resolve).collect::<Result<_, _>>()?,
+            expect_not: command.expect_not.iter().map(resolve).collect::<Result<_, _>>()?,
             root: command.root,
             input: None,
             or_skip: None,
             stall: None,
+            save: None,
         };
         let (output, shown) = self.execute_attack(&resolved.command, resolved.root, deadline)?;
-        check_command(&resolved, &output, shown, true)
+        let checked = check_command(&resolved, &output, shown, true)?;
+        self.keep(command.save.as_deref(), &output);
+        Ok(checked)
     }
 
     /// Brings the attacker up and gives it and the machine under test their
@@ -2117,6 +2175,9 @@ impl<'a> Worker<'a> {
     fn ready_attacker(&mut self, deadline: Instant) -> Result<(), StepFailure> {
         if self.attacker_ready {
             return Ok(());
+        }
+        if self.linux_attacker && self.shared.redteam.is_none() {
+            return Err(StepFailure::Skip(NO_REDTEAM.into()));
         }
         self.driver.start_attacker(deadline).map_err(StepFailure::Error)?;
         // Neither machine can reach the other until each has an address on
@@ -2130,12 +2191,16 @@ impl<'a> Worker<'a> {
                 "could not give the machine its address on the private network\n{shown}"
             )));
         }
-        let (output, shown) =
-            self.execute_attack(&address_setup(ATTACKER_ON_SEGMENT), true, deadline)?;
-        if output.status != Some(0) {
-            return Err(StepFailure::Error(format!(
-                "could not give the attacker its address on the private network\n{shown}"
-            )));
+        // The kit's init gives itself its address from the kernel command
+        // line, and has no `elevate` to run this with.
+        if !self.linux_attacker {
+            let (output, shown) =
+                self.execute_attack(&address_setup(ATTACKER_ON_SEGMENT), true, deadline)?;
+            if output.status != Some(0) {
+                return Err(StepFailure::Error(format!(
+                    "could not give the attacker its address on the private network\n{shown}"
+                )));
+            }
         }
         self.attacker_ready = true;
         Ok(())
@@ -2188,7 +2253,18 @@ impl<'a> Worker<'a> {
         root: bool,
         deadline: Instant,
     ) -> Result<(ssh::Output, String), StepFailure> {
-        let (line, input, prompt) = self.as_root(command, root, None)?;
+        let (line, input, prompt) = match self.shared.redteam.filter(|_| self.linux_attacker) {
+            // The kit has no `elevate`: a step that needs root runs as the
+            // kit's user when that is root, and fails when it is not.
+            Some(kit) if root && kit.user != "root" => {
+                return Err(StepFailure::Error(format!(
+                    "this step needs root, and the red-team kit's attacker runs steps as {}: set user = \"root\" in its kit.toml",
+                    kit.user
+                )));
+            }
+            Some(_) => (command.to_string(), None, if root { "#" } else { "$" }),
+            None => self.as_root(command, root, None)?,
+        };
         let output =
             self.driver.attack(&line, input.as_deref(), deadline).map_err(StepFailure::Error)?;
         self.finish(command, output, prompt)
@@ -2790,6 +2866,7 @@ mod tests {
             input: None,
             or_skip: Some("needs an Azure machine".into()),
             stall: None,
+            save: None,
         };
         let output = |status, text: &str| ssh::Output { status, text: text.into() };
         let check = |command: &Command, status, text| {

@@ -85,6 +85,8 @@ pub struct RunOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redteam: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fonts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browsers: Option<String>,

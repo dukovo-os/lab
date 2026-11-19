@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::bench::Kit;
 use crate::machines::{Control, DriverKind, Machine};
+use crate::redteam::RedteamKit;
 use crate::ssh;
 use crate::stop::Stop;
 use crate::suite::{BlankDisc, Button, Floppy, PowerAction, Reader, Stick};
@@ -32,6 +33,9 @@ pub const TARGET_ON_SEGMENT: &str = "10.9.9.1";
 
 /// The attacker's address on that same network.
 pub const ATTACKER_ON_SEGMENT: &str = "10.9.9.2";
+
+/// The prefix length of the private lab network, 10.9.9.0/24.
+pub const SEGMENT_PREFIX_LENGTH: u8 = 24;
 
 /// A machine the runner is driving.
 pub trait Driver: Send {
@@ -245,6 +249,12 @@ pub trait Driver: Send {
     /// a network test). A driver with no attacker ignores it.
     fn want_attacker(&mut self, _yes: bool) {}
 
+    /// Says whether the attacker of the next boot is the red-team kit's
+    /// Linux (`attacker = "linux"`) rather than a Dukovo guest. The runner
+    /// calls it with every [`Driver::want_attacker`]; a driver with no
+    /// attacker ignores it.
+    fn want_linux_attacker(&mut self, _yes: bool) {}
+
     /// Brings the attacker up on the private network, if it is not up
     /// already, so [`Driver::attack`] can run commands on it. Fails when
     /// this machine has no attacker, or it does not come up by `deadline`.
@@ -357,6 +367,9 @@ pub struct Setup {
     pub sockets: PathBuf,
     /// The lab key, for machines with an SSH channel.
     pub key: Option<PathBuf>,
+    /// The Linux the attacker boots from for tests that say
+    /// `attacker = "linux"`, when the run was given it.
+    pub redteam: Option<RedteamKit>,
     /// Dukovo's ob, whose `ob disc-drive` is a QEMU machine's drive of
     /// music CDs, when the run was given it.
     pub ob: Option<PathBuf>,

@@ -35,6 +35,8 @@ pub const KEY_FILE: &str = "lab_ed25519";
 pub struct Target {
     pub host: String,
     pub port: u16,
+    /// The account to log in as: [`LAB_ACCOUNT`] on a machine under test.
+    pub user: String,
     pub key: PathBuf,
     pub known_hosts: PathBuf,
     /// Where the command's output is gathered while it runs.
@@ -171,7 +173,7 @@ impl Target {
     }
 
     fn account(&self) -> String {
-        format!("{LAB_ACCOUNT}@{}", self.host)
+        format!("{}@{}", self.user, self.host)
     }
 
     /// Everything of the command line before the account: no user or
@@ -211,6 +213,13 @@ const PASSWORD_LENGTH: usize = 32;
 /// The lab key's path in the configuration folder `config`.
 pub fn key_path(config: &Path) -> PathBuf {
     config.join(KEY_FILE)
+}
+
+/// The public key beside the private key at `key`.
+pub fn public_key_path(key: &Path) -> PathBuf {
+    let mut path = key.as_os_str().to_owned();
+    path.push(".pub");
+    PathBuf::from(path)
 }
 
 /// The lab password's path in the configuration folder `config`.
@@ -305,6 +314,7 @@ mod tests {
         let target = Target {
             host: "10.77.0.2".into(),
             port: 22,
+            user: LAB_ACCOUNT.into(),
             key: "/keys/it's".into(),
             known_hosts: "/work/known_hosts-1".into(),
             scratch: "/work/ssh-output".into(),
@@ -338,6 +348,7 @@ mod tests {
         let target = Target {
             host: "127.0.0.1".into(),
             port: 40022,
+            user: LAB_ACCOUNT.into(),
             key: "/k/lab_ed25519".into(),
             known_hosts: "/w/known_hosts".into(),
             scratch: "/w/out".into(),

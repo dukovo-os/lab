@@ -105,6 +105,8 @@ struct Page {
     build: Option<String>,
     /// The Linux kit runs from the page hold Dukovo to, when given.
     linux: Option<PathBuf>,
+    /// The red-team kit runs from the page attack from, when given.
+    redteam: Option<PathBuf>,
     /// The console's fonts, the browser kit and the install stick and DVD
     /// runs from the page use, when given.
     fonts: Option<PathBuf>,
@@ -153,6 +155,13 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
     let linux = match &arguments.linux {
         Some(dir) => {
             crate::bench::Kit::read(dir).map_err(Error::Usage)?;
+            Some(absolute(dir.clone())?)
+        }
+        None => None,
+    };
+    let redteam = match &arguments.redteam {
+        Some(dir) => {
+            crate::redteam::RedteamKit::read(dir).map_err(Error::Usage)?;
             Some(absolute(dir.clone())?)
         }
         None => None,
@@ -220,6 +229,7 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         image,
         build: arguments.build.clone(),
         linux,
+        redteam,
         fonts,
         browsers,
         stick,
@@ -553,6 +563,9 @@ impl Page {
         if let Some(linux) = &self.linux {
             args.extend(["--linux".into(), linux.display().to_string()]);
         }
+        if let Some(redteam) = &self.redteam {
+            args.extend(["--redteam".into(), redteam.display().to_string()]);
+        }
         if let Some(fonts) = &self.fonts {
             args.extend(["--fonts".into(), fonts.display().to_string()]);
         }
@@ -834,6 +847,7 @@ mod tests {
             image: None,
             build: None,
             linux: None,
+            redteam: None,
             fonts: None,
             browsers: None,
             stick: None,

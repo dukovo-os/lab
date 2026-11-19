@@ -34,6 +34,7 @@ mod output;
 mod peer;
 mod png;
 mod qmp;
+mod redteam;
 mod resume;
 mod run;
 mod schedule;
@@ -130,6 +131,8 @@ Options for run:
   --image <file>   The image under test (from `ob image --lab`)
   --linux <dir>    The Linux kit performance tests hold Dukovo to (`ob lab`
                    builds it in out/lab-linux)
+  --redteam <dir>  The red-team kit, the Linux that tests with attacker =
+                   \"linux\" attack from (`ob lab redteam-kit` builds it)
   --fonts <dir>    The console's PSF fonts, for steps that read the screen
                    (`ob lab` gives Dukovo's)
   --browsers <dir> The browser kit, for steps that drive a browser (`ob lab`
@@ -222,6 +225,8 @@ struct Arguments {
     image: Option<PathBuf>,
     /// The Linux kit performance tests hold Dukovo to.
     linux: Option<PathBuf>,
+    /// The red-team kit, the attacker's Linux.
+    redteam: Option<PathBuf>,
     /// The console's fonts, for reading the screen.
     fonts: Option<PathBuf>,
     /// The browser kit, for steps that drive a browser.
@@ -318,6 +323,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--store" => arguments.store = Some(value("--store")?.into()),
             "--image" => arguments.image = Some(value("--image")?.into()),
             "--linux" => arguments.linux = Some(value("--linux")?.into()),
+            "--redteam" => arguments.redteam = Some(value("--redteam")?.into()),
             "--fonts" => arguments.fonts = Some(value("--fonts")?.into()),
             "--browsers" => arguments.browsers = Some(value("--browsers")?.into()),
             "--stick" => arguments.stick = Some(value("--stick")?.into()),
@@ -877,6 +883,12 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         Some(dir) => Some(bench::Kit::read(dir).map_err(Error::Usage)?),
         None => None,
     };
+    // Without a red-team kit, tests that attack from Linux skip.
+    let redteam_folder = options.redteam.as_deref().map(PathBuf::from);
+    let redteam = match &redteam_folder {
+        Some(dir) => Some(redteam::RedteamKit::read(dir).map_err(Error::Usage)?),
+        None => None,
+    };
     // Without fonts, steps that read the screen skip; without a browser
     // kit, steps that drive a browser; without a stick, tests that boot
     // it; each says how to get one.
@@ -936,6 +948,8 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         with_person: options.with_person,
         linux,
         linux_folder,
+        redteam,
+        redteam_folder,
         fonts,
         fonts_folder,
         browsers,
@@ -996,6 +1010,7 @@ fn pick_requested<'a>(
     let options = bundle::RunOptions {
         with_person: arguments.with_person,
         linux: given(&arguments.linux),
+        redteam: given(&arguments.redteam),
         fonts: given(&arguments.fonts),
         browsers: given(&arguments.browsers),
         stick: given(&arguments.stick),
@@ -1039,6 +1054,7 @@ fn pick_unfinished<'a>(
     let options = bundle::RunOptions {
         with_person: first.with_person || arguments.with_person,
         linux: given(&arguments.linux, &first.linux),
+        redteam: given(&arguments.redteam, &first.redteam),
         fonts: given(&arguments.fonts, &first.fonts),
         browsers: given(&arguments.browsers, &first.browsers),
         stick: given(&arguments.stick, &first.stick),

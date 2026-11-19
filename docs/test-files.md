@@ -40,6 +40,7 @@ expect_not = "NO-CARRIER"
 | `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
 | `cf` | no | A CompactFlash card in an IDE adapter for the test to format, of this size, from `1M` to `128G`: see [CompactFlash tests](#compactflash-tests). |
 | `hardware` | no | A virtual machine's devices the test needs, which its boot gives the machine: `guest-agent` (a QEMU guest agent channel, whose host end a host step reaches as `{guest-agent}`) and `virtio-scsi` (a blank 1 GiB disk on a virtio SCSI adapter). The test boots afresh with them and its boot is not shared. A machine that cannot give them, as a real one, skips the test. |
+| `attacker` | no | Which machine `attack` steps run on: `"image"`, a second Dukovo guest (the default), or `"linux"`, Linux from the run's red-team kit. Without `--redteam` a `"linux"` test is skipped. See [The red-team kit](#the-red-team-kit). |
 | `stall` | no | How long a `run` step or a wait for console text may be silent before it ends as stalled: a length of time as `time` is written, or `"off"`. Three minutes by default. See [Steps that go silent](#steps-that-go-silent). |
 | `[[step]]` | at least one | The steps, in order. |
 
@@ -105,6 +106,27 @@ Each step has exactly one action key, and only the options that go with it.
 | `wait = "<time>"` | | Waits that long. | |
 
 Every test also needs `power` and `serial`, for the boot it starts with.
+
+## Keeping a step's output
+
+A `run`, `attack` or `host` step with `save = "<name>"` keeps its output,
+trimmed of white space at both ends, once it passes. Later steps of the
+same test write `{saved:<name>}` in their command, `input`, `expect` or
+`expect_not`, and the output takes its place. This carries a value one
+step made to a step on another machine: a session cookie or a token the
+machine printed, which an `attack` step then presents from the attacker.
+A name is `a-z`, `0-9` and `-`. A `{saved:<name>}` that no earlier step of
+the test kept is an error when the suite loads, and what a step keeps
+goes when the test ends. The value shows in the log where the command
+that holds it does, so keep only values of the test's own accounts.
+
+```toml
+[[step]]
+run = "reader-token"
+save = "token"
+[[step]]
+attack = "curl -s -H 'Authorization: Bearer {saved:token}' http://{target}/"
+```
 
 ## Steps that go silent
 
@@ -343,6 +365,41 @@ exit = 1
   boots afresh, and its boot is never shared with the test after it.
 - A machine with no attacker (`attack = "none"` in its file) skips these
   tests and says so. The attacker is the machine's own, never a person's.
+
+### The red-team kit
+
+A test that needs tools only Linux has (`nmap`, `hping3`, `scapy`) says
+`attacker = "linux"` at test level. Its `attack` steps then run on Linux
+booted from the kit the run was given with `--redteam`, on the same
+private network and under the same rules as the Dukovo guest: the
+attacker's own network has `restrict=on`, so it reaches only the machine
+under test. Tests without `attacker = "linux"` keep the Dukovo guest
+whether or not a kit is given, since they use Dukovo's own tools. Without
+a kit, a `"linux"` test is skipped, and its reason names `--redteam` and
+`ob lab redteam-kit`, which builds the kit.
+
+The kit is a folder with a `kit.toml` (see [commands](commands.md#run))
+naming a `kernel`, an `initrd`, the kernel's `cmdline`, and optionally the
+`user` that steps run as (default `root`) and a `ready` line. The driver
+boots the kernel and initramfs directly, with no disk, and drives the
+attacker over SSH on a port forwarded from the lab PC's loopback. The
+kit's init has to meet this contract, which the driver states on the
+kernel command line after the kit's own `cmdline`:
+
+- `lab.addr=10.9.9.2/24`: give the network card that is not the one with
+  the forwarded SSH port (the private network's, MAC `52:54:00:4c:a1:02`)
+  this address and bring it up. The lab does not set it, as it does on the
+  Dukovo guest; the machine under test gets its address as always.
+- `lab.key=<base64>`: the lab's public key line, base64 encoded because a
+  command line has no room for its spaces. Start an SSH server on port 22
+  that lets `user` in with that key and no other way.
+- Send the console to `ttyS0` (the serial log is kept in the bundle as
+  `attacker-serial-<boot>.log`). When `ready` is given, print that line
+  once the SSH server is up; the lab then waits for it before it tries SSH.
+
+An `attack` step with `root = true` runs as the kit's `user` when that is
+`root`, with no `elevate`, and fails when it is another account. Only an
+`initrd` kit is read; a kit that boots from a disk is not supported.
 
 Attack tests live under `lab/tests/security/`. Keep them to probing the
 machine from the outside over the private range; a check of the machine's
