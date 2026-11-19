@@ -41,6 +41,12 @@ pub struct Runner<'a> {
     pub kit: &'a Path,
     /// The page address, `https://host:port`.
     pub url: &'a str,
+    /// The machine as the test's other steps name it, `host:port` (its
+    /// `{machine}` and `{machine-port:N}`), which the page address is not
+    /// when the browser opens the machine through a forward on the lab
+    /// PC's loopback. A script that reads a file a host step named after
+    /// the machine finds it by this, in `DUKOVO_LAB_MACHINE`.
+    pub machine: &'a str,
     /// The test's script.
     pub script: &'a Path,
     /// Where the runner puts the screenshots it keeps.
@@ -57,7 +63,9 @@ impl Runner<'_> {
     /// for `sh`.
     pub fn command(&self, engine: Engine) -> String {
         format!(
-            "node {} --kit {} --engine {} --url {} --script {} --shots {} --logs {} --name {}",
+            "DUKOVO_LAB_MACHINE={} node {} --kit {} --engine {} --url {} --script {} --shots {} \
+             --logs {} --name {}",
+            quoted(self.machine),
             quoted(self.file.display()),
             quoted(self.kit.display()),
             engine.as_str(),
@@ -170,6 +178,7 @@ mod tests {
             file: Path::new("/work/browser-runner.mjs"),
             kit: Path::new("/home/lab's kit"),
             url: "https://127.0.0.1:40443",
+            machine: "10.77.0.2:9090",
             script: Path::new("/tests/web-console/browser.mjs"),
             shots: Path::new("/bundle/screenshots/qemu"),
             logs: Path::new("/bundle/logs/qemu"),
@@ -177,7 +186,7 @@ mod tests {
         };
         assert_eq!(
             runner.command(Engine::Firefox),
-            "node '/work/browser-runner.mjs' --kit '/home/lab'\\''s kit' --engine firefox \
+            "DUKOVO_LAB_MACHINE='10.77.0.2:9090' node '/work/browser-runner.mjs' --kit '/home/lab'\\''s kit' --engine firefox \
              --url 'https://127.0.0.1:40443' --script '/tests/web-console/browser.mjs' \
              --shots '/bundle/screenshots/qemu' --logs '/bundle/logs/qemu' \
              --name 'web-console-browser'"

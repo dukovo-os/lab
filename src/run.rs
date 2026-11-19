@@ -1784,12 +1784,14 @@ impl<'a> Worker<'a> {
                 .map_err(|err| StepFailure::Error(format!("making {}: {err}", folder.display())))?;
         }
         let url = self.browser_url(test, browser.port, deadline)?;
+        let machine = self.fill(&format!("{{machine}}:{{machine-port:{}}}", browser.port))?;
         let (kit, script) = (absolute(kit), self.peer.here.join(&browser.script));
         let (absolute_shots, absolute_logs) = (absolute(&shots), absolute(&logs));
         let runner = browser::Runner {
             file: &file,
             kit: &kit,
             url: &url,
+            machine: &machine,
             script: &script,
             shots: &absolute_shots,
             logs: &absolute_logs,
