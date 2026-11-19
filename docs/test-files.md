@@ -469,6 +469,10 @@ real-machines.md, "Browsers open the machine by `localhost`"). Only the
 browser's page changes: `{machine}` and `{machine-port:N}` in `host` and
 `run` steps stay the machine's address. When the forward does not start,
 the browser is given the machine's address and the test's log says why.
+The script finds the machine as the other steps name it, `host:port`
+from `{machine}` and `{machine-port:PORT}`, in the environment variable
+`DUKOVO_LAB_MACHINE`: a file a `host` step names after the machine is
+found by it, not by the page's address.
 `page` is a Playwright
 [Page](https://playwright.dev/docs/api/class-page): the script finds
 elements by their role and name, as a person using a screen reader does,
