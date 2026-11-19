@@ -21,7 +21,9 @@
 //! machines if a run holds them, brings the lab's own checkout up to main,
 //! builds the lab image and runs the tests there with `ob lab run`, then
 //! sends the run's findings to lab-results, or holds them, as the schedule
-//! says. Scheduled runs never run Needs you tests: nobody is there.
+//! says, and sends the push notice of notify.toml if there is one (what
+//! becomes of it goes to the schedule's log). Scheduled runs never run
+//! Needs you tests: nobody is there.
 //!
 //! The lab's own checkout is never one a person works in: it is reset to
 //! main on each start, so nothing typed in it would last. Scheduled runs
@@ -39,7 +41,7 @@ use serde_json::{Value, json};
 use crate::clock::Utc;
 use crate::machines::{is_machine_ref, is_plain_name};
 use crate::zone::{self, Zone};
-use crate::{Arguments, Error, findings, send, store};
+use crate::{Arguments, Error, findings, notify, send, store};
 
 /// Where the lab's own checkout comes from unless the schedules file says.
 pub const SOURCE: &str = "https://github.com/dukovo-os/dukovo.git";
@@ -745,6 +747,14 @@ fn go(arguments: &Arguments, name: &str) -> Result<Value, Error> {
         last.result,
         last.note.as_deref().map(|note| format!(" ({note})")).unwrap_or_default()
     );
+    // A start that never got a run to report tells the owner too.
+    if last.result == "error"
+        && last.run.is_none()
+        && let Err(why) =
+            notify::did_not_start(arguments, name, last.note.as_deref().unwrap_or_default())
+    {
+        let _ = writeln!(log, "{} {why}", Utc::now().rfc3339());
+    }
     let answer = serde_json::to_value(&last).expect("outcomes always serialize");
     edit_state(&store, name, |state| {
         state.going = None;
@@ -804,7 +814,12 @@ fn run_once(
             });
         };
         drop(checkout_lock);
-        return Ok(finish(arguments, schedule, &store, &id, &record, commit));
+        let last = finish(arguments, schedule, &store, &id, &record, commit);
+        // The schedule's result stands whatever becomes of its notice.
+        if let Err(why) = notify::tell(arguments, &id) {
+            let _ = writeln!(log, "{} {why}", Utc::now().rfc3339());
+        }
+        return Ok(last);
     }
     Err(Error::Busy("its machines stayed busy; it gave up for this time".into()))
 }

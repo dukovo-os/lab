@@ -29,11 +29,21 @@
 //! - It serves its own page, the commands' answers, and files inside
 //!   results bundles; nothing else on the PC. The lab key is never in a
 //!   bundle, so the page can never hand it out.
+//!
+//! `--share <address>` adds a second listener, for a phone, on one
+//! address of this PC (its Tailscale one: only the owner's own devices
+//! reach that). It serves the same page read only: it has a key of its
+//! own, in a cookie of its own, answers only to its own address, serves
+//! GET requests alone and refuses every other method with 403, so the
+//! page's actions, which are POSTs, cannot be made through it even with
+//! its key. The page is told it is read only (`read_only` in
+//! `/api/page`) and shows no action buttons. The full page's key opens
+//! nothing there, and the share key opens nothing on the full page.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -43,13 +53,15 @@ use serde_json::{Value, json};
 
 use crate::http::{Request, Response, read_request, write_response};
 use crate::machines::{is_machine_ref, is_plain_name};
-use crate::{Arguments, Error, findings, send, store};
+use crate::{Arguments, Error, findings, notify, send, store};
 
 /// The port `ui` listens on unless told otherwise.
 const DEFAULT_PORT: u16 = 7420;
 
-/// The page's cookie, which carries its key.
+/// The page's cookie, which carries its key, and the read-only listener's,
+/// which carries its own: both can live in one browser.
 const COOKIE: &str = "dukovo_lab";
+const SHARE_COOKIE: &str = "dukovo_lab_share";
 
 /// The page and what it loads, built into the program.
 const PAGE_HTML: &str = include_str!("ui/page.html");
@@ -69,10 +81,18 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("X-Frame-Options", "DENY"),
 ];
 
-/// What the server knows.
+/// What the server knows. A read-only listener is served by a copy of the
+/// full page's, with a key, a cookie and a name of its own.
+#[derive(Clone)]
 struct Page {
-    port: u16,
+    /// The `Host` values this listener answers to: its address and port.
+    names: Vec<String>,
     key: String,
+    cookie: &'static str,
+    /// Whether this listener serves GET requests alone.
+    read_only: bool,
+    /// The configuration folder, where `notify.toml` is.
+    config: PathBuf,
     /// This program, which the page's commands run.
     program: PathBuf,
     /// The folder options every command gets, with absolute paths.
@@ -186,8 +206,11 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
     })?;
     let port = listener.local_addr().map_err(|err| Error::Harness(err.to_string()))?.port();
     let page = Arc::new(Page {
-        port,
+        names: vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")],
         key: new_key()?,
+        cookie: COOKIE,
+        read_only: false,
+        config: absolute(arguments.config_dir()?)?,
         program: std::env::current_exe()
             .map_err(|err| Error::Harness(format!("finding this program: {err}")))?,
         folders,
@@ -204,13 +227,29 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
         ob,
     });
     let address = format!("http://127.0.0.1:{port}/?key={}", page.key);
+    let shared = match &arguments.share {
+        Some(share) => Some(share_page(&page, share, port, arguments.new_share_key)?),
+        None => None,
+    };
+    let share_address = shared
+        .as_ref()
+        .map(|(page, _)| format!("http://{}/?key={}#phone", page.names[0], page.key));
     if arguments.json {
-        println!("{}", json!({ "event": "ui-started", "address": address, "port": port }));
+        println!(
+            "{}",
+            json!({ "event": "ui-started", "address": address, "port": port, "share": share_address })
+        );
     } else {
         println!("The runner page is at {address}");
         println!("Only this PC can open it. Ctrl+C closes it; runs carry on without it.");
         if page.image.is_none() {
             println!("No --image was given, so the page cannot start runs; `ob lab ui` gives one.");
+        }
+        if let Some(share_address) = &share_address {
+            println!("The phone view is at {share_address}");
+            println!(
+                "It is read only, and its key is not the page's. Share it only over Tailscale: anyone who reaches that address with its key can read the lab's status."
+            );
         }
     }
     if !arguments.no_open
@@ -223,11 +262,99 @@ pub fn serve(arguments: &Arguments) -> Result<u8, Error> {
             .stderr(Stdio::null())
             .spawn();
     }
+    if let Some((shared, listener)) = shared {
+        let shared = Arc::new(shared);
+        std::thread::spawn(move || accept(&listener, &shared));
+    }
+    accept(&listener, &page);
+    Ok(0)
+}
+
+/// Answers each connection on `listener`, one thread for each.
+fn accept(listener: &TcpListener, page: &Arc<Page>) {
     for stream in listener.incoming().flatten() {
-        let page = Arc::clone(&page);
+        let page = Arc::clone(page);
         std::thread::spawn(move || page.answer(&stream));
     }
-    Ok(0)
+}
+
+/// The read-only copy of `page` for `--share <share>`, with the listener
+/// it serves on: `share` on the page's port.
+fn share_page(
+    page: &Page,
+    share: &str,
+    port: u16,
+    renew: bool,
+) -> Result<(Page, TcpListener), Error> {
+    let ip: IpAddr = share.parse().map_err(|_| {
+        Error::Usage(format!(
+            "--share takes an IP address of this PC, such as its Tailscale one, not \"{share}\""
+        ))
+    })?;
+    // 0.0.0.0 and :: are every network at once, a LAN or the internet too.
+    if ip.is_unspecified() {
+        return Err(Error::Usage(format!(
+            "--share {share} would listen on every network; give one address, the lab PC's Tailscale one"
+        )));
+    }
+    let at = SocketAddr::new(ip, port);
+    let listener = TcpListener::bind(at).map_err(|err| {
+        Error::Usage(format!(
+            "cannot listen on {at} for --share ({err}); give an address this PC has, and a --port that is free on it"
+        ))
+    })?;
+    if !ip.is_loopback() && !tailscale(ip) {
+        eprintln!(
+            "warning: {ip} is not a Tailscale address, so anyone on its network who learns the key can read the lab's status"
+        );
+    }
+    let shared = Page {
+        names: vec![at.to_string()],
+        key: share_key(&page.config, renew)?,
+        cookie: SHARE_COOKIE,
+        read_only: true,
+        ..page.clone()
+    };
+    Ok((shared, listener))
+}
+
+/// Whether `ip` is in the range Tailscale gives its devices: 100.64.0.0/10
+/// or fd7a:115c:a1e0::/48.
+fn tailscale(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 0x40,
+        IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// The read-only listener's key, kept in `share_key` in the configuration
+/// folder (readable by its owner alone, as the lab key is) so that the
+/// `link` of notify.toml still opens the page after `ui` restarts. `renew`
+/// replaces it, for when a link has leaked.
+fn share_key(config: &Path, renew: bool) -> Result<String, Error> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = config.join("share_key");
+    if !renew && let Ok(text) = fs::read_to_string(&file) {
+        let key = text.trim();
+        if key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(key.to_string());
+        }
+        return Err(Error::Usage(format!(
+            "{} is not a key `ui` made: delete it, or give --new-share-key, to make a new one",
+            file.display()
+        )));
+    }
+    let key = new_key()?;
+    let written = fs::create_dir_all(config).and_then(|()| {
+        // Removed first: the mode of an existing file is not changed by a write.
+        let _ = fs::remove_file(&file);
+        fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&file)
+    });
+    written
+        .and_then(|mut out| out.write_all(key.as_bytes()))
+        .map_err(|err| Error::Harness(format!("writing {}: {err}", file.display())))?;
+    Ok(key)
 }
 
 /// A new random key: 128 bits from the system's random source.
@@ -261,12 +388,22 @@ impl Page {
 
     /// The names this page answers to.
     fn our_host(&self, host: &str) -> bool {
-        host == format!("127.0.0.1:{}", self.port) || host == format!("localhost:{}", self.port)
+        self.names.iter().any(|name| name == host)
     }
 
     fn route(&self, request: &Request) -> Response {
         if !request.header("host").is_some_and(|host| self.our_host(host)) {
-            return Response::text(421, "This page answers only to 127.0.0.1 and localhost.");
+            return Response::text(
+                421,
+                &format!("This page answers only to {}.", self.names.join(" and ")),
+            );
+        }
+        // Every action is a POST, and a read-only address takes none.
+        if self.read_only && request.method != "GET" {
+            return Response::text(
+                403,
+                "This address is read only: it shows the lab's status and takes no actions.",
+            );
         }
         // The printed address: trade its key for the cookie, and drop the
         // key from the address bar.
@@ -282,10 +419,10 @@ impl Page {
             }
             return Response::text(303, "").with("Location", "/").with(
                 "Set-Cookie",
-                format!("{COOKIE}={}; HttpOnly; SameSite=Strict; Path=/", self.key),
+                format!("{}={}; HttpOnly; SameSite=Strict; Path=/", self.cookie, self.key),
             );
         }
-        if !request.cookie(COOKIE).is_some_and(|key| same(key, &self.key)) {
+        if !request.cookie(self.cookie).is_some_and(|key| same(key, &self.key)) {
             return Response::text(
                 403,
                 "Open the address `dukovo-lab ui` printed: it carries this page's key.",
@@ -305,6 +442,11 @@ impl Page {
                     // Send needs a lab-results clone (docs/sending.md).
                     "can_send": self.results.join(".git").exists(),
                     "results": self.results,
+                    // A read-only page shows no action buttons.
+                    "read_only": self.read_only,
+                    // The phone view says whether a notice is set up; the
+                    // topic itself never leaves the PC through the page.
+                    "notify": notify::is_set_up(&self.config),
                 }),
             ),
             ("GET", "/api/list") => self.command(&["list"]),
@@ -680,8 +822,11 @@ mod tests {
 
     fn page(store: &Path) -> Page {
         Page {
-            port: 7420,
+            names: vec!["127.0.0.1:7420".into(), "localhost:7420".into()],
             key: "k".repeat(32),
+            cookie: COOKIE,
+            read_only: false,
+            config: store.join("config"),
             program: "/bin/false".into(),
             folders: Vec::new(),
             store: store.to_path_buf(),
@@ -892,6 +1037,173 @@ mod tests {
         let refused = page.start_run(&body);
         assert_eq!(refused.status, 400);
         assert!(String::from_utf8_lossy(&refused.body).contains("open it again with `ob lab ui`"));
+    }
+
+    const SHARE_HOST: &str = "100.64.0.7:7420";
+
+    /// The read-only listener's page, as `--share 100.64.0.7` makes it.
+    fn shared(page: &Page) -> Page {
+        Page {
+            names: vec![SHARE_HOST.into()],
+            key: "s".repeat(32),
+            cookie: SHARE_COOKIE,
+            read_only: true,
+            ..page.clone()
+        }
+    }
+
+    fn share_get(page: &Page, path: &str) -> Response {
+        let mut request = get(path, SHARE_HOST, None);
+        request.headers.push(("cookie".into(), format!("{SHARE_COOKIE}={}", page.key)));
+        page.route(&request)
+    }
+
+    #[test]
+    fn a_share_listener_refuses_every_post_even_with_its_key() {
+        let store = TempDir::new("ui-share-post");
+        let page = shared(&page(store.path()));
+        let id = "f-3a9c51d2e07b";
+        let run = "20261107-153012-4f2a";
+        for (path, body) in [
+            ("/api/run", r#"{"tests":["boot/ready"],"machines":["qemu"]}"#.to_string()),
+            ("/api/stop", format!(r#"{{"run":"{run}"}}"#)),
+            ("/api/done", format!(r#"{{"run":"{run}","machine":"qemu"}}"#)),
+            ("/api/send", r#"{"all":true}"#.to_string()),
+            ("/api/findings", format!(r#"{{"finding":"{id}","reopen":true}}"#)),
+            ("/api/schedules", r#"{"start":"nightly"}"#.to_string()),
+        ] {
+            let mut request = get(path, SHARE_HOST, Some(&page.key));
+            request.headers.retain(|(name, _)| name != "cookie");
+            request.headers.push(("cookie".into(), format!("{SHARE_COOKIE}={}", page.key)));
+            request.headers.push(("x-dukovo-lab".into(), "1".into()));
+            request.headers.push(("origin".into(), format!("http://{SHARE_HOST}")));
+            request.body = body.into_bytes();
+            for method in ["POST", "PUT", "DELETE", "PATCH"] {
+                request.method = method.into();
+                assert_eq!(page.route(&request).status, 403, "{method} {path}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_share_listener_refuses_a_request_without_its_key_or_with_the_page_s() {
+        let store = TempDir::new("ui-share-key");
+        let full = page(store.path());
+        let page = shared(&full);
+        // No key, a wrong key, or the full page's key as the cookie or in
+        // the printed address.
+        assert_eq!(page.route(&get("/api/grid", SHARE_HOST, None)).status, 403);
+        let wrong = get("/api/grid", SHARE_HOST, Some("wrong"));
+        assert_eq!(page.route(&wrong).status, 403);
+        for cookie in [COOKIE, SHARE_COOKIE] {
+            let mut request = get("/api/grid", SHARE_HOST, None);
+            request.headers.push(("cookie".into(), format!("{cookie}={}", full.key)));
+            assert_eq!(page.route(&request).status, 403, "{cookie}");
+        }
+        let entry = |key: &str| page.route(&get(&format!("/?key={key}"), SHARE_HOST, None));
+        assert_eq!(entry(&full.key).status, 403);
+        // Its own key trades for a cookie of its own.
+        let own = entry(&page.key);
+        assert_eq!(own.status, 303);
+        assert!(own.headers.iter().any(|(name, value)| *name == "Set-Cookie"
+            && value.starts_with(&format!("{SHARE_COOKIE}={}", page.key))
+            && value.contains("HttpOnly")));
+        // Only its own address: not localhost, not the full page's.
+        for host in ["127.0.0.1:7420", "localhost:7420", "evil.example:7420"] {
+            let mut request = get("/api/grid", host, None);
+            request.headers.push(("cookie".into(), format!("{SHARE_COOKIE}={}", page.key)));
+            assert_eq!(page.route(&request).status, 421, "{host}");
+        }
+        // And the share key opens nothing on the full page.
+        let mut request = get("/api/grid", "127.0.0.1:7420", None);
+        request.headers.push(("cookie".into(), format!("{COOKIE}={}", page.key)));
+        assert_eq!(full.route(&request).status, 403);
+    }
+
+    #[test]
+    fn a_share_listener_serves_what_the_phone_view_reads() {
+        let store = TempDir::new("ui-share-reads");
+        let page = shared(&page(store.path()));
+        assert_eq!(share_get(&page, "/").status, 200);
+        assert_eq!(share_get(&page, "/page.js").status, 200);
+        for (path, command) in [
+            ("/api/grid", "dukovo-lab grid --json"),
+            ("/api/fleet", "dukovo-lab fleet --json"),
+            ("/api/status", "dukovo-lab status --json"),
+            ("/api/runs", "dukovo-lab runs --limit 20 --json"),
+            (
+                "/api/status?run=20261107-153012-4f2a",
+                "dukovo-lab status 20261107-153012-4f2a --json",
+            ),
+        ] {
+            assert_eq!(command_of(&share_get(&page, path)), command, "{path}");
+        }
+        let about: Value = serde_json::from_slice(&share_get(&page, "/api/page").body).unwrap();
+        assert_eq!(
+            (about["read_only"].as_bool(), about["notify"].as_bool()),
+            (Some(true), Some(false))
+        );
+        // The page keeps its CSP on this listener too.
+        assert!(SECURITY_HEADERS.iter().any(|(name, _)| *name == "Content-Security-Policy"));
+        // What no view reads is not served.
+        assert_eq!(share_get(&page, "/api/run").status, 404);
+    }
+
+    #[test]
+    fn the_full_page_says_it_is_not_read_only_and_whether_a_notice_is_set_up() {
+        let store = TempDir::new("ui-notify-line");
+        let page = page(store.path());
+        let key = page.key.clone();
+        let about = |page: &Page| -> Value {
+            let reply = page.route(&get("/api/page", "127.0.0.1:7420", Some(&key)));
+            serde_json::from_slice(&reply.body).unwrap()
+        };
+        assert_eq!(about(&page)["read_only"], false);
+        assert_eq!(about(&page)["notify"], false);
+        store.write("config/notify.toml", "ntfy = \"https://ntfy.sh/a-long-random-topic\"\n");
+        let set_up = about(&page);
+        assert_eq!(set_up["notify"], true);
+        assert!(!set_up.to_string().contains("a-long-random-topic"));
+    }
+
+    #[test]
+    fn shares_on_one_address_of_this_pc_and_knows_tailscale_s() {
+        let store = TempDir::new("ui-share-address");
+        let page = page(store.path());
+        for share in ["0.0.0.0", "::", "not-an-address", "lab-pc.tailnet.ts.net"] {
+            assert!(matches!(share_page(&page, share, 0, false), Err(Error::Usage(_))), "{share}");
+        }
+        let (shared, _listener) = share_page(&page, "127.0.0.1", 0, false).unwrap();
+        assert!(shared.read_only);
+        assert_eq!(shared.cookie, SHARE_COOKIE);
+        assert_ne!(shared.key, page.key);
+        assert!(tailscale("100.64.0.1".parse().unwrap()));
+        assert!(tailscale("100.127.255.254".parse().unwrap()));
+        assert!(tailscale("fd7a:115c:a1e0::1".parse().unwrap()));
+        for other in ["100.63.0.1", "100.128.0.1", "192.168.1.5", "10.0.0.2", "8.8.8.8"] {
+            assert!(!tailscale(other.parse().unwrap()), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_share_key_is_kept_private_reused_and_replaced_on_request() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let store = TempDir::new("ui-share-keep");
+        let config = store.path().join("config");
+        let first = share_key(&config, false).unwrap();
+        let file = config.join("share_key");
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(share_key(&config, false).unwrap(), first);
+        let second = share_key(&config, true).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(share_key(&config, false).unwrap(), second);
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::write(&file, "junk").unwrap();
+        assert!(
+            matches!(share_key(&config, false), Err(Error::Usage(why)) if why.contains("--new-share-key"))
+        );
+        // Not the page's own key, which is new at each start.
+        assert_ne!(second, page(store.path()).key);
     }
 
     #[test]

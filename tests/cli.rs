@@ -137,6 +137,105 @@ fn a_detached_run_is_followed_to_its_end() {
     assert!(error["error"].as_str().unwrap().contains("boot/none"));
 }
 
+/// A port nothing listens on.
+fn unused_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+#[test]
+fn a_run_sends_its_notice_when_asked_and_its_result_stands_either_way() {
+    let setting = Setting::new("notify");
+    let image = setting.image();
+    let args = ["run", "boot/ready", "--image", &image, "--notify"];
+    // Asked for a notice with no notify.toml: refused before it starts.
+    let (code, error) = setting.run(&args);
+    assert_eq!(code, Some(2), "{error}");
+    assert!(error["error"].as_str().unwrap().contains("notify.toml"), "{error}");
+    assert!(!setting.dir.join("store/runs").exists());
+
+    // A topic that is not there: the notice is lost, the run's status
+    // (3, its boot broke) and results are not.
+    let config = setting.dir.join("config/notify.toml");
+    fs::write(&config, format!("ntfy = \"http://127.0.0.1:{}/topic\"\n", unused_port())).unwrap();
+    let output = setting.command().args(args).output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("the notice was not sent"), "{said}");
+
+    // A topic that is: one POST, with the counts in its title.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(&config, format!("ntfy = \"http://{}/topic\"\n", listener.local_addr().unwrap()))
+        .unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = vec![0; 2048];
+        let read = stream.read(&mut head).unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+        String::from_utf8_lossy(&head[..read]).into_owned()
+    });
+    let output = setting.command().args(args).output().unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let request = server.join().unwrap();
+    assert!(request.starts_with("POST /topic HTTP/1.1"), "{request}");
+    assert!(request.contains("Title: Lab: 0 passed, 1 failing"), "{request}");
+    assert!(request.contains("Lab fault: boot/ready on qemu"), "{request}");
+
+    // A run not asked for a notice sends none (the server is gone).
+    let without = ["run", "boot/ready", "--image", &image];
+    assert_eq!(setting.command().args(without).output().unwrap().status.code(), Some(3));
+}
+
+#[test]
+fn a_schedule_that_cannot_start_a_round_says_so_on_the_phone() {
+    let setting = Setting::new("notify-nostart");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(
+        setting.dir.join("config/notify.toml"),
+        format!("ntfy = \"http://{}/topic\"\n", listener.local_addr().unwrap()),
+    )
+    .unwrap();
+    // A source that is not a repository: the checkout cannot be made.
+    let source = setting.dir.join("no-such-repository");
+    fs::write(
+        setting.dir.join("config/schedules.json"),
+        format!("{{\"source\": \"{}\"}}\n", source.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        setting.run(&["schedule", "save", "quick", "--preset", "quick", "--each-build"]).0,
+        Some(0)
+    );
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = vec![0; 2048];
+        let read = stream.read(&mut head).unwrap();
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+        String::from_utf8_lossy(&head[..read]).into_owned()
+    });
+    assert_eq!(setting.run(&["schedule", "start", "quick"]).0, Some(0));
+    let request = server.join().unwrap();
+    assert!(request.contains("Title: Lab: the quick round did not start"), "{request}");
+    assert!(request.contains("Priority: 4"), "{request}");
+    assert!(!request.contains("no-such-repository"), "{request}");
+}
+
+#[test]
+fn a_test_notice_needs_the_notify_file_and_says_when_it_could_not_send() {
+    let setting = Setting::new("notify-test");
+    let (code, error) = setting.run(&["notify", "--test"]);
+    assert_eq!(code, Some(2), "{error}");
+    assert!(error["error"].as_str().unwrap().contains("notify.toml"), "{error}");
+    assert_eq!(setting.run(&["notify"]).0, Some(2));
+    fs::write(
+        setting.dir.join("config/notify.toml"),
+        format!("ntfy = \"http://127.0.0.1:{}/topic\"\n", unused_port()),
+    )
+    .unwrap();
+    let (code, error) = setting.run(&["notify", "--test"]);
+    assert_eq!(code, Some(3), "{error}");
+    assert!(error["error"].as_str().unwrap().contains("the notice was not sent"), "{error}");
+}
+
 #[test]
 fn a_run_that_ends_at_once_is_still_detached() {
     let setting = Setting::new("at-once");
@@ -459,6 +558,14 @@ fn a_schedule_tests_main_on_the_lab_s_own_checkout() {
     }
     assert_eq!(setting.run(&["schedule"]).1["schedules"].as_array().unwrap().len(), 1);
 
+    // A topic nothing listens on: the notice cannot be sent, which is
+    // noted in the log and changes nothing else.
+    fs::write(
+        setting.dir.join("config/notify.toml"),
+        format!("ntfy = \"http://127.0.0.1:{}/topic\"\n", unused_port()),
+    )
+    .unwrap();
+
     // Started by hand: it clones main, builds and runs there. The boot
     // breaks (no QEMU here), so the run broke.
     let (code, started) = setting.run(&["schedule", "start", "quick"]);
@@ -473,6 +580,7 @@ fn a_schedule_tests_main_on_the_lab_s_own_checkout() {
     assert_eq!(runs["runs"][0]["build"], format!("test {}", &first[..7]));
     let log = fs::read_to_string(setting.dir.join("store/schedules/quick.log")).unwrap();
     assert!(log.contains("pretend ob: building the lab image"), "{log}");
+    assert!(log.contains("the notice was not sent"), "{log}");
 
     // The timer's tick: the first look at main only notes where it is...
     let (code, ticked) = setting.run(&["schedule", "tick"]);

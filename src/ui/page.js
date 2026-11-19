@@ -8,8 +8,13 @@
 //
 // One view shows at a time, chosen by the address's hash (#home, #tests,
 // #test/<id>, #failure/<run>/<machine>/<test>, #findings, #fleet, #runs,
-// #run/<id>, #start), so a view can be shared and Back works. Text from
-// tests, machines and logs is only ever set as text, never as HTML.
+// #run/<id>, #start, #phone), so a view can be shared and Back works. Text
+// from tests, machines and logs is only ever set as text, never as HTML.
+//
+// Opened on the read-only address (`ui --share`), the server says so
+// (`read_only` in /api/page) and the page leaves out every control marked
+// `data-act`: the server refuses actions there anyway, so this is only so
+// that nothing offered does nothing.
 
 "use strict";
 
@@ -110,6 +115,11 @@ function notice(text) {
   const box = byId("notice");
   box.textContent = text;
   box.hidden = !text;
+}
+
+/** Whether the server says this address takes no actions. */
+function readOnly() {
+  return !!(state.page && state.page.read_only);
 }
 
 /** "45 s", "12 min", "3 h 40 min". */
@@ -300,12 +310,12 @@ function findingById(id) {
 function parseRoute() {
   const hash = location.hash.replace(/^#/, "");
   const [name, ...rest] = hash.split("/");
-  const known = ["home", "tests", "test", "failure", "findings", "fleet", "runs", "run", "start"];
+  const known = ["home", "tests", "test", "failure", "findings", "fleet", "runs", "run", "start", "phone"];
   if (!known.includes(name)) return { name: "home", args: [] };
   return { name, args: rest };
 }
 
-const NAV_OF = { home: "home", tests: "tests", test: "tests", failure: "findings", findings: "findings", fleet: "fleet", runs: "runs", run: "runs", start: "" };
+const NAV_OF = { home: "home", tests: "tests", test: "tests", failure: "findings", findings: "findings", fleet: "fleet", runs: "runs", run: "runs", start: "", phone: "" };
 
 async function route() {
   state.route = parseRoute();
@@ -333,6 +343,7 @@ async function loadRoute() {
   if (name === "failure") await loadFailure();
   if (name === "run") await loadRun(args[0]);
   if (name === "start" && state.page === null) state.page = await read("/api/page");
+  if (name === "phone" && !state.fleet) await loadFleet();
   if (name === "fleet" && !state.fleet) await loadFleet();
 }
 
@@ -394,8 +405,10 @@ function runsKey() {
 function render() {
   renderBar();
   const { name } = state.route;
-  const views = { home: homeView, tests: testsView, test: testsView, failure: failureView, findings: findingsView, fleet: fleetView, runs: runsView, run: runView, start: startView };
+  const views = { home: homeView, tests: testsView, test: testsView, failure: failureView, findings: findingsView, fleet: fleetView, runs: runsView, run: runView, start: startView, phone: phoneView };
+  document.body.classList.toggle("phone-view", name === "phone");
   drawInto(byId("view"), views[name]());
+  if (readOnly()) for (const control of document.querySelectorAll("[data-act]")) control.remove();
   // A console shows its end: that is where a test stopped.
   for (const pre of byId("view").querySelectorAll("pre.console")) pre.scrollTop = pre.scrollHeight;
 }
@@ -425,8 +438,8 @@ function renderBar() {
   label.setAttribute("href", href);
   label.replaceChildren(el("span", { class: dotClass }), el("span", {}, text));
   const start = byId("start-run");
-  start.title = page.can_run === false ? "This page was opened without an image: open it with ob lab ui to start runs" : "";
-  if (page.can_run === false) {
+  if (start) start.title = page.can_run === false ? "This page was opened without an image: open it with ob lab ui to start runs" : "";
+  if (page.can_run === false && !page.read_only) {
     notice("This page was opened without an image, so it can show runs but not start them. Open it with ob lab ui.");
   }
 }
@@ -479,6 +492,7 @@ function homeView() {
   const t = tallies(grid);
   return el("div", { class: "page-in", style: "display:flex;flex-direction:column;gap:20px" },
     el("h1", { class: "vh" }, "Home: tests by machines"),
+    el("a", { class: "phone-link", href: "#phone" }, "Phone view: the round, new failures and machines on one screen →"),
     el("section", { class: "four", "aria-label": "At a glance" }, tiles(grid, t)),
     el("div", { class: "cols" },
       el("div", { class: "main" }, gridCard(grid)),
@@ -636,6 +650,108 @@ function runningCard() {
     rows.length ? rows : el("div", { class: "muted" }, "No machine is running a test."), el("div", { class: "muted" }, load)));
 }
 
+// ---- Phone: the round at a glance, for a screen 390 px wide ----
+
+/** A machine's state on the phone: a glyph, a word, and the reason a benched machine is out. */
+function phoneMachine(machine) {
+  let kind = "idle";
+  let word = "idle";
+  let detail = "";
+  if (machine.benched) {
+    kind = "benched";
+    word = "benched";
+    detail = firstLine(machine.benched.reason).replace(machine.name + " was benched: ", "");
+  } else if (machine.doing) {
+    kind = "running";
+    word = machine.spare ? "spare, rerunning" : "running";
+    detail = machine.doing.test || "";
+  } else if (machine.spare) {
+    word = "spare";
+  }
+  const mark = kind === "benched" ? "! " : kind === "running" ? "▸ " : "";
+  return el("li", { class: "pm" },
+    el("span", { class: "pm-name" }, machine.name),
+    el("span", { class: "pm-state is-" + kind }, mark + word),
+    detail ? el("span", { class: "pm-detail" }, detail) : null);
+}
+
+/** The failures that are new since the last round: a Dukovo failure that is red for the first time, or a lab fault, a row each. */
+function phoneNew(grid) {
+  const rows = [];
+  for (const row of grid.rows) {
+    const cells = Object.entries(row.cells).map(([column, cell]) => ({ column, cell }))
+      .filter(({ cell }) => cell.streak > 0 && ((cell.class === "dukovo" && cell.streak === 1) || cell.class === "lab"));
+    if (!cells.length) continue;
+    cells.sort((a, b) => b.cell.at.localeCompare(a.cell.at));
+    rows.push({ row, cells, at: cells[0].cell.at });
+  }
+  rows.sort((a, b) => b.at.localeCompare(a.at));
+  return rows;
+}
+
+function phoneView() {
+  const grid = state.grid;
+  const page = state.page || {};
+  const status = state.current;
+  const last = state.runs.find((r) => r.state !== "running" && r.summary);
+  let title;
+  let counts;
+  let percent = null;
+  let timeLeft = "";
+  if (status) {
+    const c = status.counts;
+    const total = c.passed + c.failed + c.skipped + c.errors + c.running + c.queued || 1;
+    percent = Math.round((100 * (total - c.running - c.queued)) / total);
+    const run = state.runs.find((r) => r.id === status.id);
+    const named = run && (run.schedule || run.preset);
+    title = (named ? runName(run).replace(" (scheduled)", "") : "Round") + ", " + percent + "%";
+    counts = { passed: c.passed, failing: c.failed + c.errors, left: c.running + c.queued };
+    if (status.left_seconds != null) {
+      const ends = new Date(Date.now() + status.left_seconds * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+      timeLeft = "About " + duration(status.left_seconds) + " left · ends near " + ends;
+    } else {
+      timeLeft = "Time left not known: some of its tests have not run here before";
+    }
+  } else if (last) {
+    const s = last.summary;
+    title = "No round going";
+    counts = { passed: s.passed, failing: s.failed + s.errors, left: 0 };
+    timeLeft = "The last one ended " + whenLower(last.ended || last.started);
+  } else {
+    title = "No round yet";
+    counts = { passed: 0, failing: 0, left: 0 };
+  }
+  const tile = (label, n, cls) => el("div", { class: "card ptile" }, el("div", { class: "ptile-label" }, label), el("div", { class: "ptile-n " + (cls || "") }, String(n)));
+  const fresh = grid ? phoneNew(grid) : [];
+  const items = fresh.slice(0, 6).map(({ row, cells }) => {
+    const lab = cells[0].cell.class === "lab";
+    const machines = [...new Set(cells.map(({ cell }) => cell.machine))].join(", ");
+    return el("li", {},
+      el("a", { href: failureHash(cells[0].cell.run, cells[0].cell.machine, row.test), class: "pn-test" }, row.test),
+      el("div", { class: "pn-why" }, (lab ? "Lab fault" : "Dukovo") + " · " + machines));
+  });
+  const more = fresh.length > items.length ? el("a", { href: "#home", class: "pn-more" }, "and " + (fresh.length - items.length) + " more, on Home") : null;
+  const newList = !grid ? el("p", { class: "muted small", style: "margin:0" }, "Reading the results…")
+    : items.length ? el("ul", { class: "pn" }, items) : el("p", { class: "muted small", style: "margin:0" }, "Nothing new since the last round.");
+  const machines = state.fleet ? state.fleet.machines.map(phoneMachine) : [];
+  const pushLine = page.notify
+    ? "You will get one notice when the round ends, with the counts and the new failures."
+    : "No push notice is set up. notify.toml in the lab's configuration folder turns one on.";
+  return el("div", { class: "phone" },
+    el("header", { class: "phone-head" },
+      el("div", { class: "phone-kicker" }, "Dukovo lab · " + (page.read_only ? "read only" : "phone view")),
+      el("h1", { class: "phone-title" }, title),
+      percent != null ? el("div", { class: "track phone-track", role: "img", "aria-label": percent + " percent done" }, el("i", { style: "width:" + percent + "%" })) : null,
+      timeLeft ? el("div", { class: "phone-left" }, timeLeft) : null),
+    el("div", { class: "phone-body" },
+      el("section", { class: "ptiles", "aria-label": "Counts" }, tile("Passed", counts.passed, "pass"), tile("Failing", counts.failing, counts.failing ? "fail" : ""), tile("Left", counts.left)),
+      el("section", { class: "card pad", "aria-label": "New since last round" }, el("h2", { class: "phone-h2" }, "New since last round"), newList, more),
+      el("section", { class: "card pad", "aria-label": "Machines" }, el("h2", { class: "phone-h2" }, "Machines"),
+        machines.length ? el("ul", { class: "pms" }, machines) : el("p", { class: "muted small", style: "margin:0" }, "Reading the machines…")),
+      el("div", { class: "callout phone-push" }, pushLine),
+      el("a", { class: "phone-all", href: "#home" }, "All tests, machines and runs →")));
+}
+
 // ---- Tests: details and who can run them ----
 
 const TEST_FILTERS = [
@@ -777,14 +893,14 @@ function testPanel(id) {
     return el("li", {}, el("span", { class: "n" }, i + 1), el("span", { class: "chip ctl " + (person ? "flaky" : "plain") }, s.control || "lab"), el("span", { class: "txt" }, s.step));
   });
   const target = state.detailMachine && cols.some((c) => c.name === state.detailMachine) ? state.detailMachine : (cols.find((c) => fit(test, c.name) === "runs") || cols[0] || { name: "qemu" }).name;
-  const choose = el("select", { id: "detail-machine", "aria-label": "Machine to run on", onchange: (e) => {
+  const choose = el("select", { id: "detail-machine", "aria-label": "Machine to run on", "data-act": true, onchange: (e) => {
     state.detailMachine = e.target.value;
     render();
   } }, cols.map((c) => el("option", { value: c.name, selected: c.name === target }, c.name.replace(/^pool:/, ""))));
   const kind = fit(test, target);
   const run = el("button", { class: "btn ink", type: "button", disabled: !state.page || !state.page.can_run || kind === "lacks",
     title: kind === "lacks" ? "That machine cannot do " + fitControls(test, target).join(", ") : null,
-    onclick: () => startRun([id], [target]) }, "Run on " + target.replace(/^pool:/, ""));
+    onclick: () => startRun([id], [target]), "data-act": true }, "Run on " + target.replace(/^pool:/, ""));
   const shown = state.showHistory === id;
   return el("div", { class: "card pad" },
     el("div", { class: "small muted" }, category ? category.title : test.category),
@@ -901,6 +1017,7 @@ function failureView() {
 
 /** The buttons above a failure: Rerun, Change class, Send, Not a bug. */
 function failureActions(result, finding, cls) {
+  if (readOnly()) return null;
   const column = columnOf(result.machine);
   const can = state.page || {};
   const rerun = el("button", { class: "btn", type: "button", disabled: !can.can_run, onclick: () => startRun([result.test], [column]) }, "Rerun on " + column.replace(/^pool:/, "pool "));
@@ -1104,7 +1221,7 @@ function findingsView() {
   return el("div", { style: "display:flex;flex-direction:column;gap:20px" }, el("h1", { class: "vh" }, "Findings"),
     el("section", { class: "card", "aria-label": "Findings" },
       el("header", {}, el("h2", {}, "Findings"), el("span", { class: "small muted" }, plural(state.findings.length, "finding")),
-        el("button", { class: "btn ink grow", type: "button", disabled: !canSend || state.sending || !toSend.length, onclick: () => sendNow({ all: true }) },
+        el("button", { class: "btn ink grow", type: "button", disabled: !canSend || state.sending || !toSend.length, onclick: () => sendNow({ all: true }), "data-act": true },
           state.sending ? "Sending…" : "Send all new (" + toSend.length + ")")),
       state.findings.length
         ? el("div", { class: "scroll" }, el("table", { class: "tbl" },
@@ -1172,7 +1289,7 @@ function fleetView() {
 function waitingCard(fleet) {
   const waits = fleet.waiting.map((w) => el("div", { class: "wait" },
     el("span", {}, el("strong", {}, "Needs you on " + w.machine + ": "), w.step + " (" + w.test + "), then press Done."),
-    el("button", { class: "btn ink", type: "button", onclick: () => act("/api/done", { run: w.run, machine: w.machine }).then(refresh) }, "Done")));
+    el("button", { class: "btn ink", type: "button", "data-act": true, onclick: () => act("/api/done", { run: w.run, machine: w.machine }).then(refresh) }, "Done")));
   return card("Waiting for a person" + (waits.length ? " · " + plural(waits.length, "step") : ""), el("div", { class: "pad", style: "display:flex;flex-direction:column;gap:10px" },
     waits.length ? waits : el("p", { class: "muted", style: "margin:0" }, "No run is waiting for a person. Tests that need one run only when you pick them in Start run; the run then waits here, and on its own page, with a Done button.")));
 }
@@ -1245,13 +1362,13 @@ function schedulesCard() {
     if (line) title.append(el("small", {}, line));
     return el("tr", {}, title, el("td", {}, schedule.when), el("td", {}, schedule.machines.join(", ")),
       el("td", {}, schedule.send ? "Send when done" : "Hold for me"), el("td", {}, next),
-      el("td", {}, el("button", { class: "btn mini", type: "button", onclick: () => openForm(schedule) }, "Edit")));
+      el("td", {}, el("button", { class: "btn mini", type: "button", "data-act": true, onclick: () => openForm(schedule) }, "Edit")));
   });
   let note = "Scheduled runs always skip tests that need you. A scheduled run waits if a run is already going on that machine, and tests main as it is then, on the lab's own Dukovo checkout.";
   if (listed.zone_problem) note += " Times cannot be worked out: " + listed.zone_problem;
   if (!listed.timer) note += " The timer that starts schedules is not installed yet: ob lab installs it.";
   return el("section", { class: "card", "aria-label": "Schedules" },
-    el("header", {}, el("h2", {}, "Schedules"), el("button", { class: "btn grow", type: "button", onclick: () => openForm(null) }, "New schedule")),
+    el("header", {}, el("h2", {}, "Schedules"), el("button", { class: "btn grow", type: "button", "data-act": true, onclick: () => openForm(null) }, "New schedule")),
     schedules.length
       ? el("div", { class: "scroll" }, el("table", { class: "tbl" },
         el("thead", {}, el("tr", {}, ["Runs", "When (" + (listed.zone_short || listed.zone) + ")", "Machines", "Findings", "Next", ""].map((h) => el("th", { scope: "col" }, h)))), el("tbody", {}, rows)))
@@ -1419,7 +1536,7 @@ function runsView() {
     el("td", { class: "mono" }, run.build || ""), el("td", {}, runResultNode(run)), el("td", {}, runFindings(run))));
   return el("div", { style: "display:flex;flex-direction:column;gap:20px" }, el("h1", { class: "vh" }, "Past runs"),
     el("section", { class: "card", "aria-label": "Past runs" },
-      el("header", {}, el("h2", {}, "Past runs"), el("a", { class: "btn grow", href: "#start" }, "Start run")),
+      el("header", {}, el("h2", {}, "Past runs"), el("a", { class: "btn grow", href: "#start", "data-act": true }, "Start run")),
       state.runs.length
         ? el("div", { class: "scroll" }, el("table", { class: "tbl" },
           el("thead", {}, el("tr", {}, ["When", "Run", "Machines", "Build", "Result", "Findings"].map((h) => el("th", { scope: "col" }, h)))), el("tbody", {}, rows)))
@@ -1483,9 +1600,9 @@ function runView() {
   const machines = status.machines.map((m) => el("span", {}, el("strong", {}, m.name), " " + m.counts.passed + " passed, " + (m.counts.failed + m.counts.errors) + " failed" + (m.running ? ", running " + m.running : "")));
   const waits = status.waiting.map((wait) => el("div", { class: "wait" },
     el("span", {}, el("strong", {}, "Needs you on " + wait.machine + ": "), wait.step + " (" + wait.test + "), then press Done."),
-    el("button", { class: "btn ink", type: "button", onclick: () => act("/api/done", { run: status.id, machine: wait.machine }).then(refresh) }, "Done")));
+    el("button", { class: "btn ink", type: "button", "data-act": true, onclick: () => act("/api/done", { run: status.id, machine: wait.machine }).then(refresh) }, "Done")));
   const stop = status.state === "running"
-    ? el("button", { class: "btn grow", type: "button", disabled: state.stopping, onclick: async () => {
+    ? el("button", { class: "btn grow", type: "button", "data-act": true, disabled: state.stopping, onclick: async () => {
       state.stopping = true;
       render();
       await act("/api/stop", { run: status.id });
@@ -1520,7 +1637,7 @@ function runView() {
       status.output ? el("pre", { class: "log", style: "border:1px solid var(--line);border-radius:6px" }, status.output) : null)),
     el("section", { class: "card", "aria-label": "What failed" },
       el("header", {}, el("h2", {}, "Failed and lab faults"), el("span", { class: "small muted" }, red.length + " of " + results.results.length + " results"),
-        toSend.length || ofRun.length ? el("button", { class: "btn ink grow", type: "button", disabled: !canSend || state.sending || !toSend.length, title: canSend ? null : "Send needs a lab-results clone: ob lab makes it",
+        toSend.length || ofRun.length ? el("button", { class: "btn ink grow", type: "button", "data-act": true, disabled: !canSend || state.sending || !toSend.length, title: canSend ? null : "Send needs a lab-results clone: ob lab makes it",
           onclick: () => sendNow({ run: status.id }) }, state.sending ? "Sending…" : toSend.length ? "Send " + plural(toSend.length, "finding") : "Sent") : null),
       red.length
         ? el("div", { class: "scroll" }, el("table", { class: "tbl" },
@@ -1536,6 +1653,7 @@ function runView() {
 // ---- Start a run ----
 
 function startView() {
+  if (readOnly()) return el("div", { style: "display:flex;flex-direction:column;gap:20px" }, el("h1", { style: "font-size:24px" }, "Start a run"), el("p", { class: "notice" }, "This address is read only: runs are started from the page on the lab PC."));
   const can = state.page && state.page.can_run;
   const find = state.startFind.toLowerCase();
   const shown = state.tests.filter((t) => !find || t.id.includes(find) || t.about.toLowerCase().includes(find));
@@ -1714,7 +1832,7 @@ async function refresh(force) {
     state.gridAt = Date.now();
   }
   const staleFleet = !state.fleet || (going && Date.now() - state.fleetAt > 3000) || Date.now() - state.fleetAt > 30000;
-  if ((["home", "fleet"].includes(need) || !state.fleet) && staleFleet) {
+  if ((["home", "fleet", "phone"].includes(need) || !state.fleet) && staleFleet) {
     changed = put("fleet", await read("/api/fleet")) || changed;
     state.fleetAt = Date.now();
   }

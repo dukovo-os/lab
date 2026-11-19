@@ -47,10 +47,84 @@ In a Dukovo checkout, `./ob lab schedule ...` does the same.
    ([Sending findings](sending.md)). If that fails (no clone, no
    network), the findings are held, and the schedule says why. A
    schedule that holds them leaves them on the page.
+5. **Sends the notice,** when `notify.toml` is in place ([Notices](#notices));
+   also when no round could start.
+   A notice that cannot be sent is noted in the schedule's log and
+   changes nothing else.
 
 Scheduled runs take the lab's checkout one at a time: two schedules due
 at once run one after the other. A schedule still going when its next
 time comes skips that time.
+
+## Notices
+
+A scheduled run can tell your phone when it ends, with
+[ntfy](https://ntfy.sh): a notice with the counts, the new failures and
+the benched machines. It is sent when `notify.toml` is in the
+configuration folder (`~/.config/dukovo-lab`):
+
+```toml
+ntfy = "https://ntfy.sh/dukovo-lab-7q4k9x2m5v8c1w3z"
+link = "http://100.101.102.103:7420/?key=…#phone"
+```
+
+`ntfy` is the topic's address: ntfy.sh, or an ntfy server of your own.
+`link` is optional: the address a tap on the notice opens, normally the
+runner page's phone view on the lab PC's Tailscale address (see [On your
+phone](runner-page.md#on-your-phone)). Its key is the share key, which
+`dukovo-lab ui --share` keeps in `share_key` in the configuration folder,
+so the link keeps working when `ui` restarts. If the link leaks, replace
+the key with `ui --share <address> --new-share-key` and update the link. Without
+`notify.toml` nothing is ever sent. The file holds the topic, which is
+the only secret a topic has: `chmod 600` it, as the lab key is.
+
+When a scheduled run ends, and when a run given `--notify` ends, the lab
+sends one plain-text message to the topic:
+
+```
+Title:    Lab: 131 passed, 7 failing (3 new)
+Priority: 4
+Tags:     x,warning
+Click:    <link>
+
+New: php/suite on optiplex-1
+New: php/suite on optiplex-2
+Lab fault: storage/format on optiplex-3
+Benched: optiplex-3
+```
+
+- The title has the run's passed count, and the failed and errored
+  results as failing; the parenthesis counts the new ones: Dukovo's
+  failures whose test was not red on that machine, or its pool, the
+  time before (the page's New). A run that was stopped or that died says
+  so.
+- The body lists up to 5 new Dukovo failures and lab faults, as test and
+  machine, then `and N more`, then the machines benched in that run.
+  With nothing to list it says so.
+- The priority is 4 (high) when something is new, a lab fault happened or
+  a machine was benched, else 3. The tags show a cross or a check mark
+  beside the title, and a warning for a lab fault or a benched machine.
+- A schedule that cannot start a round at all (its checkout would not
+  update or its image would not build) sends a notice titled `Lab: the
+  <schedule> round did not start`, priority 4, whose body is the first
+  line of why, without paths, addresses or URLs.
+- Nothing else leaves the PC: no log, no result text (a reason can name
+  an address), and no address other than the `link` you set.
+
+The message is sent with `curl`, which the lab PC needs for this alone:
+the lab's own HTTP client speaks plain HTTP, and ntfy.sh is HTTPS. The
+topic, the link and the text go to curl on its standard input, not in
+its arguments, so other accounts on the PC cannot see them in the process
+list.
+
+A notice that cannot be sent never fails the run or the schedule: the
+reason goes to the schedule's log (`schedules/<name>.log` in the store),
+or, for `run --notify`, to standard error and a detached run's
+`output.log`. Check the setting, and that it reaches the phone, with
+
+```sh
+dukovo-lab notify --test
+```
 
 ## The timer
 

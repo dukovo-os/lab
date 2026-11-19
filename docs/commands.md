@@ -22,7 +22,7 @@ person does.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--tests <dir>` | `lab/tests` | The test folder. |
-| `--config <dir>` | `~/.config/dukovo-lab` | Machine files (`machines/`), the schedules (`schedules.json`) and the lab key. |
+| `--config <dir>` | `~/.config/dukovo-lab` | Machine files (`machines/`), the schedules (`schedules.json`), the push notice's setting (`notify.toml`) and the lab key. |
 | `--store <dir>` | `~/.local/share/dukovo-lab` | Results bundles (`runs/`) and the run's work files while it runs. |
 | `--json` | | Answer in JSON. |
 
@@ -135,7 +135,7 @@ See [Real machines](real-machines.md).
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
                [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
                [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
-               [--with-person] [--no-rerun] [--detach]
+               [--with-person] [--no-rerun] [--notify] [--detach]
 dukovo-lab run --resume <run> --image <file> [--build <text>] [--detach]
 ```
 
@@ -210,6 +210,13 @@ keeps the first try as the result and records the second beside it as
 so counts and findings read only the first. A failure whose rerun passes is
 flaky. `rerun-started` and `rerun-ended` events report it. `--no-rerun`
 turns it off; schedules do not give it.
+
+`--notify` sends the push notice of `notify.toml` when the run ends (see
+[notify](#notify)). A run asked for a notice without that file is
+refused before it starts. A notice that cannot be sent is reported on
+standard error, which a detached run keeps in its `output.log`, and
+changes neither the run's results nor its exit status. Scheduled runs
+send their notice without it.
 
 A machine runs one run at a time. When a picked machine is busy with
 another run, `run` exits 4 and runs nothing.
@@ -492,9 +499,8 @@ and with the runner page closed. See [Schedules](schedules.md).
 ```
 dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--fonts <dir>]
               [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
-              [--port <n>] [--no-open]
+              [--port <n>] [--share <address>] [--new-share-key] [--no-open]
 ```
-
 Serves the runner page to a browser on this PC, at
 `http://127.0.0.1:7420/` unless `--port` says otherwise, and opens it
 when there is a desktop (not with `--no-open`). It prints the address to
@@ -503,6 +509,32 @@ not open. Ctrl+C closes the page; runs started from it carry on. Without
 `--image` the page shows tests and runs but cannot start runs; `ob lab
 ui` gives the image. Runs started from the page get `--linux`,
 `--fonts`, `--browsers`, `--stick`, `--dvd` and `--ob` when they were given. See [the runner page](runner-page.md).
+
+`--share <address>` also serves the page read only, for a phone, on one
+address of this PC at the same port: the lab PC's Tailscale address,
+whose network holds only the owner's own devices. It prints a second
+address, `http://<address>:<port>/?key=…#phone`, with a key of its own:
+the share key, made once and kept in `share_key` in the configuration
+folder (mode 600) so a notice's link keeps working. `--new-share-key`
+replaces it. That listener answers GET requests alone and
+refuses every other method with 403; the full page's key does not open
+it, and its key does not open the full page. `0.0.0.0` and `::`, which
+mean every network, are refused. An address that is not Tailscale's,
+a LAN or public one, is allowed with a warning: anyone who reaches it
+and learns the key can read the lab's status, so do not use one (see
+[Sharing read only](runner-page.md#sharing-read-only)).
+
+## notify
+
+```
+dukovo-lab notify --test
+```
+
+Sends a test notice to the ntfy topic in `notify.toml` in the
+configuration folder, so the owner can check that it reaches their phone
+(see [Notices](schedules.md#notices)). Exits 2 when there is no
+`notify.toml` or no `--test`, and 3 when the notice could not be sent;
+the answer says why. With `--json`: `{"sent": true}`.
 
 ## key
 
@@ -602,4 +634,7 @@ times may be slow". The load never changes a result.
 | A schedule's last result is `error` | It could not run: the lab's checkout would not update or the image would not build. `dukovo-lab schedule` says why, and its log (`schedules/<name>.log` in the store) holds what `ob` printed. |
 | A schedule never starts | Is the timer on? `systemctl --user status dukovo-lab-schedules.timer`; `dukovo-lab schedule install` (or `ob lab`) puts it in place. `journalctl --user -u dukovo-lab-schedules` shows each tick's problems. |
 | A schedule's result is `missed` | The lab PC was off or asleep at its time, for more than 12 hours. |
+| `notify --test` exits 3: curl is not installed | Notices are sent with `curl`: `sudo apt install curl` on the lab PC. |
+| `notify --test` exits 3: curl said ... | The topic address in `notify.toml` is wrong, or the lab PC cannot reach the server. curl's reason follows: for example "Could not resolve host" is a network or spelling problem, and "returned error: 404" is a server that does not take the address. |
+| A scheduled run's notice did not come | The schedule's log (`schedules/<name>.log` in the store) says why it could not be sent; with no line there, `notify.toml` is missing. |
 | The runner page says its key has changed | `dukovo-lab ui` was started again: open the address it printed this time. |

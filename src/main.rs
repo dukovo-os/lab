@@ -29,6 +29,7 @@ mod load;
 mod machines;
 mod netboot;
 mod netlog;
+mod notify;
 mod output;
 mod peer;
 mod png;
@@ -111,7 +112,9 @@ Commands:
                    Removes, pauses or resumes a schedule, or starts it now
   schedule install Puts in place the systemd timer that starts schedules
   schedule tick    What the timer runs each minute: starts those due
-  ui               Serves the runner page on this PC, for a browser here
+  ui               Serves the runner page on this PC, for a browser here;
+                   --share <address> also serves it read only on a phone
+  notify --test    Sends a test notice to the ntfy topic in notify.toml
   key              Makes the lab key, once, and prints its public key's path
   help             This text
 
@@ -151,6 +154,7 @@ Options for run:
                    ends (on another machine of its pool, else afresh on the
                    same one); a rerun that passes marks the failure flaky
   --detach         Start the run in the background, print its id and return
+  --notify         Send the notice of notify.toml when the run ends
 
 Options for other commands:
   --wait           status: wait until the run ends
@@ -158,6 +162,11 @@ Options for other commands:
   --limit <n>      runs: how many (default 20)
   --port <n>       ui: the port on 127.0.0.1 (default 7420)
   --no-open        ui: do not open a browser
+  --share <addr>   ui: also listen read only on this address, the lab PC's
+                   Tailscale one, for the phone view (the page prints a
+                   second key for it, kept in the configuration folder)
+  --new-share-key  ui: make a new share key, for when its link has leaked
+  --test           notify: send a test notice
   --run <run>      findings: those of a run; send: a run and its findings
   --all            findings: every finding, closed ones too;
                    send: every finding not sent yet, and its runs
@@ -229,6 +238,10 @@ struct Arguments {
     /// The id a detached run's parent chose for it.
     run_id: Option<String>,
     port: Option<u16>,
+    /// ui: the address to serve the read-only page on, besides 127.0.0.1.
+    share: Option<String>,
+    /// ui: replace the kept share key.
+    new_share_key: bool,
     limit: Option<usize>,
     all: bool,
     json: bool,
@@ -239,6 +252,10 @@ struct Arguments {
     no_rerun: bool,
     failed: bool,
     no_open: bool,
+    /// run: send a notice when it ends.
+    notify: bool,
+    /// notify: send a test notice.
+    test_notice: bool,
     /// findings and send: a run.
     run: Option<String>,
     /// send: the lab-results clone.
@@ -311,6 +328,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--preset" => arguments.preset = Some(value("--preset")?),
             "--run-id" => arguments.run_id = Some(value("--run-id")?),
             "--port" => arguments.port = Some(number(&value("--port")?, "--port")?),
+            "--share" => arguments.share = Some(value("--share")?),
             "--limit" => arguments.limit = Some(number(&value("--limit")?, "--limit")?),
             "--run" => arguments.run = Some(value("--run")?),
             "--results" => arguments.results = Some(value("--results")?.into()),
@@ -334,6 +352,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--no-rerun" => arguments.no_rerun = true,
             "--failed" => arguments.failed = true,
             "--no-open" => arguments.no_open = true,
+            "--notify" => arguments.notify = true,
+            "--new-share-key" => arguments.new_share_key = true,
+            "--test" => arguments.test_notice = true,
             "--help" | "-h" => arguments.command = Some("help".into()),
             "--version" | "-V" => arguments.command = Some("version".into()),
             flag if flag.starts_with('-') => {
@@ -377,6 +398,7 @@ fn dispatch(arguments: &Arguments) -> Result<u8, Error> {
         Some("send") => send_findings(arguments),
         Some("schedule") => schedule::command(arguments),
         Some("ui") => ui::serve(arguments),
+        Some("notify") => notify::command(arguments),
         Some("key") => make_key(arguments),
         Some(other) => Err(Error::Usage(format!("no command \"{other}\"; see `dukovo-lab help`"))),
     }
@@ -828,6 +850,12 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         return Err(Error::Usage(format!("the image {} does not exist", image.display())));
     }
     let store = arguments.store_dir()?;
+    // Found out before the run, not when it ends.
+    if arguments.notify && notify::load(&arguments.config_dir()?)?.is_none() {
+        return Err(Error::Usage(
+            "--notify needs notify.toml in the configuration folder, which names the ntfy topic (docs/schedules.md shows one)".into(),
+        ));
+    }
     let picked = match &arguments.resume {
         Some(id) => pick_unfinished(arguments, &store, id, &image, &tests, &all_machines)?,
         None => pick_requested(arguments, &tests, &all_machines)?,
@@ -922,6 +950,13 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
     };
     let reporter = output::Reporter::new(arguments.json);
     let ended = run::run(&request, &reporter, &driver::start)?;
+    // The run's result stands whatever becomes of its notice; the reason
+    // goes where the run's other messages do (output.log when detached).
+    if arguments.notify
+        && let Err(why) = notify::tell(arguments, &ended.id)
+    {
+        eprintln!("dukovo-lab: {why}");
+    }
     Ok(match ended.summary {
         summary if summary.errors > 0 => 3,
         summary if summary.failed > 0 => 1,
