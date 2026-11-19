@@ -18,8 +18,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::Error;
-use crate::bundle::{Outcome, PoolRecord, ResultRecord, ResultsFile, RunRecord, StepRecord};
+use crate::bundle::{Outcome, PoolRecord, Rerun, ResultRecord, ResultsFile, RunRecord, StepRecord};
 use crate::clock::Utc;
+use crate::findings::{self, Class};
 use crate::store;
 
 /// What a test says that a run's process ended in, which a run resumed
@@ -228,6 +229,8 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
         )
         .collect();
     let mut waiting: Vec<Waiting> = Vec::new();
+    // The machines running a failed test once more, with the test.
+    let mut rerunning: HashMap<String, String> = HashMap::new();
     for event in &events {
         let machine = text(event, "machine");
         let test = text(event, "test");
@@ -270,10 +273,17 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
             }
             // The step a person was asked to do has ended either way.
             Some("step-ended") => waiting.retain(|wait| wait.machine != machine),
+            Some("rerun-started") => {
+                rerunning.insert(machine, format!("{test} (rerun)"));
+            }
+            Some("rerun-ended") => {
+                rerunning.remove(&text(event, "on"));
+            }
             _ => {}
         }
     }
     if state == State::Died {
+        rerunning.clear();
         waiting.clear();
         for entry in tests.iter_mut().filter(|entry| entry.state == TestStateKind::Running) {
             entry.state = TestStateKind::Error;
@@ -298,6 +308,11 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
             if entry.state == TestStateKind::Running {
                 machine.running = Some(entry.test.clone());
             }
+        }
+    }
+    for machine in &mut machines {
+        if machine.running.is_none() {
+            machine.running = rerunning.remove(&machine.name);
         }
     }
     let left_seconds = (state == State::Running)
@@ -402,6 +417,18 @@ pub struct Results {
     pub run: RunRecord,
     pub bundle: PathBuf,
     pub results: Vec<ResultRecord>,
+    /// Whose each failed or errored result is (see findings.rs).
+    pub classes: Vec<ResultClass>,
+}
+
+/// The class of one failed or errored result, and its finding when it has
+/// one (an error has none).
+#[derive(Serialize)]
+pub struct ResultClass {
+    pub machine: String,
+    pub test: String,
+    pub class: Class,
+    pub finding: Option<String>,
 }
 
 /// Reads run `id`'s results.
@@ -414,7 +441,23 @@ pub fn results(store: &Path, id: &str) -> Result<Results, Error> {
         Some(file) => file.results,
         None => results_from_events(&run, &read_events(&bundle)),
     };
-    Ok(Results { state, run, bundle, results })
+    let findings = findings::load_all(store);
+    let classes = results
+        .iter()
+        .filter(|result| matches!(result.result, Outcome::Fail | Outcome::Error))
+        .map(|result| {
+            let reason = result.reason.as_deref().unwrap_or_default();
+            let finding = findings::finding_of(&findings, &result.test, reason)
+                .filter(|_| result.result == Outcome::Fail);
+            ResultClass {
+                machine: result.machine.clone(),
+                test: result.test.clone(),
+                class: findings::classify(result.result, result.flaky(), finding),
+                finding: finding.map(|finding| finding.id.clone()),
+            }
+        })
+        .collect();
+    Ok(Results { state, run, bundle, results, classes })
 }
 
 /// The results of the tests that ended, from the events, in the order
@@ -455,7 +498,24 @@ fn results_from_events(run: &RunRecord, events: &[Value]) -> Vec<ResultRecord> {
                     log: event["log"].as_str().map(String::from),
                     screenshots: serde_json::from_value(event["screenshots"].clone())
                         .unwrap_or_default(),
+                    rerun: None,
                 });
+            }
+            Some("rerun-ended") => {
+                let first =
+                    ended.iter_mut().find(|result| result.machine == key.0 && result.test == key.1);
+                if let Some(first) = first
+                    && let Ok(result) = serde_json::from_value(event["result"].clone())
+                {
+                    first.rerun = Some(Rerun {
+                        machine: text(event, "on"),
+                        result,
+                        reason: event["reason"].as_str().map(String::from),
+                        milliseconds: event["milliseconds"].as_u64().unwrap_or(0),
+                        boot: event["boot"].as_u64().and_then(|boot| u32::try_from(boot).ok()),
+                        log: event["log"].as_str().map(String::from),
+                    });
+                }
             }
             _ => {}
         }
@@ -693,6 +753,7 @@ mod tests {
             log: None,
             steps: Vec::new(),
             screenshots: Vec::new(),
+            rerun: None,
         };
         // An older run that ran both tests, then a newer one stopped part
         // way through boot/a, before boot/b.

@@ -409,6 +409,7 @@ mod tests {
             log: Some("logs/qemu/drivers-link-pull.log".into()),
             steps: Vec::new(),
             screenshots: vec!["screenshots/qemu/drivers-link-pull-failed.png".into()],
+            rerun: None,
         }];
         bundle.write_results(&results).unwrap();
         let dir = bundle.dir();

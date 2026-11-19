@@ -5,8 +5,8 @@
 //!
 //! The page does nothing a command cannot: each of its buttons runs a
 //! `dukovo-lab` command with `--json` (`run --detach`, `status`, `stop`,
-//! `done`, `results`, `runs`, `list`, `machines`, `findings`, `send`,
-//! `schedule`)
+//! `done`, `results`, `runs`, `list`, `show`, `machines`, `grid`, `fleet`,
+//! `findings`, `send`, `schedule`)
 //! and shows the answer,
 //! and every answer names the command it ran. So whatever a person does
 //! on the page, an agent can do with the same commands, and the page can
@@ -309,6 +309,12 @@ impl Page {
             ),
             ("GET", "/api/list") => self.command(&["list"]),
             ("GET", "/api/machines") => self.command(&["machines"]),
+            ("GET", "/api/grid") => self.command(&["grid"]),
+            ("GET", "/api/fleet") => self.command(&["fleet"]),
+            ("GET", "/api/test") => match request.query("id") {
+                Some(id) if plain_test(id) => self.command(&["show", id]),
+                _ => bad("which test?"),
+            },
             ("GET", "/api/runs") => self.command(&["runs", "--limit", "20"]),
             ("GET", "/api/schedules") => self.command(&["schedule"]),
             ("GET", "/api/findings") => match request.query("run") {
@@ -391,10 +397,7 @@ impl Page {
             args.extend(["--preset".into(), preset.into()]);
         } else {
             let tests = strings("tests").unwrap_or_default();
-            // Ids are a category and a name: never an option.
-            let plain =
-                |test: &String| test.split('/').all(is_plain_name) && test.split('/').count() <= 2;
-            if tests.is_empty() || !tests.iter().all(plain) {
+            if tests.is_empty() || !tests.iter().all(|test| plain_test(test)) {
                 return bad("pick tests to run");
             }
             args.extend(tests);
@@ -454,9 +457,10 @@ impl Page {
         self.command(&args)
     }
 
-    /// Says a finding is not a bug, with an optional note, or reopens it:
-    /// `{"finding": id, "not_a_bug": true, "note": text}` or
-    /// `{"finding": id, "reopen": true}`.
+    /// Says a finding is not a bug, with an optional note, or reopens it, or
+    /// gives it a class: `{"finding": id, "not_a_bug": true, "note": text}`,
+    /// `{"finding": id, "reopen": true}` or `{"finding": id, "class": c}`,
+    /// where `c` is a class or `auto`.
     fn change_finding(&self, body: &Value) -> Response {
         let Some(id) = body["finding"].as_str().filter(|id| findings::valid_id(id)) else {
             return bad("which finding?");
@@ -464,8 +468,16 @@ impl Page {
         if body["reopen"].as_bool() == Some(true) {
             return self.command(&["findings", id, "--reopen"]);
         }
+        if let Some(class) = body["class"].as_str() {
+            let known = class == "auto" || findings::Class::parse(class).is_some();
+            return if known {
+                self.command(&["findings", id, "--class", class])
+            } else {
+                bad("not a class: lab, dukovo, flaky, known, test or auto")
+            };
+        }
         if body["not_a_bug"].as_bool() != Some(true) {
-            return bad("say not_a_bug or reopen");
+            return bad("say not_a_bug, reopen or a class");
         }
         // One line, kept short: it shows in lists and in lab-results.
         let note =
@@ -515,9 +527,7 @@ impl Page {
             args.push("--all".into());
         } else {
             let tests = strings("tests");
-            let plain =
-                |test: &String| test.split('/').all(is_plain_name) && test.split('/').count() <= 2;
-            if tests.is_empty() || !tests.iter().all(plain) {
+            if tests.is_empty() || !tests.iter().all(|test| plain_test(test)) {
                 return bad("pick what the schedule runs");
             }
             args.extend(tests);
@@ -643,6 +653,12 @@ fn not_found() -> Response {
     Response::text(404, "Not here.")
 }
 
+/// Whether `test` is a test id or a category as commands take them: a
+/// category and a name, never an option.
+fn plain_test(test: &str) -> bool {
+    test.split('/').all(is_plain_name) && test.split('/').count() <= 2
+}
+
 fn run_id(body: &Value) -> Option<&str> {
     body["run"].as_str().filter(|id| store::valid_run_id(id))
 }
@@ -759,12 +775,38 @@ mod tests {
             command_of(&marked),
             format!("dukovo-lab findings {id} --not-a-bug --note 'the cable was out' --json")
         );
+        let classed =
+            post(&page, "/api/findings", &format!(r#"{{"finding":"{id}","class":"flaky"}}"#));
+        assert_eq!(command_of(&classed), format!("dukovo-lab findings {id} --class flaky --json"));
+        let auto = post(&page, "/api/findings", &format!(r#"{{"finding":"{id}","class":"auto"}}"#));
+        assert_eq!(command_of(&auto), format!("dukovo-lab findings {id} --class auto --json"));
+        for class in ["--all", "other", ""] {
+            let body = format!(r#"{{"finding":"{id}","class":"{class}"}}"#);
+            assert_eq!(post(&page, "/api/findings", &body).status, 400, "{class}");
+        }
         let reopened =
             post(&page, "/api/findings", &format!(r#"{{"finding":"{id}","reopen":true}}"#));
         assert_eq!(command_of(&reopened), format!("dukovo-lab findings {id} --reopen --json"));
         assert_eq!(post(&page, "/api/findings", r#"{"finding":"-x","reopen":true}"#).status, 400);
         let long = format!(r#"{{"finding":"{id}","not_a_bug":true,"note":"{}"}}"#, "x".repeat(501));
         assert_eq!(post(&page, "/api/findings", &long).status, 400);
+    }
+
+    #[test]
+    fn reads_the_grid_the_fleet_and_one_test_only_by_plain_names() {
+        let store = TempDir::new("ui-reads");
+        let page = page(store.path());
+        let key = page.key.clone();
+        let fetch = |path: &str| page.route(&get(path, "127.0.0.1:7420", Some(&key)));
+        assert_eq!(command_of(&fetch("/api/grid")), "dukovo-lab grid --json");
+        assert_eq!(command_of(&fetch("/api/fleet")), "dukovo-lab fleet --json");
+        assert_eq!(
+            command_of(&fetch("/api/test?id=boot/ready")),
+            "dukovo-lab show boot/ready --json"
+        );
+        for path in ["/api/test", "/api/test?id=--all", "/api/test?id=a/b/c", "/api/test?id="] {
+            assert_eq!(fetch(path).status, 400, "{path}");
+        }
     }
 
     #[test]

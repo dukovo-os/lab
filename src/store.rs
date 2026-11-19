@@ -49,6 +49,11 @@ pub fn bundle_dir(store: &Path, id: &str) -> PathBuf {
     store.join("runs").join(date).join(id)
 }
 
+/// The lock a run holds while it uses machine `name`.
+fn machine_lock(store: &Path, name: &str) -> PathBuf {
+    store.join("machines").join(format!("{name}.lock"))
+}
+
 /// The run's files while it is going.
 fn running_dir(store: &Path, id: &str) -> PathBuf {
     store.join("running").join(id)
@@ -138,7 +143,7 @@ pub fn running_ids(store: &Path) -> Vec<String> {
 
 /// The run using machine `name` now, if one is.
 pub fn machine_user(store: &Path, name: &str) -> Option<String> {
-    let path = store.join("machines").join(format!("{name}.lock"));
+    let path = machine_lock(store, name);
     if !held(&path) {
         return None;
     }
@@ -166,7 +171,7 @@ impl Running {
             .ok_or_else(|| Error::Harness(format!("run {id} is already going")))?;
         let mut held_machines = Vec::new();
         for &name in machines {
-            let path = store.join("machines").join(format!("{name}.lock"));
+            let path = machine_lock(store, name);
             let Some(mut file) = take_lock(&path)? else {
                 let user = machine_user(store, name).unwrap_or_else(|| "another run".into());
                 // Nothing ran, so nothing is left behind but what a
@@ -188,6 +193,17 @@ impl Running {
             _lock: lock,
             _machines: held_machines,
         })
+    }
+
+    /// Takes the lock of machine `name`, which the run did not start with
+    /// (a pool's spare, kept for reruns), for as long as the file lives.
+    /// None when another run uses the machine.
+    pub fn borrow_machine(&self, name: &str) -> Result<Option<File>, Error> {
+        let Some(mut file) = take_lock(&machine_lock(&self.store, name))? else {
+            return Ok(None);
+        };
+        let _ = write!(file, "{}", self.id);
+        Ok(Some(file))
     }
 
     /// Whether `dukovo-lab stop` has asked the run to stop.

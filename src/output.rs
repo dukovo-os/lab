@@ -9,8 +9,9 @@
 //! `test-started`, `step-progress` (while a long step is still running),
 //! `step-ended` and `test-ended` for each test on each machine as they
 //! happen (machines run side by side, so their lines interleave),
-//! `person-needed` when a step waits for a person, then `run-ended` with
-//! the counts. Readers skip events they do not know, so new ones can be
+//! `person-needed` when a step waits for a person, `rerun-started` and
+//! `rerun-ended` when a test that failed is run once more, then
+//! `run-ended` with the counts. Readers skip events they do not know, so new ones can be
 //! added.
 //!
 //! The same lines also go to `events.jsonl` in the bundle, with or without
@@ -86,6 +87,23 @@ pub enum Event<'a> {
         boot: Option<u32>,
         log: Option<&'a str>,
         screenshots: &'a [String],
+    },
+    /// A test that failed is being run once more, on `machine`.
+    RerunStarted {
+        machine: &'a str,
+        test: &'a str,
+    },
+    /// The rerun of the test that failed on `machine` ended, run on `on`;
+    /// `log` is relative to the bundle.
+    RerunEnded {
+        machine: &'a str,
+        test: &'a str,
+        on: &'a str,
+        result: Outcome,
+        reason: Option<&'a str>,
+        milliseconds: u64,
+        boot: Option<u32>,
+        log: Option<&'a str>,
     },
     /// A machine of a pool left it for the rest of the run, because it
     /// would not start or its health check benched it; the others carry on
@@ -199,6 +217,12 @@ fn human(event: &Event<'_>) -> Option<String> {
                 Some(reason) => format!("[{machine}] {test}: {word}{time}: {reason}"),
                 None => format!("[{machine}] {test}: {word}{time}"),
             }
+        }
+        Event::RerunStarted { machine, test } => format!("[{machine}] {test}: running again"),
+        Event::RerunEnded { machine, test, on, result, .. } => {
+            let word =
+                if *result == Outcome::Pass { "passed, so it is flaky" } else { "failed again" };
+            format!("[{machine}] {test}: run again on {on}, {word}")
         }
         Event::MachineOut { machine, reason } => format!("[{machine}] out of its pool: {reason}"),
         Event::RunEnded { id, bundle, summary, stopped, findings } => {

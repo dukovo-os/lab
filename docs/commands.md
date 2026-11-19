@@ -61,7 +61,40 @@ dukovo-lab show <test>
 
 One test: what it checks, its file, its time limit, its controls, its
 steps in words and how it fits each machine. With `--json`, the same
-object as in `list`, less `last_milliseconds`.
+object as in `list`, and `host_needs` (programs the lab PC must have),
+`pools` (how it fits each pool, named `pool:<name>`), `last_milliseconds`
+and `history`: its newest results on every machine, each with run, time,
+build, machine, result, `flaky`, class and the first line of its reason.
+
+## grid
+
+```
+dukovo-lab grid
+```
+
+The newest result of each test on each machine that is in no pool and on
+each pool, read from the newest 100 runs. With `--json`: `columns`, and
+`rows` of `{test, category, about, failing, new, class, history, red_since,
+cells}`. A cell holds `result`, `state` (`pass`, `fail`, `flaky`, `stalled`,
+`error`, `benched`, `skip`), `class`, the first line of `reason`, `skip_group`,
+`milliseconds`, `run`, `at`, `machine` (the one that ran it, for a pool),
+`rerun`, `finding`, `history` (its last 14 results, oldest first: `p` passed,
+`f` failed, `k` flaky, `e` error, `x` skipped), `streak` (red results in a
+row) and `red_since` (the run, time and build it first went red in). `running`
+lists tests going now, and `round` the newest run that ended and how its time
+split.
+
+## fleet
+
+```
+dukovo-lab fleet
+```
+
+Each machine with who does each control, its last health check (the line
+from the newest run that booted it, as a list of checks), whether the newest
+run it took part in benched it, and what it is doing now; the lab PC's
+load; and the steps waiting for a person in runs going. With `--json`:
+`{"lab_pc_load", "machines", "waiting"}`.
 
 ## machines
 
@@ -102,7 +135,7 @@ See [Real machines](real-machines.md).
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
                [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
                [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
-               [--with-person] [--detach]
+               [--with-person] [--no-rerun] [--detach]
 dukovo-lab run --resume <run> --image <file> [--build <text>] [--detach]
 ```
 
@@ -168,6 +201,15 @@ it. The new run's run.json names the run it resumes (`resumes`), and
 
 The first run's bundle is not changed. Resuming a run twice runs its
 unfinished tests twice.
+
+A test that fails (not one that errors or is skipped) is run once more
+before the run ends: on another machine of its pool, a spare
+(`spare = true`) first, else on the same machine on a fresh boot. results.json
+keeps the first try as the result and records the second beside it as
+`rerun` (its machine, result, reason, time and log, in `logs/<machine>/rerun/`),
+so counts and findings read only the first. A failure whose rerun passes is
+flaky. `rerun-started` and `rerun-ended` events report it. `--no-rerun`
+turns it off; schedules do not give it.
 
 A machine runs one run at a time. When a picked machine is busy with
 another run, `run` exits 4 and runs nothing.
@@ -347,7 +389,7 @@ lab-results (`sent`). With `--json`: `{"runs": [...]}`.
 
 ```
 dukovo-lab findings [--run <run>] [--all]
-dukovo-lab findings <finding> [--not-a-bug [--note <text>] | --reopen]
+dukovo-lab findings <finding> [--not-a-bug [--note <text>] | --reopen | --class <class>]
 ```
 
 What failed, grouped: each failure belongs to a *finding*, the same test
@@ -370,6 +412,16 @@ what it said last time. With `--json`, the finding itself.
   out), with why in `--note`. It stays so however often it comes back
   and is not offered to Send, unless asked for by id.
 - `--reopen` takes that back: it is new again.
+- `--class` gives it a class (`lab`, `dukovo`, `flaky`, `known` or `test`),
+  which holds in every run it fails in and survives a Send; `auto` goes
+  back to the class the lab works out. `--not-a-bug` and `--reopen` clear
+  it.
+
+Each failed or errored result also has a class, which `results --json`
+lists in `classes` (with the result's finding): `lab` for an error, then a
+person's class, `test` for a finding marked not a bug, `known` for one with a
+fix proposed, approved or landed or a link to its fix, `flaky` for a failure
+that passed when run again, and `dukovo` for any other failure.
 
 A finding's other states (fix proposed, approved, fixed) are set in
 lab-results by the thread that fixes it and the maintainer; each Send

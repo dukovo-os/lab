@@ -23,6 +23,10 @@
       "enum": ["new", "not-a-bug", "fix-proposed", "approved", "fixed"]
     },
     "note": { "description": "Why a person said it is not a bug.", "type": ["string", "null"] },
+    "class": {
+      "description": "The class a person gave the finding, which holds in every run it fails in: lab, dukovo, flaky, known or test. Absent until a person changes it; the lab works the class out from the results and the state otherwise.",
+      "enum": ["lab", "dukovo", "flaky", "known", "test", null]
+    },
     "first_seen": { "description": "When the first run it failed in started (RFC 3339 UTC).", "type": "string" },
     "last_seen": { "description": "When the last run it failed in started (RFC 3339 UTC).", "type": "string" },
     "count": { "description": "How many times it failed: one per run and machine.", "type": "integer", "minimum": 1 },

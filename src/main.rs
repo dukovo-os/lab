@@ -20,6 +20,8 @@ mod clock;
 mod des;
 mod driver;
 mod findings;
+mod fleet;
+mod grid;
 mod hash;
 mod health;
 mod http;
@@ -74,6 +76,10 @@ Commands:
                    The tests by category, and how each fits each machine
   show <test>      What a test checks, its steps, its time limit, its file
   machines         The machines and who does each of their controls
+  grid             The latest result of each test on each machine and pool,
+                   with its class and its last 14 results
+  fleet            Each machine: its health check, whether it is benched
+                   or busy, and the steps waiting for a person
   machines check [<machine>...]
                    Checks what runs on real machines need: AMT, the
                    serial port, the lab network, net boot and the key; and
@@ -141,6 +147,9 @@ Options for run:
   --resume <run>   Run the tests that run did not finish, on its machines,
                    with its options; needs its image and build
   --with-person    Also run Needs you tests, asking a person to do their steps
+  --no-rerun       Do not run a test that failed once more before the run
+                   ends (on another machine of its pool, else afresh on the
+                   same one); a rerun that passes marks the failure flaky
   --detach         Start the run in the background, print its id and return
 
 Options for other commands:
@@ -156,6 +165,9 @@ Options for other commands:
                    and is not offered to send again
   --note <text>    with --not-a-bug: why
   --reopen         findings <finding>: takes back --not-a-bug
+  --class <class>  findings <finding>: gives it a class (lab, dukovo, flaky,
+                   known or test) in every run it fails in; auto goes back
+                   to the class the lab works out
   --results <dir>  send: the lab-results clone (default: lab-results in
                    the store)
 
@@ -223,6 +235,8 @@ struct Arguments {
     detach: bool,
     wait: bool,
     with_person: bool,
+    /// run: do not run a failed test once more.
+    no_rerun: bool,
     failed: bool,
     no_open: bool,
     /// findings and send: a run.
@@ -232,6 +246,8 @@ struct Arguments {
     note: Option<String>,
     not_a_bug: bool,
     reopen: bool,
+    /// findings <finding>: the class a person gives it.
+    class: Option<String>,
     /// schedule save: when, which days, or each build; send or hold.
     at: Option<String>,
     days: Option<String>,
@@ -299,6 +315,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--run" => arguments.run = Some(value("--run")?),
             "--results" => arguments.results = Some(value("--results")?.into()),
             "--note" => arguments.note = Some(value("--note")?),
+            "--class" => arguments.class = Some(value("--class")?),
             "--at" => arguments.at = Some(value("--at")?),
             "--days" => arguments.days = Some(value("--days")?),
             "--title" => arguments.title = Some(value("--title")?),
@@ -314,6 +331,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Arguments, Error> {
             "--detach" => arguments.detach = true,
             "--wait" => arguments.wait = true,
             "--with-person" => arguments.with_person = true,
+            "--no-rerun" => arguments.no_rerun = true,
             "--failed" => arguments.failed = true,
             "--no-open" => arguments.no_open = true,
             "--help" | "-h" => arguments.command = Some("help".into()),
@@ -347,6 +365,8 @@ fn dispatch(arguments: &Arguments) -> Result<u8, Error> {
         Some("list") => list(arguments),
         Some("show") => show(arguments),
         Some("machines") => list_machines(arguments),
+        Some("grid") => show_grid(arguments),
+        Some("fleet") => show_fleet(arguments),
         Some("run") => run_tests(arguments),
         Some("status") => show_status(arguments),
         Some("stop") => stop_run(arguments),
@@ -444,6 +464,107 @@ fn test_json(test: &Test, machines: &[&Machine]) -> Value {
     })
 }
 
+/// `show --json`: the test as `list` has it, and what the runner page's
+/// Tests view adds: the programs it needs on the lab PC, how it fits each
+/// pool, how long it took last time on each machine, and its newest
+/// results.
+fn test_detail_json(arguments: &Arguments, test: &Test, machines: &[&Machine]) -> Value {
+    let mut value = test_json(test, machines);
+    value["host_needs"] = json!(test.host_needs);
+    let pools: Vec<Value> = machines
+        .iter()
+        .filter_map(|machine| machine.pool.as_deref())
+        .fold(Vec::new(), |mut pools, pool| {
+            if !pools.contains(&pool) {
+                pools.push(pool);
+            }
+            pools
+        })
+        .into_iter()
+        .filter_map(|pool| {
+            // A pool's machines have the same controls, so one stands for all.
+            let first = machines
+                .iter()
+                .find(|machine| machine.pool.as_deref() == Some(pool) && !machine.spare)?;
+            let mut fit = fits_json(test, &[first]);
+            fit[0]["machine"] = json!(format!("{}{pool}", machines::POOL_PREFIX));
+            Some(fit[0].clone())
+        })
+        .collect();
+    value["pools"] = Value::Array(pools);
+    let Ok(store) = arguments.store_dir() else { return value };
+    let typical = status::typical_durations(&store, None);
+    let last: serde_json::Map<String, Value> = machines
+        .iter()
+        .filter_map(|machine| {
+            let ms = typical.get(&(machine.name.clone(), test.id.clone()))?;
+            Some((machine.name.clone(), json!(ms)))
+        })
+        .collect();
+    value["last_milliseconds"] = Value::Object(last);
+    value["history"] = json!(grid::history(&store, &test.id, 30));
+    value
+}
+
+/// `grid`: the latest result of each test on each machine and pool.
+fn show_grid(arguments: &Arguments) -> Result<u8, Error> {
+    let tests = arguments.load_tests()?;
+    let machines = arguments.load_machines()?;
+    let grid = grid::grid(&arguments.store_dir()?, &tests, &machines);
+    if arguments.json {
+        println!("{}", serde_json::to_string(&grid).expect("the grid always serializes"));
+        return Ok(0);
+    }
+    for row in grid.rows.iter().filter(|row| row.failing) {
+        for (column, cell) in row.cells.iter().filter(|(_, cell)| cell.streak > 0) {
+            let class = cell.class.map_or("", findings::Class::word);
+            println!(
+                "{:<32} {:<14} {:<7} {:<8} {}",
+                row.test,
+                column,
+                cell.state,
+                class,
+                cell.reason.as_deref().unwrap_or_default()
+            );
+        }
+    }
+    println!(
+        "{} tests on {} columns, from {} runs",
+        grid.rows.len(),
+        grid.columns.len(),
+        grid.runs
+    );
+    Ok(0)
+}
+
+/// `fleet`: each machine's health and what it is doing.
+fn show_fleet(arguments: &Arguments) -> Result<u8, Error> {
+    let machines = arguments.load_machines()?;
+    let fleet = fleet::fleet(&arguments.store_dir()?, &machines);
+    if arguments.json {
+        println!("{}", serde_json::to_string(&fleet).expect("the fleet always serializes"));
+        return Ok(0);
+    }
+    for machine in &fleet.machines {
+        let state = match (&machine.benched, &machine.doing) {
+            (Some(benched), _) => format!("benched: {}", benched.reason),
+            (None, Some(doing)) => format!("busy with run {}", doing.run),
+            (None, None) => "idle".into(),
+        };
+        println!("{}: {state}", machine.name);
+        if let Some(health) = &machine.health {
+            println!("  {}", health.line);
+        }
+    }
+    for wait in &fleet.waiting {
+        println!(
+            "NEEDS YOU on {}: {} ({}); once done, run `{}`",
+            wait.step.machine, wait.step.step, wait.step.test, wait.step.done
+        );
+    }
+    Ok(0)
+}
+
 /// `list`: the tests by category.
 fn list(arguments: &Arguments) -> Result<u8, Error> {
     let tests = arguments.load_tests()?;
@@ -522,7 +643,7 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
     let all_machines = arguments.load_machines()?;
     let machines: Vec<&Machine> = all_machines.iter().collect();
     if arguments.json {
-        println!("{}", test_json(test, &machines));
+        println!("{}", test_detail_json(arguments, test, &machines));
         return Ok(0);
     }
     println!("{}: {}", test.id, test.about);
@@ -796,6 +917,7 @@ fn run_tests(arguments: &Arguments) -> Result<u8, Error> {
         preset,
         schedule: arguments.schedule.clone(),
         resume,
+        rerun: !arguments.no_rerun,
         id: arguments.run_id.clone(),
     };
     let reporter = output::Reporter::new(arguments.json);
@@ -1225,13 +1347,28 @@ fn show_findings(arguments: &Arguments) -> Result<u8, Error> {
     if arguments.note.is_some() && !arguments.not_a_bug {
         return Err(Error::Usage("--note goes with --not-a-bug".into()));
     }
+    if arguments.class.is_some() && (arguments.not_a_bug || arguments.reopen) {
+        return Err(Error::Usage("give --class, --not-a-bug or --reopen, one at a time".into()));
+    }
     match arguments.names.as_slice() {
-        [] if arguments.not_a_bug || arguments.reopen => Err(Error::Usage(
-            "say which finding: `dukovo-lab findings <finding> --not-a-bug`".into(),
-        )),
+        [] if arguments.not_a_bug || arguments.reopen || arguments.class.is_some() => {
+            Err(Error::Usage(
+                "say which finding: `dukovo-lab findings <finding> --class dukovo`".into(),
+            ))
+        }
         [] => list_findings(arguments, &store),
         [id] => {
-            let finding = if arguments.not_a_bug {
+            let finding = if let Some(class) = &arguments.class {
+                let class = match class.as_str() {
+                    "auto" => None,
+                    word => Some(findings::Class::parse(word).ok_or_else(|| {
+                        Error::Usage(format!(
+                            "\"{word}\" is not a class; the classes are lab, dukovo, flaky, known, test, or auto"
+                        ))
+                    })?),
+                };
+                findings::set_class(&store, id, class)?
+            } else if arguments.not_a_bug {
                 findings::set_not_a_bug(&store, id, Some(arguments.note.clone()))?
             } else if arguments.reopen {
                 findings::set_not_a_bug(&store, id, None)?
@@ -1290,6 +1427,9 @@ fn print_finding(finding: &findings::Finding, store: &Path) {
     println!("{} {}: {}", finding.id, finding.test, finding.signature);
     let note = finding.note.as_deref().map(|note| format!(" ({note})")).unwrap_or_default();
     println!("  state: {}{note}", finding.state.word());
+    if let Some(class) = finding.class {
+        println!("  class: {} (given by a person)", class.word());
+    }
     println!(
         "  failed {} time{} on {}, first {}, last {}",
         finding.count,

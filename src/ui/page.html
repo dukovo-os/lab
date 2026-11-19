@@ -3,8 +3,9 @@
 SPDX-FileCopyrightText: 2026 The Dukovo contributors
 SPDX-License-Identifier: Apache-2.0 OR MIT
 
-The runner page. dukovo-lab ui serves it on 127.0.0.1; page.js fills it
-in by running dukovo-lab commands through the server (see ui.rs).
+The runner page. dukovo-lab ui serves it on 127.0.0.1; page.js draws one
+view at a time in #view, chosen by the address's hash, from the answers of
+dukovo-lab commands run through the server (see ui.rs).
 -->
 <html lang="en">
 <head>
@@ -15,82 +16,24 @@ in by running dukovo-lab commands through the server (see ui.rs).
 <script src="/page.js" defer></script>
 </head>
 <body>
-<div class="wrap">
-  <header class="bar">
-    <div class="brand">Dukovo <b>Lab</b></div>
-    <div class="facts">
-      <div><span>Build</span> <strong id="build">…</strong></div>
-      <div><span>Run on</span> <strong id="picked-count">…</strong></div>
-    </div>
-  </header>
-  <p class="notice" id="notice" hidden></p>
-
-  <section class="panel" aria-label="Machines">
-    <div class="ph"><h2>Machines</h2><span class="note">Pick one or more. Each picked machine runs the same tests at the same time.</span></div>
-    <div class="machines" id="machines"></div>
-  </section>
-
-  <div class="grid">
-    <section class="panel" aria-label="Tests">
-      <div class="ph">
-        <h2>Tests <span class="note" id="test-count"></span></h2>
-        <div class="tools">
-          <input type="search" id="find" placeholder="Find a test" aria-label="Find a test">
-          <select id="preset" aria-label="Preset"></select>
-          <button class="btn primary" type="button" id="run-picked">Run</button>
-        </div>
-      </div>
-      <div id="categories"></div>
-    </section>
-
-    <div class="right">
-      <section class="panel" aria-label="This run">
-        <div class="ph"><h2 id="run-title">This run</h2><div class="tools"><button class="btn" type="button" id="stop" hidden>Stop</button></div></div>
-        <div id="waiting"></div>
-        <p class="note pad" id="no-run">No run yet. Pick tests and machines, then Run.</p>
-        <div class="progress" id="progress" hidden></div>
-        <pre class="log" id="log" hidden></pre>
-      </section>
-
-      <section class="panel" aria-label="Findings" id="findings-panel" hidden>
-        <div class="ph">
-          <h2>Findings <span class="note" id="finding-count"></span></h2>
-          <div class="tools"><button class="btn" type="button" id="send-all" hidden>Send all new</button></div>
-        </div>
-        <div id="findings"></div>
-        <div class="send" id="send-bar" hidden>
-          <span class="note" id="send-note"></span>
-          <button class="btn primary" type="button" id="send-run" hidden>Send</button>
-        </div>
-      </section>
-
-      <section class="panel" aria-label="Schedules">
-        <div class="ph"><h2>Schedules</h2><div class="tools"><button class="btn" type="button" id="new-schedule">New schedule</button></div></div>
-        <div class="histwrap" id="schedules-table" hidden>
-          <table class="hist sched">
-            <thead><tr><th>Runs</th><th id="when-head">When</th><th>Machines</th><th>Findings</th><th>Next</th><th></th></tr></thead>
-            <tbody id="schedules"></tbody>
-          </table>
-        </div>
-        <p class="note pad" id="no-schedules" hidden>No schedules yet. New schedule makes one: tests that run by themselves at a time or on each new build on main, with this page closed.</p>
-        <form class="sform" id="schedule-form" hidden></form>
-        <p class="note pad" id="schedule-note">Scheduled runs always skip tests that need you. A scheduled run waits if a run is already going on that machine, and tests main as it is then, on the lab's own Dukovo checkout.</p>
-      </section>
-
-      <section class="panel" aria-label="Past runs">
-        <div class="ph"><h2>Past runs</h2></div>
-        <div class="histwrap">
-          <table class="hist">
-            <thead><tr><th>When</th><th>Run</th><th>Machines</th><th>Build</th><th>Result</th><th>Findings</th></tr></thead>
-            <tbody id="runs"></tbody>
-          </table>
-        </div>
-        <p class="note pad" id="no-runs" hidden>No runs yet.</p>
-      </section>
-
-      <p class="note" id="last-command"></p>
-    </div>
+<header class="topbar">
+  <div class="brand">Dukovo lab</div>
+  <nav aria-label="Main" id="nav">
+    <a href="#home" data-view="home">Home</a>
+    <a href="#tests" data-view="tests">Tests</a>
+    <a href="#findings" data-view="findings">Findings</a>
+    <a href="#fleet" data-view="fleet">Fleet</a>
+    <a href="#runs" data-view="runs">Past runs</a>
+  </nav>
+  <div class="runstate" id="runstate">
+    <a href="#runs" id="runstate-text"><span class="dot idle"></span><span>Loading…</span></a>
+    <a class="btn ink" href="#start" id="start-run">Start run</a>
   </div>
-</div>
+</header>
+<main class="page" id="page">
+  <p class="notice" id="notice" role="status" hidden></p>
+  <div id="view" tabindex="-1"></div>
+</main>
+<p id="last-command"></p>
 </body>
 </html>
