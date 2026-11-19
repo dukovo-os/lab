@@ -167,6 +167,41 @@ grows, the runner sets the machine's clock to the lab PC's, as root, with
 `timedatectl set-time`; a clock that cannot be set fails the boot. QEMU
 machines start each boot from the lab PC's clock, and are left alone.
 
+## The health check
+
+A machine with a bad setup fails every test it is given: a root too
+small, a clock years off. Each such failure costs a test's whole time and
+would be filed as a failure of Dukovo's. So once per fresh boot, after the
+root has grown and the clock is set, and before the test's first step, the
+runner asks the machine one question over SSH, as the lab account, which
+takes about a second. It checks:
+
+- The free space on the root: at least 1 GiB. The check is left out when
+  the machine file has `grow_root = false`, as the lab image's own root is
+  small by design.
+- The clock: within 5 seconds of the lab PC's, either way.
+
+A check that fails is an `error` for that test, not a failure: it says
+nothing about Dukovo. The reason names the check and what to do, as
+`health check failed after the fresh boot: clock 41 s off the lab PC's,
+over the 5 s allowed. ...`. What the check found is in the test's log, as
+`Health check after boot 2: root 5859 MiB free; clock 0 s off the lab
+PC's: ok`, and in the driver's log. A part of the answer that cannot be
+read (no `df` on the machine, say) is left out and the log says so.
+
+A machine whose fresh boots fail the check twice in a row is benched for
+the rest of the run: its remaining tests are skipped, each with a reason
+such as `optiplex-1 was benched: its health check failed twice (clock 41 s
+off the lab PC's, over the 5 s allowed)`. The other machines carry on. A
+fresh boot that passes starts the count again. `run --resume` does not pick
+up tests skipped this way: run them again once the machine is put right.
+Only AMT and plug machines are checked; a QEMU machine starts from a clean
+disk each time.
+
+The console is not checked: the runner waits for the machine's ready line
+on the console before the check, so a boot that reaches it has shown its
+console lines already. A console that shows nothing fails the boot.
+
 ## Safety
 
 - AMT's password stays in its file: it is never written to a log, a

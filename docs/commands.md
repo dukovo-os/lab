@@ -186,7 +186,7 @@ its time in `at`:
 ```json
 {"event":"run-started","id":"20261107-153012-4f2a","bundle":"/home/chase/.local/share/dukovo-lab/runs/2026-11-07/20261107-153012-4f2a","machines":["qemu"],"tests":["boot/reaches-ready"],"at":"2026-11-07T15:30:12Z"}
 {"event":"test-started","machine":"qemu","test":"boot/reaches-ready","at":"..."}
-{"event":"step-ended","machine":"qemu","test":"boot/reaches-ready","step":"run `whoami`, exit status 0, output has \"lab\"","result":"pass","milliseconds":800,"note":"$ whoami\nlab","at":"..."}
+{"event":"step-ended","machine":"qemu","test":"boot/reaches-ready","step":"run `whoami`, exit status 0, output has \"lab\"","result":"pass","milliseconds":800,"note":"$ whoami\nlab","lab_pc_load":0.31,"at":"..."}
 {"event":"person-needed","machine":"optiplex","test":"network/cable-pull","step":"pull the network cable","done":"dukovo-lab done 20261107-153012-4f2a --machine optiplex","at":"..."}
 {"event":"test-ended","machine":"qemu","test":"boot/reaches-ready","result":"pass","reason":null,"milliseconds":41000,"boot":1,"log":"logs/qemu/boot-reaches-ready.log","screenshots":[],"at":"..."}
 {"event":"run-ended","id":"20261107-153012-4f2a","bundle":"...","summary":{"passed":1,"failed":0,"skipped":0,"errors":0},"stopped":false,"findings":[],"at":"..."}
@@ -195,7 +195,26 @@ its time in `at`:
 `result` is `pass`, `fail` (a check failed or the time limit passed: a
 finding), `skip` (with the reason) or `error` (the harness or the machine
 broke, so the result says nothing about Dukovo). A step's `note` is cut
-at 2000 bytes; the test's log has it whole. More kinds of event may be
+at 2000 bytes; the test's log has it whole. `lab_pc_load` is the lab PC's
+load per CPU as the step ended (Linux only; left out elsewhere).
+
+Some reasons are worth knowing:
+
+- `stalled: no output for 10 min` (or `3 min`) is a `fail`: a `run`
+  step's command printed nothing, and a `serial` step saw no new console
+  line, for the stall time (ten minutes for `run`, three for `serial`,
+  unless the test's `stall` says otherwise: see
+  [test files](test-files.md#steps-that-go-silent)), instead of waiting out
+  the test's time limit. The lines below it give the
+  console's last line and what the command had printed. The same hang is
+  one finding.
+- `health check failed after the fresh boot: ...` is an `error`: a real
+  machine's root is too small or its clock is off, so the test says
+  nothing about Dukovo. The reason names the check and what to do.
+- `<machine> was benched: its health check failed twice (...)` is a
+  `skip`: the machine failed two fresh boots' health checks in a row, and
+  its remaining tests are not run. The other machines carry on. See
+  [Real machines](real-machines.md#the-health-check). More kinds of event may be
 added, so skip the ones you do not know. The same lines go to
 `events.jsonl` in the bundle, with or without `--json`.
 
@@ -432,7 +451,7 @@ as dukovo-os/lab-results keeps runs:
 
 ```
 run.json                  what ran: build, image, machines, tests, preset, start and end
-results.json              each test's result on each machine, step by step
+results.json              each test's result on each machine, step by step, with the lab PC's load at each step
 events.jsonl              what happened as it happened: run's JSON lines, every one
 logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.log, and the traces of failed browser steps
 screenshots/<machine>/    <category>-<test>-<name>.png, and .txt: the screen's text, with --fonts
@@ -451,6 +470,14 @@ runs, in `findings/<id>.json` in the store.
 [schema/finding.schema.json](../schema/finding.schema.json) describe the
 JSON. Times are UTC, in RFC 3339.
 
+Each step in results.json has `lab_pc_load`, the lab PC's one-minute load
+average divided by its CPU count, read from `/proc/loadavg` as the step
+ended (`0.31`; absent where the lab PC has no `/proc/loadavg`). Browser
+and bench steps run their side of a test on the lab PC, so a step of
+either kind that ends with the load above 0.75 says in its note, and in
+the test's log, "the lab PC was busy (load 0.92 per CPU), so this step's
+times may be slow". The load never changes a result.
+
 ## Troubleshooting
 
 | Symptom | Cause and check |
@@ -465,6 +492,10 @@ JSON. Times are UTC, in RFC 3339.
 | A root step fails with "Sorry, try again." | The image holds another password's hash: it was built before the current `lab_password`, or on another PC. Rebuild it. |
 | Performance tests are skipped saying the run was given no Linux kit | `ob lab` builds the kit before the run and prints `note: performance tests will skip: ...` when it cannot, with the reason: usually no network to fetch the Linux kernel, or `dpkg-deb` or `depmod` missing. |
 | A bench step is skipped saying QEMU's emulator made the numbers | The machine has no KVM. The step still keeps both tables in its note; give the PC KVM (`/dev/kvm`) for numbers worth holding to Linux's. |
+| A bench or browser step's note says the lab PC was busy | The lab PC's load was above 0.75 per CPU when the step ended, so its times may be slow. The result is as the step's checks left it; run again when the lab PC is quiet before sending a slow result. |
+| A test fails "stalled: no output for 10 min" (or 3 min) | A command printed nothing and the console showed no new line for the stall time: it hung, or it is quiet by nature. The reason has the console's last line. Give the test or the step a longer `stall`, or `"off"`, when it is quiet by design. |
+| A test is an `error` with "health check failed after the fresh boot" | A real machine's root has less than 1 GiB free or its clock is more than 5 s off the lab PC's. The reason says which and what to do; see [Real machines](real-machines.md#the-health-check). |
+| Tests are skipped saying a machine "was benched" | Its health check failed on two fresh boots in a row. Put the machine right (the earlier tests' reasons say how), then run those tests again. |
 | A bench step fails "slower than Linux" | A finding: the rows marked `over` take more than `limit` times Linux's time. The note has both tables; `logs/<machine>/linux-boot-<n>.log` has Linux's run. Run again to rule out a busy PC before sending it. |
 | Tests that read the screen are skipped saying the run was given no console fonts | Give `--fonts` with Dukovo's `kernel/lib/fbcon/fonts`; `ob lab` does. |
 | A `screen` step fails though the text is plainly on the screenshot | The step reads cells, each within one row: text that wraps past the row's end, or a word the cursor sits on, does not match. The `.txt` beside the screenshot shows what was read. A screen of `?` means the fonts are not the console's: rebuild with the same checkout as the image. |

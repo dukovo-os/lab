@@ -632,6 +632,10 @@ impl Driver for AmtDriver {
         true
     }
 
+    fn checks_health(&self) -> bool {
+        true
+    }
+
     /// Writes a line to amt.log, with the seconds since the driver began.
     fn note(&mut self, line: &str) {
         self.netboot.note(line);
@@ -725,12 +729,13 @@ impl Driver for AmtDriver {
         command: &str,
         input: Option<&str>,
         deadline: Instant,
+        stall: Option<&ssh::Stall>,
     ) -> Result<ssh::Output, String> {
         let target = ssh_target(&self.setup, &self.settings.machine_address, self.boot)?;
         if !self.is_on() {
             return Err("the machine is off".into());
         }
-        target.run(command, input, deadline, &self.setup.stop)
+        target.run(command, input, deadline, &self.setup.stop, stall)
     }
 
     fn peer_address(&self) -> Option<String> {

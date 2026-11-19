@@ -42,6 +42,8 @@ use crate::bundle::{
 use crate::clock::Utc;
 use crate::driver::{ATTACKER_ON_SEGMENT, Driver, Setup, TARGET_ON_SEGMENT};
 use crate::findings;
+use crate::health;
+use crate::load;
 use crate::machines::{Control, Machine, Who};
 use crate::output::{Event, Reporter, short_note};
 use crate::peer::{self, Job, Ports, Readiness, SKIP_STATUS, Token};
@@ -54,7 +56,7 @@ use crate::suite::{
     Bench, Boot, Browser, Command, Engine, Fit, PASSWORD_TOKEN, PowerAction, Serve, Step,
     TARGET_TOKEN, Test,
 };
-use crate::units::format_duration;
+use crate::units::{describe_duration, format_duration};
 
 /// What a stopped test's result says; a run that is resumed runs again the
 /// tests with these results.
@@ -85,6 +87,9 @@ pub const GROW_ROOT: &str = "sh -c 'part=$(sed -n \"s/^disk //p\" /system/live/s
 /// lab network reaches no time server, so the machine's clock is whatever
 /// its real-time clock kept from the last test.
 pub const SET_CLOCK: &str = "timedatectl set-time";
+
+/// The longest the health check's command may take: it reads two numbers.
+const HEALTH_TIME: Duration = Duration::from_secs(30);
 
 /// Why a `bench` step cannot run.
 pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given no Linux kit: `ob lab` builds one and passes it with --linux";
@@ -488,6 +493,8 @@ fn run_machine(
                 )
             })
         });
+        // A benched machine is not given the rest of the run's tests.
+        let skip = skip.or_else(|| worker.as_ref().and_then(|worker| worker.benched.clone()));
         let ran_here = skip.is_none() && worker.is_some();
         let result = match (skip, &mut worker) {
             (Some(reason), _) => skipped(test, machine, reason),
@@ -577,6 +584,12 @@ struct Worker<'a> {
     /// How host steps run as root, found the first time one does (as
     /// they are, or through sudo), or why they cannot.
     host_root: Option<Result<Vec<String>, String>>,
+    /// How many fresh boots in a row failed the health check.
+    unhealthy: u32,
+    /// Why the machine is benched, once its health check has failed
+    /// [`health::FAILURES_TO_BENCH`] fresh boots in a row: the rest of its
+    /// tests are skipped with this.
+    benched: Option<String>,
 }
 
 /// What a test has on the lab PC, which goes when the test ends.
@@ -623,6 +636,8 @@ impl<'a> Worker<'a> {
             attacker_ready: false,
             peer: PeerSide { base: peer_folder, ..PeerSide::default() },
             host_root: None,
+            unhealthy: 0,
+            benched: None,
         }
     }
 
@@ -685,22 +700,24 @@ impl<'a> Worker<'a> {
         // machine fits it, which leaves the boot as it found it.
         let mut unfit = false;
         if let Boot::Stick { disk } = test.boot {
-            let (record, outcome) =
-                self.timed(test, "boot from the install stick, with a blank disk", |worker| {
-                    worker.boot_stick(disk)
-                });
+            let (record, outcome) = self.timed(
+                test,
+                "boot from the install stick, with a blank disk",
+                false,
+                |worker| worker.boot_stick(disk),
+            );
             steps.push(record);
             failure = outcome.err();
         } else if let Boot::Dvd { disk } = test.boot {
             let (record, outcome) =
-                self.timed(test, "boot from the install DVD, with a blank disk", |worker| {
+                self.timed(test, "boot from the install DVD, with a blank disk", false, |worker| {
                     worker.boot_dvd(disk)
                 });
             steps.push(record);
             failure = outcome.err();
         } else if fresh {
             let (record, outcome) =
-                self.timed(test, "boot afresh and wait until booted", |worker| {
+                self.timed(test, "boot afresh and wait until booted", false, |worker| {
                     worker.boot_fresh(deadline)
                 });
             steps.push(record);
@@ -717,8 +734,12 @@ impl<'a> Worker<'a> {
                 failure = Some(StepFailure::Skip(STOPPED_DURING.into()));
                 break;
             }
-            let (record, outcome) =
-                self.timed(test, &step.describe(), |worker| worker.run_step(test, step, deadline));
+            // The lab PC does its side of these, so they are slow when it
+            // is busy.
+            let times_matter = matches!(step, Step::Bench(_) | Step::Browser(_));
+            let (record, outcome) = self.timed(test, &step.describe(), times_matter, |worker| {
+                worker.run_step(test, step, deadline)
+            });
             steps.push(record);
             unfit = index == 0
                 && matches!(step, Step::Run(command) if command.or_skip.is_some())
@@ -810,11 +831,14 @@ impl<'a> Worker<'a> {
     }
 
     /// Runs `action` as a step of `test` named `what`, logging, timing
-    /// and reporting it.
+    /// and reporting it, with the lab PC's load as it ended. When
+    /// `times_matter` and that load is [`load::BUSY`], the step's note and
+    /// the log say the step's times may be slow; its result is not changed.
     fn timed(
         &mut self,
         test: &Test,
         what: &str,
+        times_matter: bool,
         action: impl FnOnce(&mut Self) -> Result<Option<String>, StepFailure>,
     ) -> (StepRecord, Result<(), StepFailure>) {
         let started = Instant::now();
@@ -861,6 +885,7 @@ impl<'a> Worker<'a> {
             outcome
         });
         let milliseconds = started.elapsed().as_millis() as u64;
+        let lab_pc_load = load::now();
         let (result, note, outcome) = match outcome {
             Ok(note) => (Outcome::Pass, note, Ok(())),
             Err(StepFailure::Fail(why)) => {
@@ -872,6 +897,12 @@ impl<'a> Worker<'a> {
             Err(StepFailure::Skip(why)) => {
                 (Outcome::Skip, Some(why.clone()), Err(StepFailure::Skip(why)))
             }
+        };
+        let busy = load::busy_line(lab_pc_load).filter(|_| times_matter && result != Outcome::Skip);
+        let note = match (note, &busy) {
+            (Some(note), Some(busy)) => Some(format!("{note}\n{busy}")),
+            (None, Some(busy)) => Some(busy.clone()),
+            (note, None) => note,
         };
         let word = match result {
             Outcome::Pass => "passed",
@@ -890,8 +921,9 @@ impl<'a> Worker<'a> {
             result,
             milliseconds,
             note: note.as_deref().map(short_note),
+            lab_pc_load,
         });
-        (StepRecord { step: what.into(), result, milliseconds, note }, outcome)
+        (StepRecord { step: what.into(), result, milliseconds, note, lab_pc_load }, outcome)
     }
 
     /// Says how long the limit was when a failure came from reaching it.
@@ -920,6 +952,7 @@ impl<'a> Worker<'a> {
         let note = self.wait_ready(deadline)?;
         let grown = self.grow_root(deadline)?;
         self.set_clock(deadline)?;
+        self.check_health(deadline)?;
         // The test that boots sees its whole boot: its serial steps may
         // check what came before the ready line.
         self.serial.rewind();
@@ -992,6 +1025,67 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Checks a real machine's health once after a fresh boot, when the
+    /// root has grown and the clock is set (see health.rs), and puts what
+    /// it found in the test's log. A machine that fails is a lab error for
+    /// this test; one that fails [`health::FAILURES_TO_BENCH`] fresh boots
+    /// in a row is benched, and its remaining tests are skipped. A machine
+    /// with no SSH channel or no lab key has nothing to ask, as with
+    /// [`Worker::grow_root`].
+    fn check_health(&mut self, deadline: Instant) -> Result<(), StepFailure> {
+        if !self.driver.checks_health()
+            || self.machine.who(Control::Ssh) != Who::Driver
+            || !self.has_key
+        {
+            return Ok(());
+        }
+        let until = deadline.min(Instant::now() + HEALTH_TIME);
+        let (output, shown) = self.execute(health::COMMAND, false, None, until)?;
+        let judgement = match output.status {
+            Some(0) => health::judge(
+                &health::read(&output.text),
+                Utc::now().seconds(),
+                self.driver.grows_root(),
+            ),
+            status => {
+                let status = status.map_or("no answer".to_string(), |status| status.to_string());
+                health::Judgement {
+                    summary: format!("the check did not run (exit status: {status})"),
+                    faults: vec![health::Fault {
+                        found: format!("the check did not run on the machine: {shown}"),
+                        advice: "check that the machine answers SSH, then run again".into(),
+                    }],
+                }
+            }
+        };
+        let verdict = if judgement.faults.is_empty() { "ok" } else { "FAILED" };
+        let line =
+            format!("Health check after boot {}: {}: {verdict}", self.boot, judgement.summary);
+        self.log.push(line.clone());
+        self.driver.note(&line);
+        if judgement.faults.is_empty() {
+            self.unhealthy = 0;
+            return Ok(());
+        }
+        self.unhealthy += 1;
+        let found: Vec<&str> = judgement.faults.iter().map(|fault| fault.found.as_str()).collect();
+        if self.unhealthy >= health::FAILURES_TO_BENCH {
+            self.benched = Some(format!(
+                "{} was benched: its health check failed twice ({})",
+                self.machine.name,
+                found.join(", ")
+            ));
+            self.log.push(format!("{} is benched for the rest of the run.", self.machine.name));
+        }
+        let advice: Vec<&str> =
+            judgement.faults.iter().map(|fault| fault.advice.as_str()).collect();
+        Err(StepFailure::Error(format!(
+            "health check failed after the fresh boot: {}. {}",
+            found.join("; "),
+            advice.join(" ")
+        )))
+    }
+
     /// Boots the install stick with a blank disk, and waits for nothing:
     /// the test's steps follow the stick's boot.
     fn boot_stick(&mut self, disk: u64) -> Result<Option<String>, StepFailure> {
@@ -1036,7 +1130,7 @@ impl<'a> Worker<'a> {
         // The ready line counts wherever it is in this boot, so a test may
         // wait for it with a serial step first.
         let ready = self.machine.ready.clone();
-        self.wait_serial_where(&ready, Search::ThisBoot, deadline)?;
+        self.wait_serial_where(&ready, Search::ThisBoot, None, deadline)?;
         // Without a key, tests that have no `run` steps still run, on
         // the serial console alone; the run refuses the others before
         // it starts.
@@ -1049,7 +1143,7 @@ impl<'a> Worker<'a> {
                 return Err(StepFailure::Skip(STOPPED_DURING.into()));
             }
             let attempt = deadline.min(Instant::now() + Duration::from_secs(20));
-            match self.driver.run_command("true", None, attempt) {
+            match self.driver.run_command("true", None, attempt, None) {
                 Ok(output) if output.status == Some(0) => return Ok(None),
                 Ok(output) => last = output.text.trim().to_string(),
                 Err(err) => return Err(StepFailure::Error(err)),
@@ -1074,13 +1168,13 @@ impl<'a> Worker<'a> {
             return self.ask_person(test, step, deadline);
         }
         match step {
-            Step::Run(command) => self.run_command(command, deadline),
+            Step::Run(command) => self.run_command(command, step.stall_limit(test), deadline),
             Step::Attack(command) => self.run_attack(command, deadline),
             Step::Host(command) => self.run_host(command, deadline),
             Step::Browser(browser) => self.run_browser(test, browser, deadline),
             Step::Serve(serve) => self.serve(test, serve, deadline),
             Step::Bench(bench) => self.bench(bench, deadline),
-            Step::Serial { text, .. } => self.wait_serial(text, deadline),
+            Step::Serial { text, .. } => self.wait_serial(text, step.stall_limit(test), deadline),
             Step::Power(action) => self.power(*action, deadline),
             Step::Link(up) => self.driver.set_link(*up).map(|()| None).map_err(StepFailure::Error),
             Step::PlugUsb(stick) => {
@@ -1192,16 +1286,50 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Runs a `run` step's command. It ends as stalled when it prints
+    /// nothing for `stall` while the console shows no new line: that is
+    /// Dukovo hanging, so it fails the test, where waiting out the time
+    /// limit would cost the test's whole time.
     fn run_command(
         &mut self,
         command: &Command,
+        stall: Option<Duration>,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
         let command = self.fill_command(command)?;
         let input = self.fill_input(&command)?;
-        let (output, shown) =
-            self.execute(&command.command, command.root, input.as_deref(), deadline)?;
+        let watch = stall
+            .map(|after| ssh::Stall { after, console: self.driver.serial_log().to_path_buf() });
+        let (output, shown) = self.execute_watched(
+            &command.command,
+            command.root,
+            input.as_deref(),
+            watch.as_ref(),
+            deadline,
+        )?;
+        // A command with no status was cut short: by the stop, which
+        // `finish` turned into a skip already, by the time limit, or by
+        // the stall.
+        if let Some(after) = stall.filter(|_| output.status.is_none() && Instant::now() < deadline)
+        {
+            return Err(self.stalled(after, &shown));
+        }
         check_run(&command, &output, shown)
+    }
+
+    /// The failure of a step that was silent for `after`: the first line
+    /// says how long, so the same hang is one finding wherever it is, and
+    /// the console's last line and what the step showed follow.
+    fn stalled(&mut self, after: Duration, shown: &str) -> StepFailure {
+        let last = match self.serial.last_line() {
+            Some(line) => format!("the last console line was \"{line}\""),
+            None => "the console showed no line".to_string(),
+        };
+        StepFailure::Fail(format!(
+            "stalled: no output for {}\n{last} ({})\n{shown}",
+            describe_duration(after),
+            self.relative_serial()
+        ))
     }
 
     /// Runs a `host` step's command on the lab PC and checks it as a `run`
@@ -1444,6 +1572,7 @@ impl<'a> Worker<'a> {
             root: command.root,
             input: command.input.as_deref().map(|input| self.fill(input)).transpose()?,
             or_skip: command.or_skip.clone(),
+            stall: command.stall,
         })
     }
 
@@ -1515,6 +1644,7 @@ impl<'a> Worker<'a> {
             root: command.root,
             input: None,
             or_skip: None,
+            stall: None,
         };
         let (output, shown) = self.execute_attack(&resolved.command, resolved.root, deadline)?;
         check_command(&resolved, &output, shown, true)
@@ -1560,6 +1690,19 @@ impl<'a> Worker<'a> {
         input: Option<&str>,
         deadline: Instant,
     ) -> Result<(ssh::Output, String), StepFailure> {
+        self.execute_watched(command, root, input, None, deadline)
+    }
+
+    /// As [`Worker::execute`], ending the command early when `stall` says
+    /// it has gone quiet.
+    fn execute_watched(
+        &mut self,
+        command: &str,
+        root: bool,
+        input: Option<&str>,
+        stall: Option<&ssh::Stall>,
+        deadline: Instant,
+    ) -> Result<(ssh::Output, String), StepFailure> {
         // The machine went off when the test needed it on: Dukovo's
         // failure, as when it turns off before a serial step's text.
         if !self.driver.is_on() {
@@ -1570,7 +1713,7 @@ impl<'a> Worker<'a> {
         let (line, input, prompt) = self.as_root(command, root, input)?;
         let output = self
             .driver
-            .run_command(&line, input.as_deref(), deadline)
+            .run_command(&line, input.as_deref(), deadline, stall)
             .map_err(StepFailure::Error)?;
         self.finish(command, output, prompt)
     }
@@ -1736,28 +1879,43 @@ impl<'a> Worker<'a> {
         Ok(None)
     }
 
-    /// Waits for `text` on the serial console after the last text found.
+    /// Waits for `text` on the serial console after the last text found,
+    /// ending as stalled when the console shows no new line for `stall`.
     fn wait_serial(
         &mut self,
         text: &str,
+        stall: Option<Duration>,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
-        self.wait_serial_where(text, Search::AfterLastFound, deadline)
+        self.wait_serial_where(text, Search::AfterLastFound, stall, deadline)
     }
 
+    /// Waits for `text` where `search` says. A boot's wait passes no
+    /// `stall`: a machine may take long to show its first lines.
     fn wait_serial_where(
         &mut self,
         text: &str,
         search: Search,
+        stall: Option<Duration>,
         deadline: Instant,
     ) -> Result<Option<String>, StepFailure> {
         let found = |serial: &mut SerialWatch| match search {
             Search::AfterLastFound => serial.find(text),
             Search::ThisBoot => serial.seen_this_boot(text),
         };
+        let (mut seen, mut moved) = (self.serial.read, Instant::now());
         loop {
             if found(&mut self.serial) {
                 return Ok(None);
+            }
+            if self.serial.read != seen {
+                (seen, moved) = (self.serial.read, Instant::now());
+            }
+            if let Some(after) = stall
+                && moved.elapsed() >= after
+            {
+                let waiting = format!("waiting for \"{text}\"");
+                return Err(self.stalled(after, &waiting));
             }
             if !self.driver.is_on() {
                 // The last lines may have landed as the machine went off.
@@ -2052,6 +2210,12 @@ impl SerialWatch {
         self.text.get(self.boot..).unwrap_or_default()
     }
 
+    /// The last line the console showed, as a person reads it, if any.
+    fn last_line(&mut self) -> Option<String> {
+        self.refresh();
+        self.text.lines().rev().map(str::trim).find(|line| !line.is_empty()).map(String::from)
+    }
+
     /// The log's whole text, every boot of this log.
     fn whole(&mut self) -> &str {
         self.refresh();
@@ -2164,6 +2328,7 @@ mod tests {
             root: false,
             input: None,
             or_skip: Some("needs an Azure machine".into()),
+            stall: None,
         };
         let output = |status, text: &str| ssh::Output { status, text: text.into() };
         let check = |command: &Command, status, text| {

@@ -36,6 +36,19 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Writes a length of time in words, as a message says it: `45 s`,
+/// `3 min`, `2 h`.
+pub fn describe_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3600 && seconds.is_multiple_of(3600) {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 && seconds.is_multiple_of(60) {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +64,13 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(90)), "90s");
         assert_eq!(format_duration(Duration::from_secs(180)), "3m");
         assert_eq!(format_duration(Duration::from_secs(7200)), "2h");
+    }
+
+    #[test]
+    fn a_length_of_time_is_said_in_its_largest_whole_unit() {
+        assert_eq!(describe_duration(Duration::from_secs(45)), "45 s");
+        assert_eq!(describe_duration(Duration::from_secs(180)), "3 min");
+        assert_eq!(describe_duration(Duration::from_secs(90)), "90 s");
+        assert_eq!(describe_duration(Duration::from_secs(7200)), "2 h");
     }
 }

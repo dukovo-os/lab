@@ -39,7 +39,8 @@
                 "step": { "description": "The step in words.", "type": "string" },
                 "result": { "$ref": "#/$defs/outcome" },
                 "milliseconds": { "type": "integer", "minimum": 0 },
-                "note": { "description": "What went wrong, or what the step saw.", "type": ["string", "null"] }
+                "note": { "description": "What went wrong, or what the step saw.", "type": ["string", "null"] },
+                "lab_pc_load": { "description": "The lab PC's one-minute load average per CPU when the step ended, from /proc/loadavg. A browser or performance step that ended above 0.75 says so in its note. Absent where the lab PC has no /proc/loadavg.", "type": "number", "minimum": 0 }
               }
             }
           },
