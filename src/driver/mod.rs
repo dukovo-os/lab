@@ -298,6 +298,16 @@ pub trait Driver: Send {
         Err("the lab PC cannot reach this machine's ports".into())
     }
 
+    /// The `sh` command that forwards the lab PC's loopback port
+    /// `local_port` to the machine's own `port`, which the browser steps
+    /// open pages through: a page opened by an address the machine does not
+    /// know itself by fails the checks that need a name (a passkey's, a
+    /// certificate's `localhost`). None when the lab PC's loopback already
+    /// reaches the machine's ports, as a QEMU machine's does.
+    fn loopback_forward(&mut self, _local_port: u16, _port: u16) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// How many times longer than on real hardware tests may take here.
     fn slowdown(&self) -> u32;
 

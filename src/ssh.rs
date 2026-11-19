@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::peer;
 use crate::stop::Stop;
 
 /// The account `ob image --lab` makes for the lab.
@@ -143,9 +144,40 @@ impl Target {
     /// The `ssh` command line for `command`.
     fn command(&self, command: &str) -> Command {
         let mut ssh = Command::new("ssh");
-        // No user or system configuration: every option the lab relies on
-        // is here.
-        ssh.args(["-F", "/dev/null"]);
+        ssh.args(self.arguments_before_host());
+        ssh.arg(self.account());
+        ssh.args(["--", command]);
+        ssh
+    }
+
+    /// The `sh` command line of an `ssh` that forwards `local_port` on the
+    /// lab PC's loopback to `port` on the machine's own, for as long as it
+    /// runs. The machine sees each connection come from itself, so a page
+    /// it serves to `localhost` is served here as well. `ssh` ends when it
+    /// cannot bind the local port, so a forward that did not start does
+    /// not look as if it had.
+    pub fn forward_command(&self, local_port: u16, port: u16) -> String {
+        let mut words = vec!["ssh".to_string()];
+        words.extend(self.arguments_before_host());
+        words.extend([
+            "-N".into(),
+            "-o".into(),
+            "ExitOnForwardFailure=yes".into(),
+            "-L".into(),
+            format!("127.0.0.1:{local_port}:127.0.0.1:{port}"),
+            self.account(),
+        ]);
+        words.iter().map(peer::quoted).collect::<Vec<_>>().join(" ")
+    }
+
+    fn account(&self) -> String {
+        format!("{LAB_ACCOUNT}@{}", self.host)
+    }
+
+    /// Everything of the command line before the account: no user or
+    /// system configuration, and every option the lab relies on.
+    fn arguments_before_host(&self) -> Vec<String> {
+        let mut words = vec!["-F".to_string(), "/dev/null".into()];
         for option in [
             "BatchMode=yes".to_string(),
             "IdentitiesOnly=yes".into(),
@@ -160,12 +192,10 @@ impl Target {
             "ServerAliveCountMax=3".into(),
             "LogLevel=ERROR".into(),
         ] {
-            ssh.args(["-o", &option]);
+            words.extend(["-o".to_string(), option]);
         }
-        ssh.args(["-p", &self.port.to_string()]);
-        ssh.arg(format!("{LAB_ACCOUNT}@{}", self.host));
-        ssh.args(["--", command]);
-        ssh
+        words.extend(["-p".to_string(), self.port.to_string()]);
+        words
     }
 }
 
@@ -269,6 +299,23 @@ pub fn make_key(path: &Path) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forward_binds_the_lab_pc_s_loopback_and_ends_when_it_cannot() {
+        let target = Target {
+            host: "10.77.0.2".into(),
+            port: 22,
+            key: "/keys/it's".into(),
+            known_hosts: "/work/known_hosts-1".into(),
+            scratch: "/work/ssh-output".into(),
+        };
+        let command = target.forward_command(41000, 9090);
+        assert!(command.starts_with("'ssh' '-F' '/dev/null' "), "{command}");
+        assert!(command.contains("'IdentityFile=/keys/it'\\''s'"), "{command}");
+        assert!(command.contains("'UserKnownHostsFile=/work/known_hosts-1'"), "{command}");
+        assert!(command.contains("'ExitOnForwardFailure=yes'"), "{command}");
+        assert!(command.ends_with("'-N' '-o' 'ExitOnForwardFailure=yes' '-L' '127.0.0.1:41000:127.0.0.1:9090' 'lab@10.77.0.2'"), "{command}");
+    }
 
     #[test]
     fn a_command_is_stalled_only_when_it_and_the_console_are_both_still() {

@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use crate::peer::SKIP_STATUS;
+use crate::peer::{SKIP_STATUS, quoted};
 use crate::suite::Engine;
 
 /// The runner script, which run.rs writes into the test's folder on the
@@ -68,11 +68,6 @@ impl Runner<'_> {
             quoted(self.name),
         )
     }
-}
-
-/// `word` as one word of an `sh` command line.
-fn quoted(word: impl std::fmt::Display) -> String {
-    format!("'{}'", word.to_string().replace('\'', "'\\''"))
 }
 
 /// How the runner ended for one engine.

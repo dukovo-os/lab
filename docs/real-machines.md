@@ -167,6 +167,30 @@ grows, the runner sets the machine's clock to the lab PC's, as root, with
 `timedatectl set-time`; a clock that cannot be set fails the boot. QEMU
 machines start each boot from the lab PC's clock, and are left alone.
 
+## Browsers open the machine by `localhost`
+
+A passkey is bound to a name, and several certificate checks need the
+machine to be reached by the name it knows itself by, `localhost`. A
+QEMU machine's ports are on the lab PC's own loopback, so a `browser`
+step opens `https://127.0.0.1:PORT`. A real machine is reached by its
+address on the lab network, which it does not know itself by, so before
+the first `browser` step of a test the runner starts an `ssh -N -L
+127.0.0.1:FREE:127.0.0.1:PORT` to the machine, as the lab account, with
+the lab key and the SSH options of every other step (and the boot's
+known-hosts file), and the step's page is `https://127.0.0.1:FREE`. The
+machine sees each connection come from itself. The forward is one of the
+test's lab PC processes: it ends with the test, and the test's log says
+so. The machine's `sshd` must allow TCP forwarding, as the lab image's
+does.
+
+Only what a browser opens changes. `host`, `run` and `attack` steps, and
+`{machine}` and `{machine-port:N}` in them, keep the machine's address.
+When the forward does not start (the key is refused, the machine is
+off, the port is taken), the browser is given the machine's address as
+before, the test's log says why, and the test's script decides whether
+it can go on: a script that needs a name skips itself. The forward's
+own output is `logs/<machine>/<test>-forward-<port>.log` in the bundle.
+
 ## The health check
 
 A machine with a bad setup fails every test it is given: a root too
