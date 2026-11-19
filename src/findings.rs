@@ -494,6 +494,7 @@ mod tests {
             build: Some(format!("0.13.0 {}", &id[16..])),
             image: "lab.img".into(),
             machines: Vec::new(),
+            pools: Vec::new(),
             tests: Vec::new(),
             preset: None,
             schedule: None,

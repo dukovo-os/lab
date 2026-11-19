@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::Error;
-use crate::bundle::{Outcome, ResultRecord, ResultsFile, RunRecord, StepRecord};
+use crate::bundle::{Outcome, PoolRecord, ResultRecord, ResultsFile, RunRecord, StepRecord};
 use crate::clock::Utc;
 use crate::store;
 
@@ -203,25 +203,45 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
     let (bundle, record, state) = read_state(store, id)?;
     let events = read_events(&bundle);
 
+    // A test of a pool is queued under the pool's label until a machine of
+    // the pool takes it, when it moves to that machine.
+    let queued = |machine: String, test: &String| TestState {
+        test: test.clone(),
+        machine,
+        state: TestStateKind::Queued,
+        reason: None,
+        milliseconds: None,
+        started: None,
+    };
+    let in_pool =
+        |name: &str| record.pools.iter().any(|pool| pool.members.iter().any(|m| m == name));
     let mut tests: Vec<TestState> = record
         .machines
         .iter()
-        .flat_map(|machine| {
-            record.tests.iter().map(|test| TestState {
-                test: test.clone(),
-                machine: machine.name.clone(),
-                state: TestStateKind::Queued,
-                reason: None,
-                milliseconds: None,
-                started: None,
-            })
-        })
+        .filter(|machine| !in_pool(&machine.name))
+        .flat_map(|machine| record.tests.iter().map(|test| queued(machine.name.clone(), test)))
+        .chain(
+            record
+                .pools
+                .iter()
+                .flat_map(|pool| record.tests.iter().map(|test| queued(pool.label(), test))),
+        )
         .collect();
     let mut waiting: Vec<Waiting> = Vec::new();
     for event in &events {
         let machine = text(event, "machine");
         let test = text(event, "test");
-        let entry = tests.iter_mut().find(|entry| entry.machine == machine && entry.test == test);
+        let at = tests
+            .iter()
+            .position(|entry| entry.machine == machine && entry.test == test)
+            .or_else(|| {
+                let label =
+                    record.pools.iter().find(|pool| pool.members.contains(&machine))?.label();
+                let at = tests.iter().position(|e| e.machine == label && e.test == test)?;
+                tests[at].machine.clone_from(&machine);
+                Some(at)
+            });
+        let entry = at.map(|at| &mut tests[at]);
         match event["event"].as_str() {
             Some("test-started") => {
                 if let Some(entry) = entry {
@@ -281,7 +301,7 @@ pub fn status(store: &Path, id: &str) -> Result<Status, Error> {
         }
     }
     let left_seconds = (state == State::Running)
-        .then(|| time_left(&tests, &typical_durations(store, Some(id))))
+        .then(|| time_left(&tests, &typical_durations(store, Some(id)), &record.pools))
         .flatten();
     let output = (state == State::Died)
         .then(|| fs::read_to_string(store::output_log(store, id)).ok())
@@ -335,13 +355,27 @@ pub fn typical_durations(store: &Path, leave_out: Option<&str>) -> HashMap<(Stri
 }
 
 /// About how long the tests not yet done will take: machines run side by
-/// side, so the slowest machine's share. None if any test's time is not
-/// known.
-fn time_left(tests: &[TestState], typical: &HashMap<(String, String), u64>) -> Option<u64> {
+/// side, so the slowest machine's share. The tests still queued for a pool
+/// are shared among its machines, so a pool's share is its queue's time
+/// over its machines. None if any test's time is not known.
+fn time_left(
+    tests: &[TestState],
+    typical: &HashMap<(String, String), u64>,
+    pools: &[PoolRecord],
+) -> Option<u64> {
     let now = Utc::now();
     let mut per_machine: HashMap<&str, u64> = HashMap::new();
     for entry in tests {
-        let usual = || typical.get(&(entry.machine.clone(), entry.test.clone())).copied();
+        let pool = pools.iter().find(|pool| pool.label() == entry.machine);
+        let usual = || match pool {
+            Some(pool) => pool
+                .members
+                .iter()
+                .filter_map(|member| typical.get(&(member.clone(), entry.test.clone())))
+                .max()
+                .copied(),
+            None => typical.get(&(entry.machine.clone(), entry.test.clone())).copied(),
+        };
         let left_ms = match entry.state {
             TestStateKind::Queued => usual()?,
             TestStateKind::Running => {
@@ -352,7 +386,12 @@ fn time_left(tests: &[TestState], typical: &HashMap<(String, String), u64>) -> O
         };
         *per_machine.entry(&entry.machine).or_default() += left_ms;
     }
-    Some(per_machine.values().max().copied().unwrap_or(0).div_ceil(1000))
+    let share = |(machine, left): (&&str, &u64)| {
+        let members =
+            pools.iter().find(|pool| pool.label() == *machine).map_or(1, |pool| pool.members.len());
+        left.div_ceil(u64::try_from(members.max(1)).unwrap_or(1))
+    };
+    Some(per_machine.iter().map(share).max().unwrap_or(0).div_ceil(1000))
 }
 
 /// What `results` answers: a run's results, in full once it has ended,
@@ -421,8 +460,14 @@ fn results_from_events(run: &RunRecord, events: &[Value]) -> Vec<ResultRecord> {
             _ => {}
         }
     }
+    // A test no machine of a pool ran names the pool, which comes after
+    // the machines.
     let place = |result: &ResultRecord| {
-        let machine = run.machines.iter().position(|machine| machine.name == result.machine);
+        let machine = run
+            .machines
+            .iter()
+            .position(|machine| machine.name == result.machine)
+            .unwrap_or(usize::MAX);
         let test = run.tests.iter().position(|test| *test == result.test);
         (machine, test)
     };
@@ -503,6 +548,7 @@ mod tests {
                     driver: "qemu".into(),
                 })
                 .into(),
+            pools: Vec::new(),
             tests: vec!["boot/a".into(), "boot/b".into()],
             preset: None,
             schedule: None,
@@ -563,6 +609,52 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_s_tests_are_queued_for_the_pool_until_a_machine_takes_them() {
+        let store = TempDir::new("status-pool");
+        let id = "20261107-153012-4f2a";
+        let mut pooled = record(id);
+        pooled.machines = ["qemu", "box-1", "box-2"]
+            .map(|name| MachineRecord {
+                name: name.into(),
+                about: String::new(),
+                driver: "qemu".into(),
+            })
+            .into();
+        pooled.pools = vec![PoolRecord {
+            name: "boxes".into(),
+            members: vec!["box-1".into(), "box-2".into()],
+        }];
+        let bundle = Bundle::create(store.path(), pooled).unwrap();
+        let events = [
+            r#"{"event":"test-started","machine":"box-2","test":"boot/b","at":"2026-11-07T15:30:13Z"}"#,
+            r#"{"event":"test-ended","machine":"box-2","test":"boot/b","result":"pass","milliseconds":40}"#,
+            r#"{"event":"test-started","machine":"box-1","test":"boot/a","at":"2026-11-07T15:30:14Z"}"#,
+        ];
+        fs::write(bundle.dir().join("events.jsonl"), events.join("\n")).unwrap();
+        let running = store::Running::start(store.path(), id, &["qemu", "box-1", "box-2"]).unwrap();
+        let now = status(store.path(), id).unwrap();
+        let seen: Vec<(&str, &str, TestStateKind)> = now
+            .tests
+            .iter()
+            .map(|entry| (entry.machine.as_str(), entry.test.as_str(), entry.state))
+            .collect();
+        // The machine named on its own has every test; each test of the
+        // pool is there once, under the machine that took it.
+        assert_eq!(
+            seen,
+            [
+                ("qemu", "boot/a", TestStateKind::Queued),
+                ("qemu", "boot/b", TestStateKind::Queued),
+                ("box-1", "boot/a", TestStateKind::Running),
+                ("box-2", "boot/b", TestStateKind::Pass),
+            ]
+        );
+        assert_eq!(now.machines.len(), 3);
+        assert_eq!(now.counts.queued, 2);
+        running.end();
+    }
+
+    #[test]
     fn earlier_runs_say_how_long_is_left() {
         let tests = vec![
             TestState {
@@ -583,9 +675,9 @@ mod tests {
             },
         ];
         let mut typical = HashMap::new();
-        assert_eq!(time_left(&tests, &typical), None);
+        assert_eq!(time_left(&tests, &typical, &[]), None);
         typical.insert(("qemu".to_string(), "boot/b".to_string()), 61_500);
-        assert_eq!(time_left(&tests, &typical), Some(62));
+        assert_eq!(time_left(&tests, &typical, &[]), Some(62));
     }
 
     #[test]

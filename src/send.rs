@@ -389,6 +389,7 @@ mod tests {
             build: Some("0.13.0 fd2a9e8".into()),
             image: "lab.img".into(),
             machines: Vec::new(),
+            pools: Vec::new(),
             tests: vec!["drivers/link-pull".into()],
             preset: None,
             schedule: None,

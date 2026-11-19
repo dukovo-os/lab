@@ -388,6 +388,12 @@ impl Driver for FakeMachine {
                     .into(),
             ),
             "true" => (Some(0), String::new()),
+            // Takes long enough that machines of a pool all get a turn at
+            // its queue.
+            "slow" => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                (Some(0), String::new())
+            }
             // Says what it was given on its input, as a command a test
             // hands a file's text to does with it.
             "cat" => (Some(0), input.unwrap_or_default().to_string()),
@@ -2140,4 +2146,287 @@ fn stall_off_and_steps_quiet_by_design_are_never_cut() {
     let (_, results) = run_on(&setting, vec![&setting.qemu]);
     let reason = results[0].reason.as_deref().unwrap();
     assert!(reason.starts_with("step 1: stalled: no output for 1 s"), "{reason}");
+}
+
+/// Tests of one step each, which take a pool's machines a moment so that
+/// each gets a turn at the queue.
+fn slow_tests(count: usize) -> Setting {
+    let tests: Vec<(String, String)> = (1..=count)
+        .map(|number| {
+            (
+                format!("boot/t{number}.toml"),
+                format!(
+                    "about = \"t{number}\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"slow\"\n"
+                ),
+            )
+        })
+        .collect();
+    let tests: Vec<(&str, &str)> =
+        tests.iter().map(|(file, text)| (file.as_str(), text.as_str())).collect();
+    setting_with(&tests)
+}
+
+fn optiplex<'a>(members: Vec<&'a Machine>) -> Pool<'a> {
+    Pool { name: "optiplex".into(), members }
+}
+
+/// A run that shares tests out among pools, as `--machine pool:...` does,
+/// given the lab password that machines named `checked...` need.
+fn run_pools(
+    setting: &Setting,
+    machines: Vec<&Machine>,
+    pools: Vec<Pool<'_>>,
+    typical: HashMap<(String, String), u64>,
+) -> (Done, Vec<ResultRecord>) {
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines,
+        pools,
+        typical,
+        image: "dukovo.img".into(),
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    (Done { summary: ended.summary, bundle }, results.results)
+}
+
+/// The tests each machine ran, sorted, by machine.
+fn ran_by(results: &[ResultRecord]) -> BTreeMap<&str, Vec<&str>> {
+    let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for result in results {
+        by.entry(&result.machine).or_default().push(&result.test);
+    }
+    by.values_mut().for_each(|tests| tests.sort_unstable());
+    by
+}
+
+#[test]
+fn a_pool_of_three_shares_nine_tests_and_runs_each_once() {
+    let setting = slow_tests(9);
+    let members: Vec<Machine> =
+        ["optiplex-1", "optiplex-2", "optiplex-3"].map(|name| named(&setting, name)).into();
+    let (done, results) =
+        run_pools(&setting, Vec::new(), vec![optiplex(members.iter().collect())], HashMap::new());
+    assert_eq!(done.summary, Summary { passed: 9, failed: 0, skipped: 0, errors: 0 });
+    let mut tests: Vec<&str> = results.iter().map(|result| result.test.as_str()).collect();
+    tests.sort_unstable();
+    tests.dedup();
+    assert_eq!(results.len(), 9, "no test ran twice");
+    assert_eq!(tests.len(), 9, "every test ran");
+    let by = ran_by(&results);
+    assert!(by.len() >= 2, "more than one machine took tests: {by:?}");
+    assert!(by.keys().all(|machine| machine.starts_with("optiplex-")), "{by:?}");
+
+    let run: RunRecord =
+        serde_json::from_str(&fs::read_to_string(done.bundle.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run.pools.len(), 1);
+    assert_eq!(run.pools[0].name, "optiplex");
+    assert_eq!(run.pools[0].members, ["optiplex-1", "optiplex-2", "optiplex-3"]);
+    assert_eq!(run.machines.len(), 3);
+}
+
+#[test]
+fn a_pool_runs_its_longest_tests_first() {
+    let setting = setting_with(&[
+        ("boot/a.toml", "about = \"a\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+        ("boot/b.toml", "about = \"b\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+        ("boot/c.toml", "about = \"c\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+        ("boot/d.toml", "about = \"d\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+    ]);
+    let member = named(&setting, "optiplex-1");
+    // A test with no time yet counts as its time limit, 60 s, so c starts
+    // before the tests known to be shorter.
+    let typical = HashMap::from([
+        (("optiplex-1".to_string(), "boot/a".to_string()), 2_000),
+        (("optiplex-1".to_string(), "boot/b".to_string()), 90_000),
+        (("optiplex-1".to_string(), "boot/d".to_string()), 30_000),
+    ]);
+    let (_, results) = run_pools(&setting, Vec::new(), vec![optiplex(vec![&member])], typical);
+    let order: Vec<&str> = results.iter().map(|result| result.test.as_str()).collect();
+    assert_eq!(order, ["boot/b", "boot/c", "boot/d", "boot/a"]);
+}
+
+#[test]
+fn a_benched_machine_s_queue_is_taken_by_the_rest_of_the_pool() {
+    let setting = slow_tests(6);
+    let bad = named(&setting, "checked-bad");
+    let good = named(&setting, "optiplex-2");
+    let (done, results) =
+        run_pools(&setting, Vec::new(), vec![optiplex(vec![&bad, &good])], HashMap::new());
+    let by = ran_by(&results);
+    assert_eq!(by["checked-bad"].len(), 2, "it takes tests until its health check benches it");
+    assert_eq!(by["optiplex-2"].len(), 4, "the rest carry on with the queue");
+    assert_eq!(done.summary, Summary { passed: 4, failed: 0, skipped: 0, errors: 2 });
+    let events = fs::read_to_string(done.bundle.join("events.jsonl")).unwrap();
+    let out = events.lines().find(|line| line.contains("\"machine-out\"")).expect(&events);
+    assert!(
+        out.contains("\"machine\":\"checked-bad\"") && out.contains("checked-bad was benched"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_pool_with_every_machine_out_skips_what_is_left_with_a_reason_that_says_so() {
+    let setting = slow_tests(6);
+    let broken = named(&setting, "broken");
+    let bad = named(&setting, "checked-bad");
+    let (done, results) =
+        run_pools(&setting, Vec::new(), vec![optiplex(vec![&broken, &bad])], HashMap::new());
+    assert_eq!(done.summary, Summary { passed: 0, failed: 0, skipped: 4, errors: 2 });
+    let skipped: Vec<&ResultRecord> =
+        results.iter().filter(|result| result.result == Outcome::Skip).collect();
+    for result in skipped {
+        assert_eq!(result.machine, "pool:optiplex");
+        let reason = result.reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with("no machine of pool:optiplex was left to run this test: ")
+                && reason.contains("the broken machine did not start: no such machine")
+                && reason.contains("checked-bad was benched"),
+            "{reason}"
+        );
+    }
+
+    let alone = slow_tests(2);
+    let broken = named(&alone, "broken");
+    let (done, results) =
+        run_pools(&alone, Vec::new(), vec![optiplex(vec![&broken])], HashMap::new());
+    assert_eq!(done.summary, Summary { passed: 0, failed: 0, skipped: 2, errors: 0 });
+    assert!(results.iter().all(|result| result.machine == "pool:optiplex"));
+}
+
+#[test]
+fn a_test_the_pool_cannot_run_is_skipped_once_for_the_pool() {
+    let setting = setting_with(&[
+        ("boot/ok.toml", "about = \"ok\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+        ("stress/cord.toml", TESTS[4].1),
+        ("drivers/link.toml", TESTS[3].1),
+    ]);
+    let members: Vec<Machine> = ["optiplex-1", "optiplex-2", "optiplex-3"]
+        .map(|name| {
+            let mut machine = named(&setting, name);
+            machine.controls.insert(Control::Cord, Who::Person);
+            machine.controls.insert(Control::Link, Who::None);
+            machine
+        })
+        .into();
+    let (done, results) =
+        run_pools(&setting, Vec::new(), vec![optiplex(members.iter().collect())], HashMap::new());
+    assert_eq!(done.summary, Summary { passed: 1, failed: 0, skipped: 2, errors: 0 });
+    let skipped: Vec<(&str, &str, &str)> = results
+        .iter()
+        .filter(|result| result.result == Outcome::Skip)
+        .map(|result| {
+            (result.test.as_str(), result.machine.as_str(), result.reason.as_deref().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            ("drivers/link", "pool:optiplex", "the machine has no link"),
+            ("stress/cord", "pool:optiplex", "needs a person for cord"),
+        ]
+    );
+}
+
+#[test]
+fn a_machine_named_on_its_own_runs_every_test_beside_a_pool_that_runs_each_once() {
+    let setting = slow_tests(4);
+    let first = named(&setting, "optiplex-1");
+    let second = named(&setting, "optiplex-2");
+    let (done, results) = run_pools(
+        &setting,
+        vec![&setting.qemu],
+        vec![optiplex(vec![&first, &second])],
+        HashMap::new(),
+    );
+    assert_eq!(done.summary.passed, 8);
+    let by = ran_by(&results);
+    assert_eq!(by["qemu"], ["boot/t1", "boot/t2", "boot/t3", "boot/t4"]);
+    let in_pool: usize = by["optiplex-1"].len() + by["optiplex-2"].len();
+    assert_eq!(in_pool, 4);
+    let mut pooled: Vec<&str> = by["optiplex-1"].iter().chain(&by["optiplex-2"]).copied().collect();
+    pooled.sort_unstable();
+    pooled.dedup();
+    assert_eq!(pooled.len(), 4, "each test ran once in the pool");
+}
+
+#[test]
+fn a_resumed_sharded_run_queues_what_was_left_to_the_same_pool() {
+    let setting = setting_with(&[
+        ("features/uname.toml", TESTS[1].1),
+        ("stress/hang.toml", "about = \"hangs\"\ntime = \"1s\"\n[[step]]\nrun = \"hang\"\n"),
+        ("stress/later.toml", "about = \"later\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n"),
+    ]);
+    let id = "20261107-153012-0004";
+    let store = setting.dir.path().join("store");
+    let asker = store.clone();
+    // The hanging test goes first, as its last time was the longest.
+    let typical = HashMap::from([(("optiplex-1".to_string(), "stress/hang".to_string()), 100_000)]);
+    when_events_say(
+        store.clone(),
+        id,
+        "\"event\":\"test-started\",\"machine\":\"optiplex-1\",\"test\":\"stress/hang\"",
+        move || crate::store::request_stop(&asker, id).unwrap(),
+    );
+    let first = named(&setting, "optiplex-1");
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        pools: vec![optiplex(vec![&first])],
+        typical: typical.clone(),
+        image: "dukovo.img".into(),
+        build: Some("0.13.0 test".into()),
+        store: store.clone(),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        id: Some(id.into()),
+        ..Request::default()
+    };
+    run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let status = crate::status::status(&store, id).unwrap();
+    assert_eq!(status.counts.skipped, 3);
+
+    let resume =
+        crate::resume::plan(&store, id, Path::new("dukovo.img"), Some("0.13.0 test")).unwrap();
+    assert_eq!(resume.pools(), ["pool:optiplex"]);
+    assert!(resume.machines().is_empty(), "a pool's machine is not named on its own");
+    let names: Vec<String> = resume.tests().into_iter().map(String::from).collect();
+    assert_eq!(names, ["features/uname", "stress/hang", "stress/later"]);
+    let second = named(&setting, "optiplex-2");
+    let request = Request {
+        tests: crate::suite::select(&setting.tests, &names).unwrap(),
+        pools: vec![optiplex(vec![&first, &second])],
+        typical,
+        image: "dukovo.img".into(),
+        build: Some("0.13.0 test".into()),
+        store: store.clone(),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        resume: Some(resume),
+        id: Some("20261107-153013-0005".into()),
+        ..Request::default()
+    };
+    run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&store, "20261107-153013-0005");
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let mut ran: Vec<(&str, Outcome)> =
+        results.results.iter().map(|result| (result.test.as_str(), result.result)).collect();
+    ran.sort_unstable_by_key(|(test, _)| *test);
+    assert_eq!(
+        ran,
+        [
+            ("features/uname", Outcome::Pass),
+            ("stress/hang", Outcome::Fail),
+            ("stress/later", Outcome::Pass),
+        ]
+    );
+    let run: RunRecord =
+        serde_json::from_str(&fs::read_to_string(bundle.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run.resumes.as_deref(), Some(id));
+    assert_eq!(run.pools[0].members, ["optiplex-1", "optiplex-2"]);
 }

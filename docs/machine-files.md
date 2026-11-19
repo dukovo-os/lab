@@ -36,11 +36,45 @@ one for a real machine on a Shelly smart plug (see
 | --- | --- | --- |
 | `about` | yes | What the machine is, in one line. |
 | `driver` | yes | How the lab controls it: `qemu`; `amt` for a real machine with Intel AMT; or `plug` for a real machine with neither AMT nor a serial port, powered through a Shelly smart plug. |
+| `pool` | no | The pool the machine belongs to (below). |
+| `spare` | no | `true` keeps the machine out of a run on its pool (below). Needs `pool`. |
 | `ready` | no | The serial console line that says the machine has booted. Default `Boot complete.` |
 | `[controls]` | no | Who does each control (below). |
 | `[qemu]` | no | A QEMU machine's hardware (below). |
 | `[amt]` | for `amt` | How the lab reaches a real machine and boots it (below). |
 | `[plug]` | for `plug` | How the lab powers a real machine through a plug and boots it (below). |
+
+## Pools
+
+Machines with the same hardware and the same controls are interchangeable,
+such as three OptiPlex 7040s. A machine file puts its machine in a pool
+with `pool = "optiplex"` (a-z, 0-9 and `-`). `dukovo-lab machines` shows
+each machine's pool.
+
+A run on a machine by name runs every test on it. A run on a pool,
+`--machine pool:optiplex`, shares its tests out among the pool's machines:
+each test runs once, on whichever machine is free ([run](commands.md#run)
+says how).
+
+So that a test fits whichever machine takes it, every machine of a pool
+must have the same controls, and the same person or driver to do each. A
+pool whose machines differ is an error when the machine files are read,
+naming the machine and the control, such as `optiplex-2.toml: machine
+optiplex-2 is in the pool "optiplex" but its usb control is none, and
+optiplex-1's is person`. The machines' addresses, MACs, disks, serial
+ports and boot ports are their own, and are not compared.
+
+`spare = true` keeps a machine in the pool but out of a run on the pool:
+the others share the tests, and the spare is kept for reruns and bisects,
+which name it directly (`--machine optiplex-4`), and then it runs every
+test.
+
+```toml
+about = "Dell OptiPlex 7040 SFF, Core i5-6500, Intel AMT"
+driver = "amt"
+pool = "optiplex"
+spare = true
+```
 
 ## Controls
 

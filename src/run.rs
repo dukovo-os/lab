@@ -4,7 +4,13 @@
 //! Running tests: the picked tests on each picked machine, the machines
 //! side by side.
 //!
-//! Each machine gets a worker thread that runs the tests in order. A test
+//! Each machine gets a worker thread that runs the tests in order. A pool
+//! (`pool:<name>`, see machines.rs) is the exception: its machines are
+//! interchangeable, so they share one queue of the pool's tests, longest
+//! first, and each worker takes the next test when it is free. A test the
+//! pool's machines cannot run is skipped once for the pool, and a machine
+//! that is benched or will not start leaves the pool without stopping the
+//! others. A test
 //! with `fresh = true` gets a boot of its own; the others share the boot
 //! the last test left, which keeps a full run short. A boot is shared only
 //! after a test passed, because a failed test leaves the machine in a
@@ -23,7 +29,8 @@
 //! `dukovo-lab done` or presses Done on the runner page. A run can be
 //! stopped part way (see stop.rs); what it did not finish is skipped.
 
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -36,15 +43,15 @@ use crate::Error;
 use crate::bench::{self, Kit, Row};
 use crate::browser;
 use crate::bundle::{
-    Bundle, MachineRecord, Outcome, ResultRecord, RunOptions, RunRecord, SCHEMA, StepRecord,
-    Summary, new_run_id,
+    Bundle, MachineRecord, Outcome, PoolRecord, ResultRecord, RunOptions, RunRecord, SCHEMA,
+    StepRecord, Summary, new_run_id,
 };
 use crate::clock::Utc;
 use crate::driver::{ATTACKER_ON_SEGMENT, Driver, Setup, TARGET_ON_SEGMENT};
 use crate::findings;
 use crate::health;
 use crate::load;
-use crate::machines::{Control, Machine, Who};
+use crate::machines::{Control, Machine, Pool, Who};
 use crate::output::{Event, Reporter, short_note};
 use crate::peer::{self, Job, Ports, Readiness, SKIP_STATUS, Token};
 use crate::resume::Resume;
@@ -179,7 +186,13 @@ fn check_run(
 #[derive(Default)]
 pub struct Request<'a> {
     pub tests: Vec<&'a Test>,
+    /// The machines named on their own, each of which runs every test.
     pub machines: Vec<&'a Machine>,
+    /// The pools named, whose machines share the tests out.
+    pub pools: Vec<Pool<'a>>,
+    /// How long each test took last time on each machine, in milliseconds
+    /// by `(machine, test)`, which puts a pool's longest tests first.
+    pub typical: HashMap<(String, String), u64>,
     /// The image under test.
     pub image: PathBuf,
     /// The build's name for run.json, as `ob lab` gives it.
@@ -262,7 +275,13 @@ pub fn run(
     let id = request.id.clone().unwrap_or_else(|| new_run_id(started));
     // Before anything is written: a machine another run is using stops
     // this run here, with nothing left behind.
-    let names: Vec<&str> = request.machines.iter().map(|machine| machine.name.as_str()).collect();
+    let every: Vec<&Machine> = request
+        .machines
+        .iter()
+        .copied()
+        .chain(request.pools.iter().flat_map(|pool| pool.members.iter().copied()))
+        .collect();
+    let names: Vec<&str> = every.iter().map(|machine| machine.name.as_str()).collect();
     let running = Running::start(&request.store, &id, &names)?;
     let record = RunRecord {
         schema: SCHEMA,
@@ -272,13 +291,20 @@ pub fn run(
         ended: None,
         build: request.build.clone(),
         image: request.image.display().to_string(),
-        machines: request
-            .machines
+        machines: every
             .iter()
             .map(|machine| MachineRecord {
                 name: machine.name.clone(),
                 about: machine.about.clone(),
                 driver: format!("{:?}", machine.driver).to_lowercase(),
+            })
+            .collect(),
+        pools: request
+            .pools
+            .iter()
+            .map(|pool| PoolRecord {
+                name: pool.name.clone(),
+                members: pool.members.iter().map(|machine| machine.name.clone()).collect(),
             })
             .collect(),
         tests: request.tests.iter().map(|test| test.id.clone()).collect(),
@@ -305,7 +331,7 @@ pub fn run(
     reporter.report(&Event::RunStarted {
         id: &id,
         bundle: bundle.dir(),
-        machines: request.machines.iter().map(|machine| machine.name.as_str()).collect(),
+        machines: names.clone(),
         tests: request.tests.iter().map(|test| test.id.as_str()).collect(),
     });
 
@@ -332,6 +358,8 @@ pub fn run(
         stick: stick.as_deref(),
         dvd: dvd.as_deref(),
     };
+    let queues: Vec<Queue<'_>> =
+        request.pools.iter().map(|pool| Queue::new(pool, request, &shared)).collect();
     let results: Vec<ResultRecord> = std::thread::scope(|scope| {
         // Ends the watcher below however this ends, a worker's panic too,
         // or the scope would wait for it for ever.
@@ -346,22 +374,23 @@ pub fn run(
                 std::thread::sleep(Duration::from_millis(200));
             }
         });
-        let workers: Vec<_> = request
+        let setup = |index: usize, machine: &Machine| Setup {
+            image: image.clone(),
+            logs: bundle.logs(&machine.name),
+            work: work.join(&machine.name),
+            // By number, not name: socket paths must stay short.
+            sockets: sockets.join(index.to_string()),
+            key: request.key.clone(),
+            ob: request.ob.clone(),
+            stop: stop.clone(),
+        };
+        let shared = &shared;
+        let mut workers: Vec<_> = request
             .machines
             .iter()
             .enumerate()
             .map(|(index, &machine)| {
-                let setup = Setup {
-                    image: image.clone(),
-                    logs: bundle.logs(&machine.name),
-                    work: work.join(&machine.name),
-                    // By number, not name: socket paths must stay short.
-                    sockets: sockets.join(index.to_string()),
-                    key: request.key.clone(),
-                    ob: request.ob.clone(),
-                    stop: stop.clone(),
-                };
-                let shared = &shared;
+                let setup = setup(index, machine);
                 let tests: Vec<&Test> = request
                     .tests
                     .iter()
@@ -376,10 +405,24 @@ pub fn run(
                 scope.spawn(move || run_machine(machine, &tests, setup, shared, start))
             })
             .collect();
-        workers
+        let mut index = request.machines.len();
+        for (pool, queue) in request.pools.iter().zip(&queues) {
+            for &machine in &pool.members {
+                let setup = setup(index, machine);
+                index += 1;
+                workers.push(
+                    scope.spawn(move || run_pool_machine(machine, queue, setup, shared, start)),
+                );
+            }
+        }
+        let mut results: Vec<ResultRecord> = workers
             .into_iter()
             .flat_map(|worker| worker.join().expect("a machine's worker panicked"))
-            .collect()
+            .collect();
+        for queue in &queues {
+            results.extend(queue.finish(shared));
+        }
+        results
     });
     let _ = fs::remove_dir_all(&work);
     let _ = fs::remove_dir_all(&sockets);
@@ -457,6 +500,44 @@ fn socket_folder(id: &str) -> PathBuf {
     base.join("dukovo-lab").join(id)
 }
 
+/// Starts a machine's driver and makes its worker; the error says the
+/// machine did not start, as a result's reason does.
+fn start_worker<'a>(
+    machine: &'a Machine,
+    setup: Setup,
+    shared: &'a Shared<'a>,
+    start: &StartDriver,
+) -> Result<Worker<'a>, String> {
+    let has_key = setup.key.is_some();
+    let screen_file = setup.work.join("screen.ppm");
+    // The tests' folders on the lab PC go in the short socket folder, as
+    // servers run in them make sockets of their own.
+    let peer_folder = setup.sockets.join("peer");
+    let driver = start(machine, setup)
+        .map_err(|err| format!("the {} machine did not start: {err}", machine.name))?;
+    Ok(Worker::new(machine, driver, has_key, shared, screen_file, peer_folder))
+}
+
+/// Why `test` cannot run on `machine` however the run goes: the machine
+/// lacks a control it needs, a Needs you test is run without a person, or
+/// the lab PC has no program the test runs there.
+fn cannot_run(test: &Test, machine: &Machine, with_person: bool) -> Option<String> {
+    let skip = match test.fit(machine) {
+        Fit::NeedsPerson(_) if with_person => None,
+        fit => fit.skip_reason(),
+    };
+    // A lab PC without a server the test runs on it cannot do its side.
+    skip.or_else(|| {
+        let missing = peer::missing_programs(&test.host_needs);
+        (!missing.is_empty()).then(|| {
+            format!(
+                "the lab PC has no {}, which this test runs there: install it to run the test",
+                missing.join(", ")
+            )
+        })
+    })
+}
+
 /// Runs every test on one machine, in order.
 fn run_machine(
     machine: &Machine,
@@ -465,54 +546,28 @@ fn run_machine(
     shared: &Shared<'_>,
     start: &StartDriver,
 ) -> Vec<ResultRecord> {
-    let has_key = setup.key.is_some();
-    let screen_file = setup.work.join("screen.ppm");
-    // The tests' folders on the lab PC go in the short socket folder, as
-    // servers run in them make sockets of their own.
-    let peer_folder = setup.sockets.join("peer");
-    let (mut worker, broken) = match start(machine, setup) {
-        Ok(driver) => {
-            (Some(Worker::new(machine, driver, has_key, shared, screen_file, peer_folder)), None)
-        }
-        Err(err) => (None, Some(format!("the {} machine did not start: {err}", machine.name))),
+    let (mut worker, broken) = match start_worker(machine, setup, shared, start) {
+        Ok(worker) => (Some(worker), None),
+        Err(why) => (None, Some(why)),
     };
     let mut results = Vec::new();
     for &test in tests {
-        let skip = match test.fit(machine) {
-            _ if shared.stop.requested() => Some(STOPPED_BEFORE.to_string()),
-            Fit::NeedsPerson(_) if shared.with_person => None,
-            fit => fit.skip_reason(),
+        let skip = if shared.stop.requested() {
+            Some(STOPPED_BEFORE.to_string())
+        } else {
+            cannot_run(test, machine, shared.with_person)
         };
-        // A lab PC without a server the test runs on it cannot do its side.
-        let skip = skip.or_else(|| {
-            let missing = peer::missing_programs(&test.host_needs);
-            (!missing.is_empty()).then(|| {
-                format!(
-                    "the lab PC has no {}, which this test runs there: install it to run the test",
-                    missing.join(", ")
-                )
-            })
-        });
         // A benched machine is not given the rest of the run's tests.
         let skip = skip.or_else(|| worker.as_ref().and_then(|worker| worker.benched.clone()));
         let ran_here = skip.is_none() && worker.is_some();
         let result = match (skip, &mut worker) {
-            (Some(reason), _) => skipped(test, machine, reason),
+            (Some(reason), _) => skipped(test, &machine.name, reason),
             (None, Some(worker)) => worker.run_test(test),
             (None, None) => errored(test, machine, broken.clone().unwrap_or_default()),
         };
         // A test that ran reported its own end.
         if !ran_here {
-            shared.reporter.report(&Event::TestEnded {
-                machine: &machine.name,
-                test: &test.id,
-                result: result.result,
-                reason: result.reason.as_deref(),
-                milliseconds: 0,
-                boot: None,
-                log: None,
-                screenshots: &[],
-            });
+            report_unrun(shared, &result);
         }
         results.push(result);
     }
@@ -522,18 +577,158 @@ fn run_machine(
     results
 }
 
-fn skipped(test: &Test, machine: &Machine, reason: String) -> ResultRecord {
+/// Reports the end of a test that did not run, which has no worker to say
+/// so.
+fn report_unrun(shared: &Shared<'_>, result: &ResultRecord) {
+    shared.reporter.report(&Event::TestEnded {
+        machine: &result.machine,
+        test: &result.test,
+        result: result.result,
+        reason: result.reason.as_deref(),
+        milliseconds: 0,
+        boot: None,
+        log: None,
+        screenshots: &[],
+    });
+}
+
+/// A pool's tests, which its machines take from in turn.
+struct Queue<'a> {
+    /// The pool as results name it (`pool:<name>`), for a test no machine
+    /// of it ran.
+    label: String,
+    /// The tests no machine has taken yet, longest first.
+    tests: Mutex<VecDeque<&'a Test>>,
+    /// Why each machine left the pool, in the order they did.
+    out: Mutex<Vec<String>>,
+    /// The tests the pool's machines cannot run, skipped once for the
+    /// pool.
+    skipped: Vec<ResultRecord>,
+}
+
+impl<'a> Queue<'a> {
+    /// Sorts the tests the pool is to run: those it cannot run are skipped
+    /// here, once, and the rest are queued longest first by how long they
+    /// took last time on the pool's machines. A test with no earlier time
+    /// counts as its time limit, so it is started early rather than found
+    /// to be slow at the end. Every machine of a pool has the same
+    /// controls (see machines.rs), so the first one's fit stands for all.
+    fn new(pool: &Pool<'_>, request: &Request<'a>, shared: &Shared<'_>) -> Queue<'a> {
+        let label = pool.label();
+        let mut tests: Vec<&'a Test> = request
+            .tests
+            .iter()
+            .copied()
+            .filter(|test| {
+                let resume = request.resume.as_ref();
+                resume.is_none_or(|resume| resume.has_left_in_pool(&label, &test.id))
+            })
+            .collect();
+        let mut unrunnable = Vec::new();
+        tests.retain(|test| {
+            let Some(reason) = cannot_run(test, pool.members[0], shared.with_person) else {
+                return true;
+            };
+            let result = skipped(test, &label, reason);
+            report_unrun(shared, &result);
+            unrunnable.push(result);
+            false
+        });
+        let last = |test: &Test| {
+            pool.members
+                .iter()
+                .filter_map(|machine| request.typical.get(&(machine.name.clone(), test.id.clone())))
+                .max()
+                .map_or(test.time, |&milliseconds| Duration::from_millis(milliseconds))
+        };
+        tests.sort_by_key(|test| Reverse(last(test)));
+        Queue {
+            label,
+            tests: Mutex::new(tests.into()),
+            out: Mutex::new(Vec::new()),
+            skipped: unrunnable,
+        }
+    }
+
+    /// The next test for a machine that is free, if any is left.
+    fn next(&self) -> Option<&'a Test> {
+        self.tests.lock().unwrap_or_else(PoisonError::into_inner).pop_front()
+    }
+
+    /// Takes `machine` out of the pool for the rest of the run, and says
+    /// why. The others carry on with the queue.
+    fn leave(&self, machine: &Machine, reason: String, shared: &Shared<'_>) {
+        shared.reporter.report(&Event::MachineOut { machine: &machine.name, reason: &reason });
+        self.out.lock().unwrap_or_else(PoisonError::into_inner).push(reason);
+    }
+
+    /// The pool's results that no machine produced, once its machines are
+    /// done: the tests it cannot run, and what is left in the queue, which
+    /// only a stop or every machine being out leaves.
+    fn finish(&self, shared: &Shared<'_>) -> Vec<ResultRecord> {
+        let mut results = self.skipped.clone();
+        let left: Vec<&Test> =
+            self.tests.lock().unwrap_or_else(PoisonError::into_inner).drain(..).collect();
+        let out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
+        for test in left {
+            let reason = if shared.stop.requested() {
+                STOPPED_BEFORE.to_string()
+            } else {
+                format!(
+                    "no machine of {} was left to run this test: {}",
+                    self.label,
+                    out.join("; ")
+                )
+            };
+            let result = skipped(test, &self.label, reason);
+            report_unrun(shared, &result);
+            results.push(result);
+        }
+        results
+    }
+}
+
+/// Takes tests from a pool's queue on one of its machines until the queue
+/// is empty, the run is stopped, or the machine leaves the pool: it will
+/// not start, or its health check benches it.
+fn run_pool_machine(
+    machine: &Machine,
+    queue: &Queue<'_>,
+    setup: Setup,
+    shared: &Shared<'_>,
+    start: &StartDriver,
+) -> Vec<ResultRecord> {
+    let mut worker = match start_worker(machine, setup, shared, start) {
+        Ok(worker) => worker,
+        Err(why) => {
+            queue.leave(machine, why, shared);
+            return Vec::new();
+        }
+    };
+    let mut results = Vec::new();
+    while worker.benched.is_none() && !shared.stop.requested() {
+        let Some(test) = queue.next() else { break };
+        results.push(worker.run_test(test));
+    }
+    if let Some(why) = worker.benched.clone() {
+        queue.leave(machine, why, shared);
+    }
+    worker.driver.shut_off();
+    results
+}
+
+fn skipped(test: &Test, machine: &str, reason: String) -> ResultRecord {
     blank_result(test, machine, Outcome::Skip, reason)
 }
 
 fn errored(test: &Test, machine: &Machine, reason: String) -> ResultRecord {
-    blank_result(test, machine, Outcome::Error, reason)
+    blank_result(test, &machine.name, Outcome::Error, reason)
 }
 
-fn blank_result(test: &Test, machine: &Machine, result: Outcome, reason: String) -> ResultRecord {
+fn blank_result(test: &Test, machine: &str, result: Outcome, reason: String) -> ResultRecord {
     ResultRecord {
         test: test.id.clone(),
-        machine: machine.name.clone(),
+        machine: machine.to_string(),
         result,
         reason: Some(reason),
         milliseconds: 0,

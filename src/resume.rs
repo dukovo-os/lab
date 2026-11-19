@@ -20,7 +20,7 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use crate::Error;
-use crate::bundle::RunRecord;
+use crate::bundle::{PoolRecord, RunRecord};
 use crate::clock::Utc;
 use crate::run::{STOPPED_BEFORE, STOPPED_DURING};
 use crate::status::{self, DIED_DURING, State, TestStateKind};
@@ -44,13 +44,38 @@ impl Resume {
         self.left.contains(&(machine.to_string(), test.to_string()))
     }
 
-    /// The machines with a test left, in the order the run listed them.
+    /// Whether `test` is one the run left unfinished in the pool `label`
+    /// (`pool:<name>`): still queued for it, or begun or cut short on one
+    /// of the machines that shared its tests.
+    pub fn has_left_in_pool(&self, label: &str, test: &str) -> bool {
+        self.record.pools.iter().filter(|pool| pool.label() == label).any(|pool| {
+            self.has_left(label, test)
+                || pool.members.iter().any(|member| self.has_left(member, test))
+        })
+    }
+
+    /// The machines named on their own with a test left, in the order the
+    /// run listed them.
     pub fn machines(&self) -> Vec<&str> {
         self.record
             .machines
             .iter()
             .map(|machine| machine.name.as_str())
+            .filter(|name| {
+                !self.record.pools.iter().any(|pool| pool.members.iter().any(|m| m == name))
+            })
             .filter(|name| self.left.iter().any(|(machine, _)| machine == name))
+            .collect()
+    }
+
+    /// The pools with a test left, as `--machine` writes them.
+    pub fn pools(&self) -> Vec<String> {
+        let tests = self.tests();
+        self.record
+            .pools
+            .iter()
+            .filter(|pool| tests.iter().any(|test| self.has_left_in_pool(&pool.label(), test)))
+            .map(PoolRecord::label)
             .collect()
     }
 
@@ -179,6 +204,7 @@ mod tests {
                     driver: "qemu".into(),
                 })
                 .into(),
+            pools: Vec::new(),
             tests: ["boot/a", "boot/b", "boot/c"].map(String::from).into(),
             preset: None,
             schedule: None,

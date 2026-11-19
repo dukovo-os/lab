@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::clock::Utc;
-use crate::machines::is_plain_name;
+use crate::machines::{is_machine_ref, is_plain_name};
 use crate::zone::{self, Zone};
 use crate::{Arguments, Error, findings, send, store};
 
@@ -197,7 +197,7 @@ impl Schedule {
         if !self.tests.iter().all(plain_test) || !self.preset.as_deref().is_none_or(is_plain_name) {
             return Err(format!("schedule {}: not a test or preset name", self.name));
         }
-        if self.machines.is_empty() || !self.machines.iter().all(|name| is_plain_name(name)) {
+        if self.machines.is_empty() || !self.machines.iter().all(|name| is_machine_ref(name)) {
             return Err(format!("schedule {}: give the machines it runs on", self.name));
         }
         match (&self.at, self.each_build) {
@@ -765,10 +765,17 @@ fn run_once(
     let store = arguments.store_dir()?;
     let checkout = checkout(&store);
     let waited_from = Utc::now();
+    // A pool is waited for as its machines are, which a run on it holds.
+    let machines = arguments.load_machines()?;
+    let waits: Vec<String> = crate::machines::pick(&machines, &schedule.machines.join(","))?
+        .every()
+        .iter()
+        .map(|machine| machine.name.clone())
+        .collect();
     // `run` answers busy (4) if a machine was taken between the wait and
     // the run; then it waits again, a few times.
     for _ in 0..5 {
-        wait_for_machines(&store, schedule, waited_from, doing)?;
+        wait_for_machines(&store, &waits, waited_from, doing)?;
         // One scheduled run at a time takes the checkout.
         doing("waiting for another schedule to finish with the Dukovo checkout", None)?;
         let checkout_lock = wait_lock(&store.join("dukovo.lock"))?;
@@ -802,16 +809,15 @@ fn run_once(
     Err(Error::Busy("its machines stayed busy; it gave up for this time".into()))
 }
 
-/// Waits until none of the schedule's machines is busy with a run.
+/// Waits until none of `machines` is busy with a run.
 fn wait_for_machines(
     store: &Path,
-    schedule: &Schedule,
+    machines: &[String],
     since: Utc,
     doing: Doing<'_>,
 ) -> Result<(), Error> {
     loop {
-        let busy = schedule
-            .machines
+        let busy = machines
             .iter()
             .find_map(|machine| store::machine_user(store, machine).map(|run| (machine, run)));
         let Some((machine, run)) = busy else { return Ok(()) };
@@ -1228,7 +1234,7 @@ fn save(arguments: &Arguments, rest: &[String]) -> Result<Value, Error> {
         }
     }
     let machines = arguments.load_machines()?;
-    crate::machines::select(&machines, &schedule.machines.join(","))?;
+    crate::machines::pick(&machines, &schedule.machines.join(","))?;
     let config = arguments.config_dir()?;
     let store = arguments.store_dir()?;
     let new = edit_schedules(&config, |schedules| {

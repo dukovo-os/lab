@@ -28,7 +28,11 @@ wrong build.
 ## What is on it
 
 - **Machines.** Tick the machines to run on; each runs the same tests at
-  the same time. A machine busy with a run says so.
+  the same time. A machine busy with a run says so. The page lists
+  machines, not pools: a run on a pool (`--machine pool:optiplex`) shows
+  each of its machines with the tests it took, and its tests no machine has
+  taken yet as queued under `pool:optiplex`. A schedule that names a pool
+  keeps it when saved from the page.
 - **Tests,** by category. Tick tests, or a whole category, then Run; or
   use a test's own Run, or a category's Run all. Click a test's name for
   its steps, file, time limit, which machines it runs on and how long it

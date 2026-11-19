@@ -9,7 +9,7 @@ A schedule runs tests by itself, with the runner page closed. It runs
 at a time of day in the lab's zone (Mountain Time), on every day or on
 the days it names, or on each new build on Dukovo's main branch. It runs
 a preset, tests and categories, or every test, on one or more machines
-at once. When it ends, it sends its findings to lab-results, or holds
+at once, or on a pool of machines that share the tests out. When it ends, it sends its findings to lab-results, or holds
 them for you to send from the page.
 
 Make them on the runner page (Schedules, New schedule) or with
@@ -18,6 +18,7 @@ commands:
 ```sh
 dukovo-lab schedule save nightly --preset full --machine qemu,optiplex --at 01:00 --title "Full run"
 dukovo-lab schedule save drivers drivers --machine optiplex --at 02:00 --days sun --hold
+dukovo-lab schedule save rounds --preset full --machine qemu,pool:optiplex --at 18:00
 dukovo-lab schedule save quick --preset quick --each-build
 dukovo-lab schedule                  # each one: when it runs next, how it went last
 dukovo-lab schedule start nightly    # run it now, as its time would
@@ -28,8 +29,9 @@ In a Dukovo checkout, `./ob lab schedule ...` does the same.
 
 ## What a scheduled run does
 
-1. **Waits for its machines.** If a run is going on one of them, it
-   waits, for up to 12 hours, then starts.
+1. **Waits for its machines.** If a run is going on one of them, or on
+   a machine of a pool it names (a spare is not waited for, as the run
+   does not use it), it waits, for up to 12 hours, then starts.
 2. **Brings the lab's own Dukovo checkout up to main.** This is a
    checkout of its own, `dukovo` in the store
    (`~/.local/share/dukovo-lab/dukovo`), cloned on the first start. It is
@@ -121,7 +123,7 @@ commands and the page write it; it can be edited by hand too.
 | `name` | Its name in commands: lowercase letters, digits and dashes. |
 | `title` | What to call it on the page. Default: its preset's title. |
 | `tests`, `preset`, `all` | What it runs: tests and categories, a preset, or every test. One of them. |
-| `machines` | The machines it runs on, all at once. |
+| `machines` | The machines it runs on, all at once. A pool is written `pool:<name>`: its machines share the tests out, as in [run](commands.md#run), instead of each running every test. |
 | `at`, `days` | When: `HH:MM`, 24-hour, and the days (`mon` to `sun`; every day when left out). |
 | `each_build` | `true` to run on each new commit on main instead of at a time. |
 | `send` | `true` to send its findings when it ends, `false` to hold them. |

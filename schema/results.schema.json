@@ -23,7 +23,7 @@
         "additionalProperties": false,
         "properties": {
           "test": { "description": "<category>/<name>", "type": "string", "pattern": "^[a-z]+/[a-z0-9][a-z0-9-]*$" },
-          "machine": { "type": "string" },
+          "machine": { "description": "The machine that ran the test; a test a pool could not run, or had no machine left for, names the pool as pool:<name>.", "type": "string" },
           "result": { "$ref": "#/$defs/outcome" },
           "reason": { "description": "Why it failed, was skipped or broke.", "type": ["string", "null"] },
           "milliseconds": { "description": "How long it took, boot included.", "type": "integer", "minimum": 0 },

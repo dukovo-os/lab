@@ -87,6 +87,13 @@ pub enum Event<'a> {
         log: Option<&'a str>,
         screenshots: &'a [String],
     },
+    /// A machine of a pool left it for the rest of the run, because it
+    /// would not start or its health check benched it; the others carry on
+    /// with the pool's tests.
+    MachineOut {
+        machine: &'a str,
+        reason: &'a str,
+    },
     RunEnded {
         id: &'a str,
         bundle: &'a Path,
@@ -193,6 +200,7 @@ fn human(event: &Event<'_>) -> Option<String> {
                 None => format!("[{machine}] {test}: {word}{time}"),
             }
         }
+        Event::MachineOut { machine, reason } => format!("[{machine}] out of its pool: {reason}"),
         Event::RunEnded { id, bundle, summary, stopped, findings } => {
             let mut text = format!(
                 "Run {id} {}: {} passed, {} failed, {} skipped, {} errors\nBundle: {}",

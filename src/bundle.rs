@@ -45,7 +45,13 @@ pub struct RunRecord {
     pub build: Option<String>,
     /// The image file, as given.
     pub image: String,
+    /// Every machine that took part: those named, and the members of each
+    /// pool.
     pub machines: Vec<MachineRecord>,
+    /// The pools the run shared its tests out among, each with its members:
+    /// a test of a pool ran once, on one of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<PoolRecord>,
     /// The tests picked, by id, in the order they ran.
     pub tests: Vec<String>,
     /// The preset the tests came from, if they did.
@@ -96,6 +102,21 @@ pub struct MachineRecord {
     pub name: String,
     pub about: String,
     pub driver: String,
+}
+
+/// A pool in run.json.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PoolRecord {
+    pub name: String,
+    /// The machines that shared the pool's tests, which a spare is not.
+    pub members: Vec<String>,
+}
+
+impl PoolRecord {
+    /// How results, events and `--machine` name the pool.
+    pub fn label(&self) -> String {
+        format!("{}{}", crate::machines::POOL_PREFIX, self.name)
+    }
 }
 
 /// How many results came out each way.
@@ -268,6 +289,7 @@ mod tests {
             build: Some("0.13.0 fd2a9e8".into()),
             image: "out/lab/dukovo.img".into(),
             machines: vec![],
+            pools: Vec::new(),
             tests: vec!["boot/reaches-ready".into()],
             preset: None,
             schedule: None,
