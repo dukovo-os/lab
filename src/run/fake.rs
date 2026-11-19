@@ -58,6 +58,9 @@ struct FakeMachine {
     /// Whether it asks for its clock to be set after a fresh boot, as a
     /// real machine's driver does; the machine named `clocked` does.
     sets_clock: bool,
+    /// What the lab PC's loopback forward to the machine's ports listens
+    /// on, while the machine is up.
+    listeners: Vec<std::net::TcpListener>,
     /// The machine's name, which says how its health check answers: the
     /// machines named `checked...` have one. `checked` is healthy,
     /// `checked-once` has a full root on its first boot only, and
@@ -77,6 +80,12 @@ fn fake_font() -> Vec<u8> {
 }
 
 impl FakeMachine {
+    /// Whether the lab PC reaches it by an address, as a real machine on
+    /// the lab network: the machines named `addressed...`.
+    fn addressed(&self) -> bool {
+        self.name.starts_with("addressed")
+    }
+
     fn say(&self, line: &str) {
         let mut log = OpenOptions::new().create(true).append(true).open(&self.serial).unwrap();
         writeln!(log, "{line}").unwrap();
@@ -499,15 +508,42 @@ impl Driver for FakeMachine {
     }
 
     fn machine_address(&self) -> Option<String> {
-        Some("127.0.0.1".into())
+        Some(if self.addressed() { "10.77.0.2" } else { "127.0.0.1" }.into())
     }
 
-    /// The machine's port N is at the lab PC's 40000 + N.
+    /// The machine's port N is at the lab PC's 40000 + N; an addressed
+    /// machine's, as a real machine's on the lab network, at N.
     fn reach(&mut self, port: u16, udp: bool) -> Result<u16, String> {
+        if self.addressed() {
+            return Ok(port);
+        }
         if udp {
             return Err("this fake forwards no UDP".into());
         }
         port.checked_add(40000).ok_or_else(|| "this fake forwards only low ports".into())
+    }
+
+    /// An addressed machine forwards, as the real drivers do, with a
+    /// `sleep` that writes its pid and what it forwards. `addressed-refused`
+    /// cannot start one and `addressed-ends` has one that ends at once.
+    fn loopback_forward(&mut self, local_port: u16, port: u16) -> Result<Option<String>, String> {
+        if !self.addressed() {
+            return Ok(None);
+        }
+        if self.name == "addressed-refused" {
+            return Err("the lab has no key".into());
+        }
+        if self.name == "addressed-ends" {
+            return Ok(Some("echo Permission denied; exit 255".into()));
+        }
+        let listener = std::net::TcpListener::bind(("127.0.0.1", local_port))
+            .map_err(|err| err.to_string())?;
+        self.listeners.push(listener);
+        let pid = self.logs.join("forward.pid");
+        Ok(Some(format!(
+            "echo forward 127.0.0.1:{local_port} to {port}; echo $$ > {}; exec sleep 300",
+            pid.display()
+        )))
     }
 
     fn slowdown(&self) -> u32 {
@@ -573,6 +609,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         grows_root: machine.name.starts_with("grows") || machine.name.starts_with("checked"),
         grow_fails: machine.name == "grows-badly",
         sets_clock: machine.name == "clocked",
+        listeners: Vec::new(),
         name: machine.name.clone(),
     }))
 }
@@ -2577,4 +2614,96 @@ fn a_run_in_progress_shows_the_rerun_from_its_events() {
     fs::remove_file(done.bundle.join("results.json")).unwrap();
     let results = crate::status::results(&store, id).unwrap();
     assert!(results.results[0].flaky(), "{:?}", results.results[0]);
+}
+
+/// A browser kit whose Playwright opens nothing, to check the address the
+/// step gives its script.
+fn browser_kit(setting: &Setting) -> PathBuf {
+    setting.dir.write("kit/node_modules/playwright/index.js", FAKE_PLAYWRIGHT);
+    setting.dir.write("kit/node_modules/axe-core/package.json", "{ \"main\": \"axe.js\" }");
+    setting.dir.write("kit/node_modules/axe-core/axe.js", "");
+    setting.dir.path().join("kit")
+}
+
+/// Runs `setting`'s tests on `machine` with the browser kit, and gives the
+/// bundle and the results.
+fn run_browsers(setting: &Setting, machine: &Machine) -> (PathBuf, Vec<ResultRecord>) {
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![machine],
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        browsers: Some(browser_kit(setting)),
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
+    };
+    run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    (bundle, results.results)
+}
+
+/// A test with a host step and a browser step; the browser's script fails
+/// unless the page is at `url`, and whose host steps expect `host_step`.
+fn console_test(url: &str, host_step: &str) -> Setting {
+    let host = format!(
+        "[[step]]\nhost = \"echo {{machine}}:{{machine-port:9090}}\"\nexpect = \"{host_step}\"\n"
+    );
+    let test = format!(
+        "about = \"opens the console\"\ntime = \"1m\"\n{host}\
+         [[step]]\nbrowser = \"console.mjs\"\nport = 9090\n{host}"
+    );
+    let script = format!(
+        "export default async function check(t) {{\n\
+         if (!t.url.startsWith({url:?})) throw new Error(`url ${{t.url}}`);\n}}\n"
+    );
+    setting_with(&[("web/console.toml", &test), ("web/console.mjs", &script)])
+}
+
+#[test]
+fn a_machine_reached_by_an_address_is_opened_by_the_browser_through_a_forward_to_its_loopback() {
+    let setting = console_test("https://127.0.0.1:", "10.77.0.2:9090");
+    let (bundle, results) = run_browsers(&setting, &named(&setting, "addressed"));
+    let result = &results[0];
+    assert_eq!(result.result, Outcome::Pass, "{:?}", result.reason);
+    let log = fs::read_to_string(bundle.join(result.log.as_ref().unwrap())).unwrap();
+    // The host steps, before and after, kept the machine's address.
+    assert!(log.contains("lab-pc $ echo 10.77.0.2:9090"), "{log}");
+    assert!(!log.contains("browser opens the machine by its address"), "{log}");
+    let forward =
+        fs::read_to_string(bundle.join("logs/addressed/web-console-forward-9090.log")).unwrap();
+    assert!(forward.starts_with("forward 127.0.0.1:"), "{forward}");
+    assert!(forward.ends_with(" to 9090\n"), "{forward}");
+    // The forward ended with the test.
+    assert!(log.contains("ended at the test's end"), "{log}");
+    let pid = fs::read_to_string(bundle.join("logs/addressed/forward.pid")).unwrap();
+    assert!(!Path::new("/proc").join(pid.trim()).exists(), "the forward's process {pid} lives");
+}
+
+#[test]
+fn a_qemu_machine_s_browser_needs_no_forward() {
+    // Its ports are already on the lab PC's loopback, as the host steps show.
+    let setting = console_test("https://127.0.0.1:49090", "127.0.0.1:49090");
+    let (bundle, results) = run_browsers(&setting, &setting.qemu);
+    assert_eq!(results[0].result, Outcome::Pass, "{:?}", results[0].reason);
+    assert!(!bundle.join("logs/qemu/web-console-forward-9090.log").exists());
+}
+
+#[test]
+fn a_browser_falls_back_to_the_machine_s_address_when_its_forward_will_not_start() {
+    for (machine, why) in [
+        ("addressed-refused", "the lab has no key"),
+        ("addressed-ends", "ended (status 255) at once"),
+    ] {
+        let setting = console_test("https://10.77.0.2:9090", "10.77.0.2:9090");
+        let (bundle, results) = run_browsers(&setting, &named(&setting, machine));
+        let result = &results[0];
+        assert_eq!(result.result, Outcome::Pass, "{machine}: {:?}", result.reason);
+        let log = fs::read_to_string(bundle.join(result.log.as_ref().unwrap())).unwrap();
+        assert!(log.contains("The browser opens the machine by its address"), "{machine}: {log}");
+        assert!(log.contains(why), "{machine}: {log}");
+    }
 }

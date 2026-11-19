@@ -461,7 +461,15 @@ export default async function check(t) {
 
 The page is at `https://{machine}:{machine-port:PORT}`, filled in as a
 `host` step's placeholders are, so under QEMU the port is forwarded for
-the rest of the boot. `page` is a Playwright
+the rest of the boot. On a real machine the browser is given
+`https://127.0.0.1:FREE` instead, an SSH forward on the lab PC's
+loopback to the machine's own `PORT` for the rest of the test, so the
+machine sees the page opened as `localhost`, as under QEMU (see
+real-machines.md, "Browsers open the machine by `localhost`"). Only the
+browser's page changes: `{machine}` and `{machine-port:N}` in `host` and
+`run` steps stay the machine's address. When the forward does not start,
+the browser is given the machine's address and the test's log says why.
+`page` is a Playwright
 [Page](https://playwright.dev/docs/api/class-page): the script finds
 elements by their role and name, as a person using a screen reader does,
 and acts on them with Playwright's own calls.

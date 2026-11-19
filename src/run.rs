@@ -104,6 +104,9 @@ pub const NO_KIT: &str = "this step holds Dukovo to Linux, and the run was given
 /// Why a step that reads the screen's text is skipped.
 pub const NO_FONTS: &str = "this step reads the screen, and the run was given no console fonts: `ob lab` passes Dukovo's with --fonts";
 
+/// How long a browser step waits for its forward to listen.
+const FORWARD_WAIT: Duration = Duration::from_secs(15);
+
 /// Why a `browser` step is skipped.
 pub const NO_BROWSERS: &str = "this step drives a browser, and the run was given no browser kit: `ob lab` makes one and passes it with --browsers";
 
@@ -978,8 +981,12 @@ struct PeerSide {
     work: Option<PathBuf>,
     /// The test file's folder (`{here}`).
     here: PathBuf,
-    /// Servers started by `background` steps.
+    /// Servers started by `background` steps, and the forwards browser
+    /// steps open pages through.
     jobs: Vec<Job>,
+    /// The lab PC's loopback port forwarded to each machine port a browser
+    /// step opened.
+    forwards: BTreeMap<u16, u16>,
     /// Whether a host step ran as root, and so may have left root's files
     /// in the test's folder.
     rooted: bool,
@@ -1776,7 +1783,7 @@ impl<'a> Worker<'a> {
             fs::create_dir_all(folder)
                 .map_err(|err| StepFailure::Error(format!("making {}: {err}", folder.display())))?;
         }
-        let url = self.fill(&format!("https://{{machine}}:{{machine-port:{}}}", browser.port))?;
+        let url = self.browser_url(test, browser.port, deadline)?;
         let (kit, script) = (absolute(kit), self.peer.here.join(&browser.script));
         let (absolute_shots, absolute_logs) = (absolute(&shots), absolute(&logs));
         let runner = browser::Runner {
@@ -1808,6 +1815,76 @@ impl<'a> Worker<'a> {
             browser::Verdict::Skipped(reason) => Err(StepFailure::Skip(reason)),
             browser::Verdict::Failed(why) => Err(StepFailure::Fail(format!("{why}\n{shown}"))),
         }
+    }
+
+    /// The page address a browser opens for the machine's `port`. A machine
+    /// the lab PC reaches by an address is opened through a forward on the
+    /// lab PC's loopback, so that the machine's own name for itself,
+    /// `localhost`, is the page's. Without the forward the browser is given
+    /// the machine's address, and the test's log says why.
+    fn browser_url(
+        &mut self,
+        test: &Test,
+        port: u16,
+        deadline: Instant,
+    ) -> Result<String, StepFailure> {
+        let folder = self.peer_work()?;
+        match self.forward_for_browser(test, port, &folder, deadline) {
+            Ok(Some(local)) => return Ok(format!("https://127.0.0.1:{local}")),
+            Ok(None) => {}
+            Err(why) => self.log.push(format!(
+                "The browser opens the machine by its address, not through a forward to its \
+                 loopback: {why}"
+            )),
+        }
+        self.fill(&format!("https://{{machine}}:{{machine-port:{port}}}"))
+    }
+
+    /// The lab PC's loopback port forwarded to the machine's `port`, started
+    /// the first time a browser step needs it and ended with the test's other
+    /// lab PC processes. None when the driver needs no forward.
+    fn forward_for_browser(
+        &mut self,
+        test: &Test,
+        port: u16,
+        folder: &Path,
+        deadline: Instant,
+    ) -> Result<Option<u16>, String> {
+        if let Some(&local) = self.peer.forwards.get(&port) {
+            return Ok(Some(local));
+        }
+        let local = peer::free_port()?;
+        let Some(command) = self.driver.loopback_forward(local, port)? else { return Ok(None) };
+        let logs = self.shared.bundle.logs(&self.folder);
+        fs::create_dir_all(&logs).map_err(|err| format!("making {}: {err}", logs.display()))?;
+        let log = logs.join(format!("{}-forward-{port}.log", test.id.replace('/', "-")));
+        self.peer.jobs.push(Job::start(&command, &[], folder, &log)?);
+        let job = self.peer.jobs.last_mut().expect("pushed above");
+        let until = deadline.min(Instant::now() + FORWARD_WAIT);
+        let readiness = job.wait_for_port(local, until, self.shared.stop);
+        let tail = job.tail();
+        let shown = self.shared.bundle.relative(&log);
+        let why = match readiness {
+            Readiness::Ready => {
+                self.peer.forwards.insert(port, local);
+                return Ok(Some(local));
+            }
+            Readiness::Exited(status) => {
+                let status = status.map_or("a signal".to_string(), |s| format!("status {s}"));
+                format!("the ssh forward ended ({status}) at once; the end of {shown}:\n{tail}")
+            }
+            Readiness::TimedOut => {
+                format!(
+                    "the ssh forward was not listening after {}s; {shown}:\n{tail}",
+                    FORWARD_WAIT.as_secs()
+                )
+            }
+            Readiness::Stopped => STOPPED_DURING.to_string(),
+        };
+        if let Some(mut job) = self.peer.jobs.pop() {
+            job.end();
+        }
+        Err(why)
     }
 
     /// Runs the runner for `engine` as a host step runs its command, and
@@ -1980,6 +2057,7 @@ impl<'a> Worker<'a> {
                 .push(format!("Lab PC server `{}`: {ended}; its output is in {log}", job.command));
         }
         self.peer.ports = Ports::default();
+        self.peer.forwards.clear();
         if let Some(work) = self.peer.work.take()
             && fs::remove_dir_all(&work).is_err()
             && self.peer.rooted

@@ -755,6 +755,11 @@ impl Driver for AmtDriver {
         Ok(port)
     }
 
+    fn loopback_forward(&mut self, local_port: u16, port: u16) -> Result<Option<String>, String> {
+        let target = ssh_target(&self.setup, &self.settings.machine_address, self.boot)?;
+        Ok(Some(target.forward_command(local_port, port)))
+    }
+
     fn slowdown(&self) -> u32 {
         1
     }

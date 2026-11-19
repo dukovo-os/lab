@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write as _;
-use std::net::{TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::ops::Range;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
@@ -300,6 +300,11 @@ fn shell(command: &str, root: &[String], folder: &Path) -> Command {
     shell
 }
 
+/// `word` as one word of an `sh` command line.
+pub fn quoted(word: impl std::fmt::Display) -> String {
+    format!("'{}'", word.to_string().replace('\'', "'\\''"))
+}
+
 /// Sends `signal` to every process of the group `group` leads. Errors are
 /// left: the group may have ended already, or hold root's processes the
 /// lab may not signal.
@@ -402,6 +407,27 @@ impl Job {
             // Read before asking whether it ended, so a server that says
             // it is ready and then ends at once is still found ready.
             if fs::read(&self.log).is_ok_and(|log| String::from_utf8_lossy(&log).contains(text)) {
+                return Readiness::Ready;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Readiness::Exited(status.code());
+            }
+            if stop.requested() {
+                return Readiness::Stopped;
+            }
+            if Instant::now() >= deadline {
+                return Readiness::TimedOut;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits until something accepts connections on the lab PC's loopback
+    /// `port`, as a forward does once it is bound.
+    pub fn wait_for_port(&mut self, port: u16, deadline: Instant, stop: &Stop) -> Readiness {
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        loop {
+            if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
                 return Readiness::Ready;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
