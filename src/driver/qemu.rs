@@ -67,10 +67,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::{Driver, Setup};
+use super::{ATTACKER_ON_SEGMENT, Driver, SEGMENT_PREFIX_LENGTH, Setup};
 use crate::bench::Kit;
 use crate::machines::{Control, DiskBus, Firmware, Kvm, QemuSettings};
 use crate::qmp::Qmp;
+use crate::redteam::RedteamKit;
 use crate::screen::Image;
 use crate::ssh;
 use crate::suite::{BlankDisc, Button, Floppy, PowerAction, Reader, Stick};
@@ -206,6 +207,9 @@ pub struct Qemu {
     /// Whether the next fresh boot gives the machine a second network port
     /// on a private network for an attacker, set by [`Driver::want_attacker`].
     want_attacker: bool,
+    /// Whether that attacker boots from the red-team kit, set by
+    /// [`Driver::want_linux_attacker`].
+    linux_attacker: bool,
     /// The port the machine's private-network port listens on this boot,
     /// which the attacker connects to; set only on an armed boot.
     segment_port: u16,
@@ -386,6 +390,7 @@ impl Qemu {
             boot_stick: None,
             boot_disc: None,
             want_attacker: false,
+            linux_attacker: false,
             segment_port: 0,
             attacker: None,
             forwards: BTreeMap::new(),
@@ -920,12 +925,39 @@ impl Qemu {
         self.setup.sockets.join("attacker-qmp.sock")
     }
 
+    /// Makes the attacker's own disk over the image under test, which the
+    /// Dukovo guest boots from.
+    fn make_attacker_disk(&self) -> Result<(), String> {
+        let image = fs::canonicalize(&self.setup.image)
+            .map_err(|err| format!("the image {}: {err}", self.setup.image.display()))?;
+        let format =
+            if image.extension().is_some_and(|ext| ext == "qcow2") { "qcow2" } else { "raw" };
+        Self::qemu_img(
+            &[
+                "-f",
+                "qcow2",
+                "-F",
+                format,
+                "-b",
+                &image.to_string_lossy(),
+                &self.attacker_disk().to_string_lossy(),
+            ],
+            "the attacker's disk",
+        )
+    }
+
     /// The attacker's QEMU arguments: like the machine under test, but
     /// with no firmware, pointer or stick of its own, its own forwarded
     /// SSH port, and its private-network port connecting to the machine's.
-    fn attacker_arguments(&self, ssh_port: u16) -> Vec<String> {
+    ///
+    /// With `kit` (the red-team kit and the lab's public key line) it boots
+    /// that kernel and initramfs directly instead of a disk.
+    fn attacker_arguments(&self, ssh_port: u16, kit: Option<(&RedteamKit, &str)>) -> Vec<String> {
         let (accel, cpu) = if self.kvm { ("kvm", "host") } else { ("tcg", "max") };
-        vec![
+        let memory = kit
+            .and_then(|(kit, _)| kit.memory.clone())
+            .unwrap_or_else(|| self.settings.memory.clone());
+        let mut arguments: Vec<String> = vec![
             "-M".into(),
             "q35".into(),
             "-accel".into(),
@@ -935,7 +967,7 @@ impl Qemu {
             "-smp".into(),
             self.settings.cpus.to_string(),
             "-m".into(),
-            self.settings.memory.clone(),
+            memory,
             "-display".into(),
             "none".into(),
             "-monitor".into(),
@@ -946,17 +978,36 @@ impl Qemu {
             "chardev:serial0".into(),
             "-qmp".into(),
             format!("unix:{},server=on,wait=off", option_value(&self.attacker_qmp_socket())),
-            "-drive".into(),
-            format!("if=none,id=disk,format=qcow2,file={}", option_value(&self.attacker_disk())),
-            "-device".into(),
-            format!(
-                "{},drive=disk,bootindex=0",
-                match self.settings.disk {
-                    DiskBus::Sata => "ide-hd",
-                    DiskBus::Nvme => "nvme",
-                    DiskBus::Virtio => "virtio-blk-pci",
-                }
-            ),
+        ];
+        if let Some((kit, public_key)) = kit {
+            let address = format!("{ATTACKER_ON_SEGMENT}/{SEGMENT_PREFIX_LENGTH}");
+            arguments.extend([
+                "-kernel".into(),
+                kit.kernel.display().to_string(),
+                "-initrd".into(),
+                kit.initrd.display().to_string(),
+                "-append".into(),
+                kit.boot_line(public_key, &address),
+            ]);
+        } else {
+            arguments.extend([
+                "-drive".into(),
+                format!(
+                    "if=none,id=disk,format=qcow2,file={}",
+                    option_value(&self.attacker_disk())
+                ),
+                "-device".into(),
+                format!(
+                    "{},drive=disk,bootindex=0",
+                    match self.settings.disk {
+                        DiskBus::Sata => "ide-hd",
+                        DiskBus::Nvme => "nvme",
+                        DiskBus::Virtio => "virtio-blk-pci",
+                    }
+                ),
+            ]);
+        }
+        arguments.extend([
             // Its own way in, over user networking as the machine's is,
             // and no way out: `restrict=on` keeps the forward that lets the
             // lab in over SSH and drops every connection the attacker
@@ -972,14 +1023,21 @@ impl Qemu {
             format!("socket,id={SEGMENT},connect=127.0.0.1:{}", self.segment_port),
             "-device".into(),
             format!("{},netdev={SEGMENT},mac={ATTACKER_MAC}", self.settings.nic),
-        ]
+        ]);
+        arguments
     }
 
-    /// How SSH reaches the attacker on `ssh_port`.
+    /// How SSH reaches the attacker on `ssh_port`: as the lab account on
+    /// the Dukovo guest, as the kit's user on the red-team kit's Linux.
     fn attacker_target(&self, ssh_port: u16, key: PathBuf) -> ssh::Target {
+        let user = match &self.setup.redteam {
+            Some(kit) if self.linux_attacker => kit.user.clone(),
+            _ => ssh::LAB_ACCOUNT.into(),
+        };
         ssh::Target {
             host: "127.0.0.1".into(),
             port: ssh_port,
+            user,
             key,
             known_hosts: self.setup.work.join(format!("attacker-known_hosts-{}", self.boot)),
             scratch: self.setup.work.join("attacker-ssh-output"),
@@ -1581,6 +1639,7 @@ impl Driver for Qemu {
         let target = ssh::Target {
             host: "127.0.0.1".into(),
             port: self.ssh_port,
+            user: ssh::LAB_ACCOUNT.into(),
             key,
             known_hosts: self.setup.work.join(format!("known_hosts-{}", self.boot)),
             scratch: self.setup.work.join("ssh-output"),
@@ -1590,6 +1649,10 @@ impl Driver for Qemu {
 
     fn want_attacker(&mut self, yes: bool) {
         self.want_attacker = yes;
+    }
+
+    fn want_linux_attacker(&mut self, yes: bool) {
+        self.linux_attacker = yes;
     }
 
     fn start_attacker(&mut self, deadline: Instant) -> Result<(), String> {
@@ -1606,29 +1669,25 @@ impl Driver for Qemu {
             .key
             .clone()
             .ok_or("the lab has no key: run `dukovo-lab key`, then build the image again")?;
-        // A disk of the attacker's own over the same image.
-        let image = fs::canonicalize(&self.setup.image)
-            .map_err(|err| format!("the image {}: {err}", self.setup.image.display()))?;
-        let format =
-            if image.extension().is_some_and(|ext| ext == "qcow2") { "qcow2" } else { "raw" };
-        Self::qemu_img(
-            &[
-                "-f",
-                "qcow2",
-                "-F",
-                format,
-                "-b",
-                &image.to_string_lossy(),
-                &self.attacker_disk().to_string_lossy(),
-            ],
-            "the attacker's disk",
-        )?;
+        let kit = if self.linux_attacker {
+            let kit = self.setup.redteam.clone().ok_or(
+                "this test attacks from Linux, and the run was given no red-team kit: pass one with --redteam",
+            )?;
+            let path = ssh::public_key_path(&key);
+            let public_key = fs::read_to_string(&path)
+                .map_err(|err| format!("reading the lab's public key {}: {err}", path.display()))?;
+            Some((kit, public_key))
+        } else {
+            self.make_attacker_disk()?;
+            None
+        };
         File::create(self.attacker_serial())
             .map_err(|err| format!("making {}: {err}", self.attacker_serial().display()))?;
         let socket = self.attacker_qmp_socket();
         let _ = fs::remove_file(&socket);
         let ssh_port = free_port()?;
-        let arguments = self.attacker_arguments(ssh_port);
+        let arguments =
+            self.attacker_arguments(ssh_port, kit.as_ref().map(|(kit, key)| (kit, key.as_str())));
         let mut log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1656,6 +1715,7 @@ impl Driver for Qemu {
         self.attacker = Some(Attacker { running: Running { child, qmp, music: None }, ssh_port });
         // Wait until the attacker answers SSH, so commands can run on it.
         let target = self.attacker_target(ssh_port, key);
+        let ready = kit.and_then(|(kit, _)| kit.ready);
         loop {
             if self.setup.stop.requested() {
                 return Err("the run was stopped before the attacker was ready".into());
@@ -1665,6 +1725,14 @@ impl Driver for Qemu {
                     "the attacker did not answer SSH in time; its console is in {}",
                     self.attacker_serial().display()
                 ));
+            }
+            // The kit says when its SSH server is up, which saves the
+            // attempts that a booting kernel refuses.
+            if let Some(line) = &ready
+                && !crate::serial::read_log(&self.attacker_serial()).contains(line.as_str())
+            {
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
             }
             let soon = (Instant::now() + Duration::from_secs(5)).min(deadline);
             if let Ok(output) = target.run("true", None, soon, &self.setup.stop, None)
@@ -1842,6 +1910,7 @@ mod tests {
             work: dir.path().join("work"),
             sockets: dir.path().join("s"),
             key: None,
+            redteam: None,
             ob: None,
             stop: crate::stop::Stop::default(),
         };
@@ -2132,6 +2201,57 @@ mod tests {
         assert!(!qemu.is_on());
         let log = fs::read_to_string(dir.path().join("logs/qemu-1.log")).unwrap();
         assert!(log.starts_with("Starting: qemu-system-x86_64 -M q35"), "{log}");
+    }
+
+    #[test]
+    fn the_kit_attacker_boots_the_kit_on_the_restricted_private_network() {
+        if !wanted() {
+            return;
+        }
+        let dir = TempDir::new("qemu-redteam");
+        let mut qemu = start(&dir, Firmware::Bios);
+        qemu.segment_port = 41234;
+        let kit_dir = dir.path().join("kit");
+        dir.write("kit/vmlinuz", "");
+        dir.write("kit/rootfs.cpio", "");
+        dir.write(
+            "kit/kit.toml",
+            "kernel = \"vmlinuz\"\ninitrd = \"rootfs.cpio\"\ncmdline = \"console=ttyS0\"\n",
+        );
+        let kit = RedteamKit::read(&kit_dir).unwrap();
+        let after = |words: &[String], flag: &str| {
+            let at = words.iter().position(|word| word == flag).unwrap();
+            words[at + 1].clone()
+        };
+
+        let words = qemu.attacker_arguments(40022, Some((&kit, "ssh-ed25519 AAAA lab\n")));
+        assert_eq!(after(&words, "-kernel"), kit_dir.join("vmlinuz").display().to_string());
+        assert_eq!(after(&words, "-initrd"), kit_dir.join("rootfs.cpio").display().to_string());
+        let append = after(&words, "-append");
+        assert!(append.starts_with("console=ttyS0 lab.key="), "{append}");
+        assert!(append.ends_with(" lab.addr=10.9.9.2/24"), "{append}");
+        assert!(!words.contains(&"-drive".to_string()), "{words:?}");
+        let user = words.iter().find(|word| word.starts_with("user,")).unwrap();
+        assert_eq!(user, "user,id=lab0,restrict=on,hostfwd=tcp:127.0.0.1:40022-:22");
+        let segment = words.iter().find(|word| word.starts_with("socket,")).unwrap();
+        assert_eq!(segment, "socket,id=seg0,connect=127.0.0.1:41234");
+        assert!(words.iter().any(|word| word.ends_with("netdev=seg0,mac=52:54:00:4c:a1:02")));
+        assert!(
+            words.iter().any(|word| word.starts_with("file,id=serial0,path=")
+                && word.contains("attacker-serial-"))
+        );
+
+        // Without a kit the attacker is the Dukovo guest, from a disk.
+        let words = qemu.attacker_arguments(40022, None);
+        assert!(words.contains(&"-drive".to_string()), "{words:?}");
+        assert!(!words.contains(&"-kernel".to_string()), "{words:?}");
+        assert!(words.iter().any(|word| word.contains("restrict=on")));
+        assert_eq!(after(&words, "-m"), "256M");
+
+        // A kit that unpacks to more than that asks for its own.
+        let big = RedteamKit { memory: Some("3G".into()), ..kit };
+        let words = qemu.attacker_arguments(40022, Some((&big, "ssh-ed25519 AAAA lab\n")));
+        assert_eq!(after(&words, "-m"), "3G");
     }
 
     #[test]

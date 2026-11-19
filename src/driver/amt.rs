@@ -911,6 +911,7 @@ mod tests {
             work: dir.path().join("work"),
             sockets: dir.path().join("sockets"),
             key: None,
+            redteam: None,
             ob: None,
             stop: Stop::default(),
         };

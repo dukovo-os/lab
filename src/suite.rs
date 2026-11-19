@@ -171,6 +171,18 @@ pub struct Test {
     /// How long its `run` and `serial` steps may be silent, when the test
     /// says; [`STALL_TIME`] otherwise.
     pub stall: Option<Stall>,
+    /// Which machine its `attack` steps run on.
+    pub attacker: AttackerKind,
+}
+
+/// The machine a test's `attack` steps run on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttackerKind {
+    /// A second Dukovo guest, with Dukovo's own tools: the default.
+    Image,
+    /// Linux from the run's red-team kit, for the tools only Linux has
+    /// (`attacker = "linux"`).
+    Linux,
 }
 
 /// The card reader a test's memory cards go in.
@@ -532,6 +544,25 @@ pub struct Command {
     /// How long a `run` step's command and the console may both stay
     /// silent, when the step says.
     pub stall: Option<Stall>,
+    /// The name its trimmed output is kept under for later steps'
+    /// `{saved:NAME}`, once the step passes.
+    pub save: Option<String>,
+}
+
+/// What a later step's command holds in place of `{saved:NAME}`: the
+/// output an earlier step kept with `save = "NAME"`.
+pub const SAVED_PREFIX: &str = "{saved:";
+
+/// The names `{saved:NAME}` placeholders in `text` ask for.
+pub fn saved_names(text: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    for (start, _) in text.match_indices(SAVED_PREFIX) {
+        let from = start + SAVED_PREFIX.len();
+        if let Some(length) = text[from..].find('}') {
+            names.push(&text[from..from + length]);
+        }
+    }
+    names
 }
 
 /// What a `power` step does.
@@ -882,6 +913,7 @@ struct TestFile {
     #[serde(default)]
     hardware: Vec<String>,
     stall: Option<String>,
+    attacker: Option<String>,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
@@ -941,6 +973,7 @@ struct StepFile {
     screen: Option<OneOrMore>,
     screen_gone: Option<String>,
     or_skip: Option<String>,
+    save: Option<String>,
     #[serde(rename = "type")]
     typed: Option<String>,
     point: Option<Vec<i32>>,
@@ -1119,6 +1152,13 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         },
     };
     let stall = file.stall.as_deref().map(parse_stall).transpose().map_err(bad)?;
+    let attacker = match file.attacker.as_deref() {
+        None | Some("image") => AttackerKind::Image,
+        Some("linux") => AttackerKind::Linux,
+        Some(other) => {
+            return Err(bad(format!("attacker = \"{other}\": \"image\" or \"linux\"")));
+        }
+    };
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut steps = Vec::new();
     for (index, step) in file.steps.into_iter().enumerate() {
@@ -1126,6 +1166,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             parse_step(step, folder).map_err(|err| bad(format!("step {}: {err}", index + 1)))?;
         steps.push(step);
     }
+    check_saved(&steps).map_err(bad)?;
     // A card, disc or floppy disk is put back only once one was taken
     // out. A test's cards all go in one reader, the one its boot has.
     let (mut card_out, mut disc_out, mut floppy_out) = (false, false, false);
@@ -1196,6 +1237,10 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
     if agent_named && !hardware.contains(&Control::GuestAgent) {
         return Err(bad("{guest-agent} needs hardware = [\"guest-agent\"]".into()));
     }
+    if attacker == AttackerKind::Linux && !steps.iter().any(|step| matches!(step, Step::Attack(_)))
+    {
+        return Err(bad("attacker = \"linux\" goes with a test that has an attack step".into()));
+    }
     Ok(Test {
         id: format!("{category}/{name}"),
         category: category.into(),
@@ -1209,7 +1254,34 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         cf,
         hardware,
         stall,
+        attacker,
     })
+}
+
+/// Fails when a step's `{saved:NAME}` names output no earlier step kept.
+fn check_saved(steps: &[Step]) -> Result<(), String> {
+    let mut kept: Vec<&str> = Vec::new();
+    for (index, step) in steps.iter().enumerate() {
+        let (Step::Run(command) | Step::Attack(command) | Step::Host(command)) = step else {
+            continue;
+        };
+        let texts = std::iter::once(&command.command)
+            .chain(&command.input)
+            .chain(&command.expect)
+            .chain(&command.expect_not);
+        for name in texts.flat_map(|text| saved_names(text)) {
+            if !kept.contains(&name) {
+                return Err(format!(
+                    "step {}: {{saved:{name}}} names no output an earlier step kept with save = \"{name}\"",
+                    index + 1
+                ));
+            }
+        }
+        if let Some(name) = &command.save {
+            kept.push(name);
+        }
+    }
+    Ok(())
 }
 
 /// Reads a `stall` setting: `"off"`, or a length of time.
@@ -1288,6 +1360,16 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     checks("expect", step.expect.is_some())?;
     checks("expect_not", step.expect_not.is_some())?;
     only_with("or_skip", step.or_skip.is_some(), "run")?;
+    if let Some(name) = &step.save {
+        if !matches!(given[0], "run" | "attack" | "host") || background {
+            return Err("save goes only with a run, attack or host step that ends".into());
+        }
+        if !crate::machines::is_plain_name(name) {
+            return Err(format!(
+                "save = \"{name}\": a name is a-z, 0-9 and -, as save = \"token\""
+            ));
+        }
+    }
     if step.or_skip.as_deref().is_some_and(|reason| reason.trim().is_empty()) {
         return Err(
             "or_skip needs the reason the test is skipped, such as \"needs an Azure machine\""
@@ -1340,6 +1422,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         input: step.input.clone(),
         or_skip: step.or_skip.clone(),
         stall,
+        save: step.save.clone(),
     };
     if let Some(text) = step.run.clone() {
         if text.trim().is_empty() {
@@ -1924,6 +2007,7 @@ expect = "1 received"
                 input: None,
                 or_skip: None,
                 stall: None,
+                save: None,
             })
         );
         let controls: Vec<Control> = test.controls().into_iter().collect();
@@ -2528,6 +2612,7 @@ expect = "1 received"
                 input: None,
                 or_skip: None,
                 stall: None,
+                save: None,
             })
         );
         assert_eq!(
@@ -2547,6 +2632,61 @@ expect = "1 received"
         dir.write("security/scan.toml", "about = \"x\"\ntime = \"1m\"\n[[step]]\nattack = \"\"\n");
         let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
         assert!(why.contains("attack needs a command"), "{why}");
+    }
+
+    #[test]
+    fn a_step_may_save_its_output_for_later_steps_to_name() {
+        let dir = TempDir::new("suite-save");
+        let write = |steps: &str| {
+            dir.write("web/save.toml", &format!("about = \"x\"\ntime = \"1m\"\n{steps}"));
+        };
+        write(
+            "[[step]]\nrun = \"token\"\nsave = \"reader-token\"\n\
+             [[step]]\nattack = \"curl -H 'Authorization: {saved:reader-token}' {target}\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        let Step::Run(first) = &test.steps[0] else { panic!("not a run step") };
+        assert_eq!(first.save.as_deref(), Some("reader-token"));
+        let Step::Attack(second) = &test.steps[1] else { panic!("not an attack step") };
+        assert_eq!(saved_names(&second.command), ["reader-token"]);
+
+        let refused = |steps: &str, why: &str| {
+            write(steps);
+            let Err(Error::Usage(message)) = load(dir.path()) else { panic!("loaded") };
+            assert!(message.contains(why), "{message}");
+        };
+        refused("[[step]]\nrun = \"echo {saved:nobody}\"\n", "{saved:nobody} names no output");
+        refused(
+            "[[step]]\nrun = \"echo {saved:later}\"\n[[step]]\nrun = \"x\"\nsave = \"later\"\n",
+            "step 1: {saved:later}",
+        );
+        refused("[[step]]\nrun = \"x\"\nsave = \"A B\"\n", "a name is a-z");
+        refused("[[step]]\nwait = \"1s\"\nsave = \"x\"\n", "save goes only with");
+        refused("[[step]]\nhost = \"x\"\nbackground = true\nsave = \"x\"\n", "save goes only with");
+    }
+
+    #[test]
+    fn a_test_chooses_its_attacker() {
+        let dir = TempDir::new("suite-attacker");
+        let write = |attacker: &str, step: &str| {
+            dir.write(
+                "security/scan.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n{attacker}[[step]]\n{step}\n"),
+            );
+        };
+        write("", "attack = \"nmap {target}\"");
+        assert_eq!(load(dir.path()).unwrap()[0].attacker, AttackerKind::Image);
+        write("attacker = \"image\"\n", "attack = \"nmap {target}\"");
+        assert_eq!(load(dir.path()).unwrap()[0].attacker, AttackerKind::Image);
+        write("attacker = \"linux\"\n", "attack = \"nmap {target}\"");
+        assert_eq!(load(dir.path()).unwrap()[0].attacker, AttackerKind::Linux);
+
+        write("attacker = \"bsd\"\n", "attack = \"nmap {target}\"");
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("\"image\" or \"linux\""), "{why}");
+        write("attacker = \"linux\"\n", "run = \"true\"");
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("has an attack step"), "{why}");
     }
 
     #[test]

@@ -133,8 +133,8 @@ See [Real machines](real-machines.md).
 
 ```
 dukovo-lab run <test or category>... | --all | --preset <name> --image <file>
-               [--machine <a,b>] [--build <text>] [--linux <dir>] [--fonts <dir>]
-               [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
+               [--machine <a,b>] [--build <text>] [--linux <dir>] [--redteam <dir>]
+               [--fonts <dir>] [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
                [--with-person] [--no-rerun] [--notify] [--detach]
 dukovo-lab run --resume <run> --image <file> [--build <text>] [--detach]
 ```
@@ -185,7 +185,7 @@ and only those: the ones skipped because the run was stopped (before or
 during the test) or that its process died in or never reached. It runs
 them on the machines they were left on (a machine with nothing left is
 not started), with the options the first run had, which its run.json
-records: `--with-person`, the preset and the kits (`--linux`, `--fonts`,
+records: `--with-person`, the preset and the kits (`--linux`, `--redteam`, `--fonts`,
 `--browsers`, `--stick`, `--dvd`, `--ob`); a kit given now fills in one the
 run had none of. Give no tests, `--all`, `--preset` or `--machine` with
 it. The new run's run.json names the run it resumes (`resumes`), and
@@ -233,6 +233,26 @@ initrd = "linux-bench.cpio"   # beside kit.toml; its first program runs the benc
 cmdline = "console=ttyS0 panic=-1 quiet mitigations=off"
 done = "linux-bench: done"    # what the serial console says once every benchmark has run
 ```
+
+`--redteam` names the folder of a red-team kit: the Linux that the
+attacker of a test with `attacker = "linux"` boots from, in place of a
+Dukovo guest (see [test files](test-files.md#the-red-team-kit)). `ob lab
+redteam-kit` builds it. Without one, those tests are skipped, saying so;
+tests without `attacker = "linux"` keep the Dukovo guest as their
+attacker, whether or not a kit is given, since they were written for
+Dukovo's own tools. The kit's `kit.toml`:
+
+```toml
+kernel = "vmlinuz"            # beside kit.toml
+initrd = "redteam.cpio"       # beside kit.toml
+cmdline = "console=ttyS0 panic=-1"
+user = "root"                 # optional: the account steps run as (default root)
+ready = "redteam: sshd up"    # optional: the serial line that says SSH is up
+memory = "3G"                 # optional: the attacker's memory instead of the machine's
+```
+
+The initramfs is unpacked into the attacker's memory, so a kit that
+unpacks to more than the machine's own `memory` holds sets its own.
 
 `--fonts` names a folder of PSF fonts (`.psf`, `.psfu`): the console's
 own, which `screen` and `screen_gone` steps read the screen's text with
@@ -497,8 +517,8 @@ and with the runner page closed. See [Schedules](schedules.md).
 ## ui
 
 ```
-dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--fonts <dir>]
-              [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
+dukovo-lab ui [--image <file>] [--build <text>] [--linux <dir>] [--redteam <dir>]
+              [--fonts <dir>] [--browsers <dir>] [--stick <file>] [--dvd <file>] [--ob <file>]
               [--port <n>] [--share <address>] [--new-share-key] [--no-open]
 ```
 Serves the runner page to a browser on this PC, at
@@ -508,7 +528,7 @@ open, which carries a key made anew each time; without it the page does
 not open. Ctrl+C closes the page; runs started from it carry on. Without
 `--image` the page shows tests and runs but cannot start runs; `ob lab
 ui` gives the image. Runs started from the page get `--linux`,
-`--fonts`, `--browsers`, `--stick`, `--dvd` and `--ob` when they were given. See [the runner page](runner-page.md).
+`--redteam`, `--fonts`, `--browsers`, `--stick`, `--dvd` and `--ob` when they were given. See [the runner page](runner-page.md).
 
 `--share <address>` also serves the page read only, for a phone, on one
 address of this PC at the same port: the lab PC's Tailscale address,

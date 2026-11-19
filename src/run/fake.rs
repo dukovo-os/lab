@@ -35,6 +35,8 @@ struct FakeMachine {
     want_attacker: bool,
     /// Whether the attacker is up on that network.
     attacker_on: bool,
+    /// Whether that attacker is the red-team kit's Linux.
+    linux_attacker: bool,
     /// The card reader the next boot gives the machine, if any.
     card_reader: Option<crate::suite::Reader>,
     /// Whether the next boot gives the machine an optical drive.
@@ -473,6 +475,10 @@ impl Driver for FakeMachine {
         self.want_attacker = yes;
     }
 
+    fn want_linux_attacker(&mut self, yes: bool) {
+        self.linux_attacker = yes;
+    }
+
     fn start_attacker(&mut self, _deadline: Instant) -> Result<(), String> {
         if !self.want_attacker {
             return Err("this boot was not given an attacker".into());
@@ -491,11 +497,17 @@ impl Driver for FakeMachine {
             return Err("the attacker is not up".into());
         }
         let (status, text) = match command {
+            // The kit's init sets its own address; a step that tries to is
+            // the runner running the Dukovo guest's setup on the kit.
+            cmd if cmd.contains("ip address add") && self.linux_attacker => {
+                (Some(127), "the kit sets its own address\n".into())
+            }
             // The attacker's own address on the private network, as root.
             cmd if cmd.contains("ip address add") => match input {
                 Some("sesame\n") => (Some(0), String::new()),
                 _ => (Some(1), "elevate: a password is needed\n".into()),
             },
+            cmd if cmd.starts_with("echo ") => (Some(0), format!("{}\n", &cmd[5..])),
             // A port scan of the machine under test, which answers on 22.
             "scan 10.9.9.1" => (Some(0), "10.9.9.1 22 open\n".into()),
             other => (Some(127), format!("{other}: not found\n")),
@@ -602,6 +614,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         disc_drive: false,
         floppy_drive: false,
         attacker_on: false,
+        linux_attacker: false,
         sticks: 0,
         stick: None,
         jammed: machine.name == "jammed",
@@ -1018,6 +1031,99 @@ fn attack_steps_run_on_a_private_lab_network() {
     assert_eq!(after.result, Outcome::Pass, "{:?}", after.reason);
     assert_eq!(after.steps[0].step, "boot afresh and wait until booted");
     assert_eq!(ended.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
+}
+
+#[test]
+fn a_step_keeps_its_output_for_the_steps_after_it() {
+    let setting = setting_with(&[(
+        "features/saved.toml",
+        "about = \"a value carried between steps\"\ntime = \"1m\"\nfresh = true\n\
+             [[step]]\nrun = \"uname\"\nsave = \"os\"\n\
+             [[step]]\nrun = \"cat\"\ninput = \"seen {saved:os}\"\nexpect = \"seen Dukovo\"\n\
+             [[step]]\nattack = \"echo from {saved:os}\"\nexpect = \"from Dukovo\"\nsave = \"echoed\"\n\
+             [[step]]\nhost = \"echo {saved:echoed}\"\nexpect = \"from Dukovo\"\n",
+    )]);
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        // The attack step's address setup on the machine runs as root.
+        password: Some("sesame".into()),
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    assert_eq!(ended.summary, Summary { passed: 1, failed: 0, skipped: 0, errors: 0 });
+}
+
+/// A run of one `attacker = "linux"` test and one default one, given the
+/// red-team kit or not, and each test's result.
+fn linux_attacker_run(kit: Option<&str>) -> (Outcome, Option<String>, Outcome) {
+    let setting = setting_with(&[
+        (
+            "security/linux.toml",
+            "about = \"a scan from Linux\"\ntime = \"1m\"\nfresh = true\nattacker = \"linux\"\n\
+             [[step]]\nattack = \"scan {target}\"\nexpect = \"{target} 22 open\"\nroot = true\n",
+        ),
+        // Without `attacker`, a test keeps the Dukovo guest, kit or no kit.
+        (
+            "security/zz-image.toml",
+            "about = \"a scan from a Dukovo guest\"\ntime = \"1m\"\nfresh = true\n\
+             [[step]]\nattack = \"scan {target}\"\nexpect = \"{target} 22 open\"\n",
+        ),
+    ]);
+    let folder = setting.dir.path().join("kit");
+    let redteam = kit.map(|text| {
+        setting.dir.write("kit/vmlinuz", "");
+        setting.dir.write("kit/rootfs.cpio", "");
+        setting.dir.write("kit/kit.toml", text);
+        crate::redteam::RedteamKit::read(&folder).unwrap()
+    });
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines: vec![&setting.qemu],
+        image: "dukovo.img".into(),
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        redteam,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
+    };
+    run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let by_test = |test: &str| results.results.iter().find(|r| r.test == test).unwrap().clone();
+    let linux = by_test("security/linux");
+    (linux.result, linux.reason, by_test("security/zz-image").result)
+}
+
+const KIT: &str = "kernel = \"vmlinuz\"\ninitrd = \"rootfs.cpio\"\ncmdline = \"console=ttyS0\"\n";
+
+#[test]
+fn a_linux_attacker_test_attacks_from_the_kit_without_the_guest_s_address_setup() {
+    let (linux, reason, image) = linux_attacker_run(Some(KIT));
+    assert_eq!(linux, Outcome::Pass, "{reason:?}");
+    assert_eq!(image, Outcome::Pass);
+}
+
+#[test]
+fn a_linux_attacker_test_is_skipped_without_a_red_team_kit() {
+    let (linux, reason, image) = linux_attacker_run(None);
+    assert_eq!(linux, Outcome::Skip);
+    let reason = reason.unwrap();
+    assert!(reason.contains("--redteam") && reason.contains("ob lab redteam-kit"), "{reason}");
+    assert_eq!(image, Outcome::Pass);
+}
+
+#[test]
+fn a_step_that_needs_root_fails_when_the_kit_runs_steps_as_another_user() {
+    let (linux, reason, _) = linux_attacker_run(Some(&format!("{KIT}user = \"red\"\n")));
+    assert_eq!(linux, Outcome::Error);
+    assert!(reason.unwrap().contains("set user = \"root\""));
 }
 
 #[test]
