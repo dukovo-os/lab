@@ -16,11 +16,14 @@
 //! also says when it first went red and the build it first failed on: the
 //! start of its unbroken run of red results, skips left out.
 //!
+//! `new_reds` says which failures of one run are new, for the notice at the
+//! end of a round (notify.rs).
+//!
 //! `history` is the same data for one test across every machine, newest
 //! first, which `show --json` gives the page's Tests view. A run that is
 //! still going has no results.json, so it shows only as `running`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -470,6 +473,37 @@ pub fn grid(store: &Path, tests: &[Test], machines: &[Machine]) -> Grid {
         round: round(&runs),
         runs: runs.len(),
     }
+}
+
+/// The failed or errored results of run `id` that are new: the test was
+/// not red in its column the last time it ran there before this run, skips
+/// passed over as a cell's streak passes them, or it had never run there.
+/// Answers each as its test and the machine that ran it.
+pub fn new_reds(store: &Path, machines: &[Machine], id: &str) -> HashSet<(String, String)> {
+    let runs = load_runs(store, GRID_RUNS);
+    let Some(at) = runs.iter().position(|run| run.record.id == id) else {
+        return HashSet::new();
+    };
+    let column_of = column_names(machines);
+    let column = |machine: &str| column_of.get(machine).map_or(machine, String::as_str).to_string();
+    let red = |outcome: Outcome| matches!(outcome, Outcome::Fail | Outcome::Error);
+    runs[at]
+        .results
+        .iter()
+        .filter(|result| red(result.result))
+        .filter(|result| {
+            let here = column(&result.machine);
+            let before = runs[at + 1..].iter().find_map(|run| {
+                run.results.iter().find(|earlier| {
+                    earlier.test == result.test
+                        && earlier.result != Outcome::Skip
+                        && column(&earlier.machine) == here
+                })
+            });
+            !before.is_some_and(|earlier| red(earlier.result))
+        })
+        .map(|result| (result.test.clone(), result.machine.clone()))
+        .collect()
 }
 
 /// The tests running now, in the column of the machine that runs each.

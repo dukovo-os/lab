@@ -233,3 +233,37 @@ pre.log .t { color: var(--muted); } pre.log .k { color: var(--link); } pre.log .
 .shots figcaption { font-size: 12px; color: var(--muted); }
 #last-command { max-width: 1376px; margin: 0 auto; padding: 0 16px 32px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 @media (prefers-reduced-motion: no-preference) { .st-running { animation: pulse 1.6s ease-in-out infinite; } @keyframes pulse { 50% { opacity: .6; } } }
+
+/* The phone view: one column, its own dark header in place of the top bar */
+.phone-link { display: none; font-size: 14px; padding: 10px 0; }
+@media (max-width: 560px) { .phone-link { display: block; } }
+body.phone-view .topbar, body.phone-view #last-command { display: none; }
+body.phone-view .page { padding: 0; max-width: none; gap: 0; }
+.phone { max-width: 480px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; }
+.phone-head { background: var(--bar); color: var(--bar-text); padding: 20px 16px 16px; }
+.phone-kicker { font-size: 13px; color: var(--bar-fg); }
+.phone-title { font-size: 20px; font-weight: 700; margin-top: 4px; }
+.phone-track { background: var(--bar-on); height: 6px; margin-top: 10px; }
+.phone-track i { background: #5aa2ff; }
+.phone-left { font-size: 13px; color: var(--bar-fg); margin-top: 8px; }
+.phone-body { padding: 16px 16px 40px; display: flex; flex-direction: column; gap: 12px; }
+.ptiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.ptile { padding: 10px 12px; }
+.ptile-label { font-size: 12px; color: var(--muted); }
+.ptile-n { font-size: 22px; font-weight: 700; }
+.ptile-n.pass { color: var(--pass); } .ptile-n.fail { color: var(--fail); }
+.phone-h2 { font-size: 15px; margin-bottom: 8px; }
+.phone .pad { padding: 12px 14px; }
+ul.pn, ul.pms { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+.pn-test { font-weight: 600; overflow-wrap: anywhere; }
+.pn-why { font-size: 13px; color: var(--muted); }
+.pn-more { display: inline-block; margin-top: 10px; font-size: 13px; }
+.pm { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; }
+.pm-name { overflow-wrap: anywhere; }
+.pm-state { font-weight: 500; }
+.pm-state.is-running { color: var(--run); }
+.pm-state.is-benched { color: var(--lab); font-weight: 600; }
+.pm-state.is-idle { color: var(--known); }
+.pm-detail { flex-basis: 100%; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.phone-push { font-size: 13px; }
+.phone-all { font-size: 14px; padding: 8px 0; }

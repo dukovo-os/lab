@@ -3,7 +3,8 @@
 SPDX-FileCopyrightText: 2026 The Dukovo contributors
 SPDX-License-Identifier: Apache-2.0 OR MIT
 
-The runner page. dukovo-lab ui serves it on 127.0.0.1; page.js draws one
+The runner page. dukovo-lab ui serves it on 127.0.0.1 (and, read only, on the
+address given to --share); page.js draws one
 view at a time in #view, chosen by the address's hash, from the answers of
 dukovo-lab commands run through the server (see ui.rs).
 -->
@@ -27,7 +28,7 @@ dukovo-lab commands run through the server (see ui.rs).
   </nav>
   <div class="runstate" id="runstate">
     <a href="#runs" id="runstate-text"><span class="dot idle"></span><span>Loading…</span></a>
-    <a class="btn ink" href="#start" id="start-run">Start run</a>
+    <a class="btn ink" href="#start" id="start-run" data-act>Start run</a>
   </div>
 </header>
 <main class="page" id="page">

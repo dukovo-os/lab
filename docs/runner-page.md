@@ -7,7 +7,8 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 
 The runner page is the lab's control panel: pick machines and tests, run
 them, watch the run, read what failed and send it on. It runs on the lab
-PC and only a browser on that PC can open it.
+PC and only a browser on that PC can open it; a phone can see a read-only
+view of it ([Sharing read only](#sharing-read-only)).
 
 ```sh
 ./ob lab ui              # in a Dukovo checkout: builds the lab image, then serves the page
@@ -30,7 +31,7 @@ wrong build.
 One view shows at a time, chosen by the address's hash, so a view can be
 shared and Back works: `#home`, `#tests`, `#test/<id>`,
 `#failure/<run>/<machine>/<test>`, `#findings`, `#fleet`, `#runs`,
-`#run/<id>` and `#start`. The top bar names the lab, links the views, and
+`#run/<id>`, `#start` and `#phone`. The top bar names the lab, links the views, and
 shows the run going now with its progress and the time left, next to
 **Start run**.
 
@@ -87,6 +88,78 @@ benched machine, – skipped (grey), ▸ running (blue).
   machine are kept apart and run only when ticked; when one of their steps
   comes up, the run says what to do on which machine, with a Done button.
 
+- **Phone** (`#phone`). The page for a screen 390 px wide: the round going
+  now with its progress and the time left, the passed, failing and left
+  counts, **New since last round** (new Dukovo failures and lab faults, each
+  linking to its Failure view), each machine as running, idle, benched with
+  why, or spare, and a line saying whether the push notice is set up. With no
+  round going it shows the last one's counts. On a narrow screen Home
+  offers a link to it.
+
+## Sharing read only
+
+```sh
+dukovo-lab ui --share 100.101.102.103 --image <file> --build <text>
+```
+
+`--share` takes one address of the lab PC and also listens on it, at the
+same port, for a phone. It prints a second address with a key of its own:
+
+```
+The phone view is at http://100.101.102.103:7420/?key=…#phone
+```
+
+Open it once on the phone: the key is traded for a cookie, and the page
+opens on `#phone`. The share key is made once and kept in `share_key` in
+the configuration folder (readable by its owner alone, like the lab key),
+so the address, and the `link` of a push notice, stay the same when `ui`
+restarts. If the address leaks, give `--new-share-key` once, or delete
+the file: the next start makes a new key, and every old address stops
+working. The full page's own key is still new each start.
+
+**Use the lab PC's Tailscale address** (`tailscale ip -4`). Tailscale's
+network holds only your own devices, so only they can reach the page.
+**Do not share a LAN or public address**: the key is the only thing between
+whoever can reach the address and the lab's status, results and logs, and
+it travels in the clear over plain HTTP, which Tailscale's encrypted
+tunnel makes safe and a LAN or the internet does not. `--share` refuses
+`0.0.0.0` and `::`, which mean every network, and warns about any address
+outside Tailscale's ranges.
+
+The read-only address:
+
+- serves only GET requests, the ones the views read, and answers every
+  other method, so every action (run, stop, done, send, mark, schedule),
+  with 403, even with its key. The page is told it is read only and shows
+  no action buttons;
+- answers only to its own address, needs its own key, and does not take
+  the full page's key; the full page does not take the phone's;
+- keeps the page's security headers, so nothing loads from elsewhere.
+
+It shows everything the page reads, results bundle logs and screenshots
+included. Starting runs, sending findings and every other action stay on
+the lab PC's own page.
+
+## On your phone
+
+The lab can push a notice when a round ends ([Notices](schedules.md#notices)).
+
+1. Install the ntfy app (Android: Google Play or F-Droid; iPhone: the App
+   Store).
+2. Pick a topic name that cannot be guessed: **the topic name is the only
+   secret.** Anyone who knows it can read the lab's notices and send
+   others to it. Make it long and random, such as
+   `dukovo-lab-7q4k9x2m5v8c1w3z` (`head -c 16 /dev/urandom | base32`), not
+   `dukovo-lab`.
+3. Subscribe to it in the app. For ntfy.sh, nothing else is needed.
+4. On the lab PC, write the topic into `notify.toml`
+   (`ntfy = "https://ntfy.sh/<topic>"`), and `chmod 600` the file.
+5. Run `dukovo-lab notify --test`. The notice should arrive in a moment.
+   To open the phone view from it, add `link` (see Notices).
+
+The notice carries only counts and the names of tests and machines. A
+server of your own (ntfy runs anywhere) keeps even those off ntfy.sh.
+
 ## Classes
 
 Each failed or broken result has a class, which says whose it is:
@@ -142,7 +215,8 @@ started with `dukovo-lab run` shows on the page too.
 
 ## Safety
 
-The page listens on 127.0.0.1 only, answers only to that address and
+The page listens on 127.0.0.1 only (and, read only, on the one address
+`--share` names), answers only to that address and
 `localhost`, needs the printed key (which it keeps in a cookie), and
 takes actions only from its own script. It serves its own files, the
 commands' answers and files inside results bundles; never anything else

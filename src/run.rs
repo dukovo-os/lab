@@ -241,6 +241,8 @@ pub struct Request<'a> {
 
 /// How a run went.
 pub struct Ended {
+    /// The run's id.
+    pub id: String,
     pub summary: Summary,
 }
 
@@ -461,7 +463,7 @@ pub fn run(
     // The run's locks go only now, once run.json says it ended, so a
     // reader never sees a run that is neither going nor ended.
     running.end();
-    Ok(Ended { summary })
+    Ok(Ended { id, summary })
 }
 
 /// A short folder for the run's sockets: the user's runtime folder when
