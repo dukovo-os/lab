@@ -388,6 +388,18 @@ impl Driver for FakeMachine {
                     .into(),
             ),
             "true" => (Some(0), String::new()),
+            // Fails the first time anywhere in the run and passes after,
+            // as a flaky test does.
+            "flip" => {
+                let bundle = self.logs.ancestors().find(|path| path.ends_with("logs")).unwrap();
+                let marker = bundle.with_file_name("flip-seen");
+                if marker.exists() {
+                    (Some(0), "ok\n".into())
+                } else {
+                    fs::write(marker, "").unwrap();
+                    (Some(0), "bad\n".into())
+                }
+            }
             // Takes long enough that machines of a pool all get a turn at
             // its queue.
             "slow" => {
@@ -2167,7 +2179,7 @@ fn slow_tests(count: usize) -> Setting {
 }
 
 fn optiplex<'a>(members: Vec<&'a Machine>) -> Pool<'a> {
-    Pool { name: "optiplex".into(), members }
+    Pool { name: "optiplex".into(), members, spares: Vec::new() }
 }
 
 /// A run that shares tests out among pools, as `--machine pool:...` does,
@@ -2429,4 +2441,140 @@ fn a_resumed_sharded_run_queues_what_was_left_to_the_same_pool() {
         serde_json::from_str(&fs::read_to_string(bundle.join("run.json")).unwrap()).unwrap();
     assert_eq!(run.resumes.as_deref(), Some(id));
     assert_eq!(run.pools[0].members, ["optiplex-1", "optiplex-2"]);
+}
+
+/// A run on `machines` and `pools` with reruns on or off.
+fn run_with_reruns(
+    setting: &Setting,
+    machines: Vec<&Machine>,
+    pools: Vec<Pool<'_>>,
+    rerun: bool,
+) -> (Done, Vec<ResultRecord>, String) {
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines,
+        pools,
+        image: "dukovo.img".into(),
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        password: Some("sesame".into()),
+        rerun,
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    let events = fs::read_to_string(bundle.join("events.jsonl")).unwrap();
+    (Done { summary: ended.summary, bundle }, results.results, events)
+}
+
+const FLIP: (&str, &str) = (
+    "features/flip.toml",
+    "about = \"flips\"\ntime = \"1m\"\n[[step]]\nrun = \"flip\"\nexpect = \"ok\"\n",
+);
+
+#[test]
+fn a_test_that_fails_and_then_passes_is_flaky() {
+    let setting = setting_with(&[FLIP, TESTS[2]]);
+    let (done, results, events) = run_with_reruns(&setting, vec![&setting.qemu], Vec::new(), true);
+    let flip = results.iter().find(|result| result.test == "features/flip").unwrap();
+    assert_eq!(flip.result, Outcome::Fail, "the first try is the result");
+    let rerun = flip.rerun.as_ref().unwrap();
+    assert_eq!((rerun.result, rerun.machine.as_str()), (Outcome::Pass, "qemu"));
+    assert!(flip.flaky());
+    assert_eq!(rerun.log.as_deref(), Some("logs/qemu/rerun/features-flip.log"));
+    assert!(done.bundle.join("logs/qemu/features-flip.log").is_file(), "the first log stays");
+    assert!(done.bundle.join("logs/qemu/rerun/features-flip.log").is_file());
+    // The run counts one failure per test, and findings hold each once.
+    assert_eq!(done.summary, Summary { passed: 0, failed: 2, skipped: 0, errors: 0 });
+    let findings = crate::findings::load_all(&setting.dir.path().join("store"));
+    assert_eq!(findings.len(), 2);
+    assert!(findings.iter().all(|finding| finding.count == 1));
+    assert!(
+        events
+            .contains("\"event\":\"rerun-ended\",\"machine\":\"qemu\",\"test\":\"features/flip\"")
+    );
+}
+
+#[test]
+fn a_test_that_fails_again_is_not_flaky() {
+    let setting = setting_with(&[TESTS[2]]);
+    let (_, results, _) = run_with_reruns(&setting, vec![&setting.qemu], Vec::new(), true);
+    let rerun = results[0].rerun.as_ref().unwrap();
+    assert_eq!(rerun.result, Outcome::Fail);
+    assert!(rerun.reason.as_deref().unwrap().contains("its output lacks \"Linux\""));
+    assert!(!results[0].flaky());
+}
+
+#[test]
+fn no_rerun_runs_each_test_once() {
+    let setting = setting_with(&[FLIP]);
+    let (done, results, events) = run_with_reruns(&setting, vec![&setting.qemu], Vec::new(), false);
+    assert_eq!(results[0].rerun, None);
+    assert!(!events.contains("rerun"));
+    assert!(!done.bundle.join("logs/qemu/rerun").exists());
+}
+
+#[test]
+fn an_error_and_a_skip_are_not_rerun() {
+    let setting = setting_with(&[TESTS[4]]);
+    let bad = named(&setting, "checked-bad");
+    let mut no_cord = named(&setting, "no-cord");
+    no_cord.controls.insert(Control::Cord, Who::None);
+    let (_, results, events) = run_with_reruns(&setting, vec![&bad, &no_cord], Vec::new(), true);
+    let kinds: Vec<Outcome> = results.iter().map(|result| result.result).collect();
+    assert!(kinds.contains(&Outcome::Error) && kinds.contains(&Outcome::Skip), "{kinds:?}");
+    assert!(results.iter().all(|result| result.rerun.is_none()));
+    assert!(!events.contains("rerun"));
+}
+
+#[test]
+fn a_test_of_a_pool_is_rerun_on_its_spare_first() {
+    let setting = setting_with(&[FLIP]);
+    let first = named(&setting, "optiplex-1");
+    let second = named(&setting, "optiplex-2");
+    let mut spare = named(&setting, "optiplex-3");
+    spare.spare = true;
+    let mut pool = optiplex(vec![&first, &second]);
+    pool.spares = vec![&spare];
+    let (_, results, events) = run_with_reruns(&setting, Vec::new(), vec![pool], true);
+    assert_eq!(results.len(), 1);
+    let rerun = results[0].rerun.as_ref().unwrap();
+    assert_eq!(rerun.machine, "optiplex-3");
+    assert_ne!(results[0].machine, "optiplex-3");
+    assert!(results[0].flaky());
+    assert_eq!(rerun.log.as_deref(), Some("logs/optiplex-3/rerun/features-flip.log"));
+    assert!(events.contains("\"event\":\"rerun-started\",\"machine\":\"optiplex-3\""));
+}
+
+#[test]
+fn a_test_of_a_pool_without_a_spare_is_rerun_on_another_member() {
+    let setting = setting_with(&[FLIP, TESTS[2]]);
+    let first = named(&setting, "optiplex-1");
+    let second = named(&setting, "optiplex-2");
+    let (_, results, _) =
+        run_with_reruns(&setting, Vec::new(), vec![optiplex(vec![&first, &second])], true);
+    for result in &results {
+        let rerun = result.rerun.as_ref().unwrap();
+        assert_ne!(rerun.machine, result.machine, "{}", result.test);
+    }
+    // A pool of one has no other machine: the same one, afresh.
+    let alone = optiplex(vec![&first]);
+    let again = setting_with(&[TESTS[2]]);
+    let (_, results, _) = run_with_reruns(&again, Vec::new(), vec![alone], true);
+    assert_eq!(results[0].rerun.as_ref().unwrap().machine, "optiplex-1");
+}
+
+#[test]
+fn a_run_in_progress_shows_the_rerun_from_its_events() {
+    let setting = setting_with(&[FLIP]);
+    let (done, _, _) = run_with_reruns(&setting, vec![&setting.qemu], Vec::new(), true);
+    let id = done.bundle.file_name().unwrap().to_str().unwrap();
+    let store = setting.dir.path().join("store");
+    // Without results.json, as a run that died part way, the events say it.
+    fs::remove_file(done.bundle.join("results.json")).unwrap();
+    let results = crate::status::results(&store, id).unwrap();
+    assert!(results.results[0].flaky(), "{:?}", results.results[0]);
 }

@@ -184,6 +184,34 @@ pub struct ResultRecord {
     pub steps: Vec<StepRecord>,
     /// Its screenshots, relative to the bundle.
     pub screenshots: Vec<String>,
+    /// The second try of a test that failed, when the run made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun: Option<Rerun>,
+}
+
+impl ResultRecord {
+    /// Whether the test failed and then passed when run again: a flake.
+    pub fn flaky(&self) -> bool {
+        self.result == Outcome::Fail
+            && self.rerun.as_ref().is_some_and(|rerun| rerun.result == Outcome::Pass)
+    }
+}
+
+/// A failed test run once more before its run ended, in results.json
+/// beside the first result. The first result stays as it was: counts,
+/// findings and `Summary` read only that one.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Rerun {
+    /// The machine that ran it again: another of the pool's (a spare
+    /// first) when the first try ran in a pool, else the same one on a
+    /// fresh boot.
+    pub machine: String,
+    pub result: Outcome,
+    pub reason: Option<String>,
+    pub milliseconds: u64,
+    pub boot: Option<u32>,
+    /// Its log, relative to the bundle.
+    pub log: Option<String>,
 }
 
 /// One step of a test, in results.json.

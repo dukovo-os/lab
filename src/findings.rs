@@ -12,6 +12,14 @@
 //! PC and in any version, so the lab-results repository can merge what
 //! several sends say about one finding.
 //!
+//! Each failed or errored result also has a *class*, which says whose it
+//! is: the lab's (an error, a health check that failed), Dukovo's (a
+//! failure, by default), flaky (it failed, then passed when run again on
+//! the same build), known (its finding has a fix proposed, approved or
+//! landed, or a link to one) or the test's (a person said it is wrong). A
+//! person can give a finding a class of their own, which holds in every
+//! run it fails in.
+//!
 //! Findings live in the store as `findings/<id>.json`, the same file the
 //! lab-results repository keeps (see send.rs), described by
 //! schema/finding.schema.json. A run adds its failures when it ends; a
@@ -66,6 +74,41 @@ impl State {
     }
 }
 
+/// Whose a failed or errored result is.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Class {
+    /// The harness or the machine broke: says nothing about Dukovo.
+    Lab,
+    /// Dukovo fails the test.
+    Dukovo,
+    /// It failed, then passed when run again on the same build.
+    Flaky,
+    /// The finding is being fixed, or links to the issue that tracks it.
+    Known,
+    /// A person said the test is wrong.
+    Test,
+}
+
+impl Class {
+    /// The class `text` names, as the command line and the page write it.
+    pub fn parse(text: &str) -> Option<Class> {
+        [Class::Lab, Class::Dukovo, Class::Flaky, Class::Known, Class::Test]
+            .into_iter()
+            .find(|class| class.word() == text)
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Class::Lab => "lab",
+            Class::Dukovo => "dukovo",
+            Class::Flaky => "flaky",
+            Class::Known => "known",
+            Class::Test => "test",
+        }
+    }
+}
+
 /// findings/<id>.json.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Finding {
@@ -77,6 +120,10 @@ pub struct Finding {
     pub state: State,
     /// Why a person said it is not a bug.
     pub note: Option<String>,
+    /// The class a person gave it, which wins over the one the lab works
+    /// out from its results and state.
+    #[serde(default)]
+    pub class: Option<Class>,
     /// The first and last runs it failed in, by their start (RFC 3339 UTC).
     pub first_seen: String,
     pub last_seen: String,
@@ -131,6 +178,7 @@ impl Finding {
             signature,
             state: State::New,
             note: None,
+            class: None,
             first_seen: String::new(),
             last_seen: String::new(),
             count: 0,
@@ -173,6 +221,12 @@ impl Finding {
         }
     }
 
+    /// Whether the finding is being fixed, or links to its issue.
+    pub fn known(&self) -> bool {
+        self.fix.is_some()
+            || matches!(self.state, State::FixProposed | State::Approved | State::Fixed)
+    }
+
     /// Whether it has failed in a run lab-results does not have yet.
     pub fn unsent(&self) -> bool {
         self.runs.iter().any(|seen| !seen.sent)
@@ -208,6 +262,7 @@ impl Finding {
             if theirs.fix.is_some() {
                 merged.fix.clone_from(&theirs.fix);
             }
+            merged.class = self.class.or(theirs.class);
         }
         for seen in &mut merged.runs {
             seen.sent = true;
@@ -217,6 +272,33 @@ impl Finding {
         merged.sent = None;
         merged
     }
+}
+
+/// Whose a result is, given how it came out, whether it was flaky (see
+/// [`ResultRecord::flaky`]) and its finding if it has one: the lab's for an
+/// error, then a person's class, the test's for a finding marked not a bug,
+/// known for one being fixed, flaky for a failure that passed when run
+/// again, and Dukovo's for any other failure.
+pub fn classify(outcome: Outcome, flaky: bool, finding: Option<&Finding>) -> Class {
+    if outcome == Outcome::Error {
+        return Class::Lab;
+    }
+    if let Some(class) = finding.and_then(|finding| finding.class) {
+        return class;
+    }
+    match finding {
+        Some(finding) if finding.state == State::NotABug => Class::Test,
+        Some(finding) if finding.known() => Class::Known,
+        _ if flaky => Class::Flaky,
+        _ => Class::Dukovo,
+    }
+}
+
+/// The finding a failure of `test` with `reason` belongs to, among `all`
+/// (see [`load_all`]).
+pub fn finding_of<'a>(all: &'a [Finding], test: &str, reason: &str) -> Option<&'a Finding> {
+    let id = finding_id(test, &signature(reason));
+    all.iter().find(|finding| finding.id == id)
 }
 
 /// How a result's reason fails, without what changes from run to run: its
@@ -413,6 +495,18 @@ pub fn set_not_a_bug(
             finding.note = None;
         }
     }
+    // The state says what it is now; a class given before no longer holds.
+    finding.class = None;
+    write(store, &finding)?;
+    Ok(finding)
+}
+
+/// Gives finding `id` the class a person chose, or, with `None`, goes back
+/// to the one worked out from its results and state.
+pub fn set_class(store: &Path, id: &str, class: Option<Class>) -> Result<Finding, Error> {
+    let _lock = lock(store)?;
+    let mut finding = find(store, id)?;
+    finding.class = class;
     write(store, &finding)?;
     Ok(finding)
 }
@@ -516,6 +610,7 @@ mod tests {
             log: None,
             steps: Vec::new(),
             screenshots: Vec::new(),
+            rerun: None,
         }
     }
 
@@ -602,6 +697,49 @@ mod tests {
         assert_eq!(find(store.path(), &ids[0]).unwrap().state, State::NotABug);
         assert_eq!(set_not_a_bug(store.path(), &ids[0], None).unwrap().state, State::New);
         assert!(matches!(find(store.path(), "f-000000000000"), Err(Error::Usage(_))));
+    }
+
+    #[test]
+    fn a_class_comes_from_the_result_and_the_finding_and_a_person_s_class_wins() {
+        let mut finding = Finding::new("f-f6dc0d2ca36b".into(), "boot/a", "step 1: no".into());
+        let failed = result("boot/a", "qemu", Outcome::Fail, Some("step 1: no"));
+        let mut flaky = failed.clone();
+        flaky.rerun = Some(crate::bundle::Rerun {
+            machine: "qemu".into(),
+            result: Outcome::Pass,
+            reason: None,
+            milliseconds: 1,
+            boot: None,
+            log: None,
+        });
+        let class = |result: &ResultRecord, finding: Option<&Finding>| {
+            classify(result.result, result.flaky(), finding)
+        };
+        assert_eq!(class(&failed, None), Class::Dukovo);
+        assert_eq!(class(&flaky, Some(&finding)), Class::Flaky);
+        let broke = result("boot/a", "qemu", Outcome::Error, Some("health check failed"));
+        assert_eq!(class(&broke, None), Class::Lab);
+        finding.fix = Some("https://github.com/dukovo-os/dukovo/issues/571".into());
+        assert_eq!(class(&flaky, Some(&finding)), Class::Known, "a fix being worked on");
+        finding.state = State::NotABug;
+        assert_eq!(class(&failed, Some(&finding)), Class::Test);
+        finding.class = Some(Class::Lab);
+        assert_eq!(class(&failed, Some(&finding)), Class::Lab);
+        assert_eq!(class(&broke, Some(&finding)), Class::Lab);
+        for word in ["lab", "dukovo", "flaky", "known", "test"] {
+            assert_eq!(Class::parse(word).map(Class::word), Some(word));
+        }
+        assert_eq!(Class::parse("auto"), None);
+
+        // What a person chose here survives a send; lab-results' own copy
+        // has none, and a class set there is kept when none is set here.
+        let mut theirs = finding.clone();
+        theirs.class = Some(Class::Known);
+        let mut ours = finding.clone();
+        ours.class = None;
+        assert_eq!(ours.merged_with(Some(&theirs)).class, Some(Class::Known));
+        ours.class = Some(Class::Dukovo);
+        assert_eq!(ours.merged_with(Some(&theirs)).class, Some(Class::Dukovo));
     }
 
     #[test]

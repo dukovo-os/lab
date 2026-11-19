@@ -909,6 +909,9 @@ pub struct Pool<'a> {
     pub name: String,
     /// The machines that take part: the pool's machines but its spares.
     pub members: Vec<&'a Machine>,
+    /// The pool's spares, which a run keeps out of its queue and runs a
+    /// failed test on again, before a member does.
+    pub spares: Vec<&'a Machine>,
 }
 
 impl Pool<'_> {
@@ -961,6 +964,7 @@ pub fn pick<'a>(machines: &'a [Machine], names: &str) -> Result<Pick<'a>, Error>
             )));
         }
         let members: Vec<&Machine> = in_pool().filter(|machine| !machine.spare).collect();
+        let spares: Vec<&Machine> = in_pool().filter(|machine| machine.spare).collect();
         if members.is_empty() {
             return Err(Error::Usage(format!(
                 "every machine of the pool \"{pool}\" is a spare, so a run on it has no machine \
@@ -970,7 +974,7 @@ pub fn pick<'a>(machines: &'a [Machine], names: &str) -> Result<Pick<'a>, Error>
         if picked.pools.iter().any(|already| already.name == pool) {
             return Err(Error::Usage(format!("pool \"{pool}\" is picked twice")));
         }
-        picked.pools.push(Pool { name: pool.to_string(), members });
+        picked.pools.push(Pool { name: pool.to_string(), members, spares });
     }
     for pool in &picked.pools {
         if let Some(machine) = picked.direct.iter().find(|machine| pool.members.contains(machine)) {

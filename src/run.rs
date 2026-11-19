@@ -43,7 +43,7 @@ use crate::Error;
 use crate::bench::{self, Kit, Row};
 use crate::browser;
 use crate::bundle::{
-    Bundle, MachineRecord, Outcome, PoolRecord, ResultRecord, RunOptions, RunRecord, SCHEMA,
+    Bundle, MachineRecord, Outcome, PoolRecord, Rerun, ResultRecord, RunOptions, RunRecord, SCHEMA,
     StepRecord, Summary, new_run_id,
 };
 use crate::clock::Utc;
@@ -230,6 +230,10 @@ pub struct Request<'a> {
     /// The run this one resumes, with the tests it has left: each machine
     /// runs only the ones named for it.
     pub resume: Option<Resume>,
+    /// Whether a test that fails is run once more before the run ends: on
+    /// another machine of its pool, a spare first, else on the same machine
+    /// afresh. A test that then passes is flaky.
+    pub rerun: bool,
     /// The run's id, when the caller chose it (a detached run's parent
     /// does, to name the run before it starts); else a new one.
     pub id: Option<String>,
@@ -422,6 +426,15 @@ pub fn run(
         for queue in &queues {
             results.extend(queue.finish(shared));
         }
+        if request.rerun && !stop.requested() {
+            let rerun_setup = |index: usize, machine: &Machine| Setup {
+                logs: bundle.logs(&format!("{}/rerun", machine.name)),
+                work: work.join(&machine.name).join("rerun"),
+                sockets: sockets.join(format!("rerun-{index}")),
+                ..setup(index, machine)
+            };
+            rerun_failures(&mut results, request, shared, &rerun_setup, start);
+        }
         results
     });
     let _ = fs::remove_dir_all(&work);
@@ -507,6 +520,7 @@ fn start_worker<'a>(
     setup: Setup,
     shared: &'a Shared<'a>,
     start: &StartDriver,
+    rerun: bool,
 ) -> Result<Worker<'a>, String> {
     let has_key = setup.key.is_some();
     let screen_file = setup.work.join("screen.ppm");
@@ -515,7 +529,7 @@ fn start_worker<'a>(
     let peer_folder = setup.sockets.join("peer");
     let driver = start(machine, setup)
         .map_err(|err| format!("the {} machine did not start: {err}", machine.name))?;
-    Ok(Worker::new(machine, driver, has_key, shared, screen_file, peer_folder))
+    Ok(Worker::new(machine, driver, has_key, shared, screen_file, peer_folder, rerun))
 }
 
 /// Why `test` cannot run on `machine` however the run goes: the machine
@@ -546,7 +560,7 @@ fn run_machine(
     shared: &Shared<'_>,
     start: &StartDriver,
 ) -> Vec<ResultRecord> {
-    let (mut worker, broken) = match start_worker(machine, setup, shared, start) {
+    let (mut worker, broken) = match start_worker(machine, setup, shared, start, false) {
         Ok(worker) => (Some(worker), None),
         Err(why) => (None, Some(why)),
     };
@@ -575,6 +589,160 @@ fn run_machine(
         worker.driver.shut_off();
     }
     results
+}
+
+/// The tests to run again on one machine: each with the index of its first
+/// result.
+struct RerunGroup<'a> {
+    machine: &'a Machine,
+    jobs: Vec<(usize, &'a Test)>,
+}
+
+/// Runs each test that failed once more, once every machine is done, and
+/// records the second try beside the first. A test of a pool goes to
+/// another of its machines, a spare first; a test of a machine named on
+/// its own, and of a pool with no other machine, goes to the same machine
+/// on a fresh boot. Errors are not rerun: they say the lab broke, not that
+/// Dukovo did.
+fn rerun_failures(
+    results: &mut [ResultRecord],
+    request: &Request<'_>,
+    shared: &Shared<'_>,
+    setup: &dyn Fn(usize, &Machine) -> Setup,
+    start: &StartDriver,
+) {
+    // A spare this run borrowed holds its lock until the reruns are done.
+    let mut borrowed: Vec<(&str, File)> = Vec::new();
+    // Per machine, the tests to run again and the machine each failed on.
+    let mut groups: BTreeMap<&str, RerunGroup<'_>> = BTreeMap::new();
+    let failed = results.iter().enumerate().filter(|(_, result)| result.result == Outcome::Fail);
+    for (turn, (index, result)) in failed.enumerate() {
+        let Some(test) = request.tests.iter().find(|test| test.id == result.test) else { continue };
+        let Some(machine) = rerun_machine(request, shared, &result.machine, turn, &mut borrowed)
+        else {
+            continue;
+        };
+        groups
+            .entry(&machine.name)
+            .or_insert_with(|| RerunGroup { machine, jobs: Vec::new() })
+            .jobs
+            .push((index, test));
+    }
+    let reruns: Vec<(usize, Rerun)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = groups
+            .into_values()
+            .enumerate()
+            .map(|(number, RerunGroup { machine, jobs })| {
+                let jobs: Vec<(usize, &Test, &str)> = jobs
+                    .into_iter()
+                    .map(|(index, test)| (index, test, results[index].machine.as_str()))
+                    .collect();
+                let setup = setup(number, machine);
+                scope.spawn(move || rerun_on(machine, &jobs, setup, shared, start))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("a machine's worker panicked"))
+            .collect()
+    });
+    for (index, rerun) in reruns {
+        results[index].rerun = Some(rerun);
+    }
+}
+
+/// The machine a test that failed on `first` runs on again.
+fn rerun_machine<'a>(
+    request: &Request<'a>,
+    shared: &Shared<'_>,
+    first: &str,
+    turn: usize,
+    borrowed: &mut Vec<(&'a str, File)>,
+) -> Option<&'a Machine> {
+    if let Some(&machine) = request.machines.iter().find(|machine| machine.name == first) {
+        return Some(machine);
+    }
+    let pool = request.pools.iter().find(|pool| pool.members.iter().any(|m| m.name == first))?;
+    for &spare in &pool.spares {
+        // One named on its own is this run's already.
+        let named = request.machines.iter().any(|machine| machine.name == spare.name);
+        let held = borrowed.iter().any(|(name, _)| *name == spare.name);
+        if named || held {
+            return Some(spare);
+        }
+        if let Ok(Some(lock)) = shared.running.borrow_machine(&spare.name) {
+            borrowed.push((&spare.name, lock));
+            return Some(spare);
+        }
+    }
+    let others: Vec<&Machine> =
+        pool.members.iter().copied().filter(|machine| machine.name != first).collect();
+    if others.is_empty() {
+        return pool.members.iter().copied().find(|machine| machine.name == first);
+    }
+    Some(others[turn % others.len()])
+}
+
+/// Runs `jobs` (result index, test, machine it failed on) on `machine`,
+/// each on a fresh boot, and answers the second tries.
+fn rerun_on(
+    machine: &Machine,
+    jobs: &[(usize, &Test, &str)],
+    setup: Setup,
+    shared: &Shared<'_>,
+    start: &StartDriver,
+) -> Vec<(usize, Rerun)> {
+    let mut worker = match start_worker(machine, setup, shared, start, true) {
+        Ok(worker) => worker,
+        Err(why) => {
+            let broke = |&(index, test, first): &(usize, &Test, &str)| {
+                let rerun = Rerun {
+                    machine: machine.name.clone(),
+                    result: Outcome::Error,
+                    reason: Some(why.clone()),
+                    milliseconds: 0,
+                    boot: None,
+                    log: None,
+                };
+                report_rerun(shared, first, test, &rerun);
+                (index, rerun)
+            };
+            return jobs.iter().map(broke).collect();
+        }
+    };
+    let mut reruns = Vec::new();
+    for &(index, test, first) in jobs {
+        if shared.stop.requested() || worker.benched.is_some() {
+            break;
+        }
+        shared.reporter.report(&Event::RerunStarted { machine: &machine.name, test: &test.id });
+        let again = worker.run_test(test);
+        let rerun = Rerun {
+            machine: machine.name.clone(),
+            result: again.result,
+            reason: again.reason,
+            milliseconds: again.milliseconds,
+            boot: again.boot,
+            log: again.log,
+        };
+        report_rerun(shared, first, test, &rerun);
+        reruns.push((index, rerun));
+    }
+    worker.driver.shut_off();
+    reruns
+}
+
+fn report_rerun(shared: &Shared<'_>, first: &str, test: &Test, rerun: &Rerun) {
+    shared.reporter.report(&Event::RerunEnded {
+        machine: first,
+        test: &test.id,
+        on: &rerun.machine,
+        result: rerun.result,
+        reason: rerun.reason.as_deref(),
+        milliseconds: rerun.milliseconds,
+        boot: rerun.boot,
+        log: rerun.log.as_deref(),
+    });
 }
 
 /// Reports the end of a test that did not run, which has no worker to say
@@ -698,7 +866,7 @@ fn run_pool_machine(
     shared: &Shared<'_>,
     start: &StartDriver,
 ) -> Vec<ResultRecord> {
-    let mut worker = match start_worker(machine, setup, shared, start) {
+    let mut worker = match start_worker(machine, setup, shared, start, false) {
         Ok(worker) => worker,
         Err(why) => {
             queue.leave(machine, why, shared);
@@ -736,6 +904,7 @@ fn blank_result(test: &Test, machine: &str, result: Outcome, reason: String) -> 
         log: None,
         steps: Vec::new(),
         screenshots: Vec::new(),
+        rerun: None,
     }
 }
 
@@ -763,6 +932,13 @@ struct Worker<'a> {
     /// may share its boot.
     reusable: bool,
     serial: SerialWatch,
+    /// Where the machine's logs and screenshots go under `logs/` and
+    /// `screenshots/`: its name, or a folder inside it for a rerun, whose
+    /// files must not replace the first try's.
+    folder: String,
+    /// Whether this worker only reruns tests that failed, and so reports
+    /// no test of its own (see [`Event::RerunStarted`]).
+    rerun: bool,
     /// The test being run: its log lines and screenshots.
     log: Vec<String>,
     screenshots: Vec<String>,
@@ -815,9 +991,12 @@ impl<'a> Worker<'a> {
         shared: &'a Shared<'a>,
         screen_file: PathBuf,
         peer_folder: PathBuf,
+        rerun: bool,
     ) -> Self {
         Worker {
             machine,
+            folder: if rerun { format!("{}/rerun", machine.name) } else { machine.name.clone() },
+            rerun,
             driver,
             has_key,
             shared,
@@ -839,7 +1018,9 @@ impl<'a> Worker<'a> {
     /// Runs one test, from its boot (if it needs one) to its last step.
     fn run_test(&mut self, test: &Test) -> ResultRecord {
         let machine = &self.machine.name;
-        self.shared.reporter.report(&Event::TestStarted { machine, test: &test.id });
+        if !self.rerun {
+            self.shared.reporter.report(&Event::TestStarted { machine, test: &test.id });
+        }
         let started = Instant::now();
         let limit = test.time * self.driver.slowdown();
         let mut deadline = started + limit;
@@ -982,16 +1163,18 @@ impl<'a> Worker<'a> {
         let milliseconds = started.elapsed().as_millis() as u64;
         let boot = (self.boot > 0).then_some(self.boot);
         let screenshots = std::mem::take(&mut self.screenshots);
-        self.shared.reporter.report(&Event::TestEnded {
-            machine,
-            test: &test.id,
-            result,
-            reason: reason.as_deref(),
-            milliseconds,
-            boot,
-            log: log.as_deref(),
-            screenshots: &screenshots,
-        });
+        if !self.rerun {
+            self.shared.reporter.report(&Event::TestEnded {
+                machine,
+                test: &test.id,
+                result,
+                reason: reason.as_deref(),
+                milliseconds,
+                boot,
+                log: log.as_deref(),
+                screenshots: &screenshots,
+            });
+        }
         ResultRecord {
             test: test.id.clone(),
             machine: machine.clone(),
@@ -1002,6 +1185,7 @@ impl<'a> Worker<'a> {
             log,
             steps,
             screenshots,
+            rerun: None,
         }
     }
 
@@ -1584,8 +1768,8 @@ impl<'a> Worker<'a> {
         let file = self.peer_work()?.join("browser-runner.mjs");
         fs::write(&file, browser::RUNNER)
             .map_err(|err| StepFailure::Error(format!("writing {}: {err}", file.display())))?;
-        let shots = self.shared.bundle.screenshots(&self.machine.name);
-        let logs = self.shared.bundle.logs(&self.machine.name);
+        let shots = self.shared.bundle.screenshots(&self.folder);
+        let logs = self.shared.bundle.logs(&self.folder);
         for folder in [&shots, &logs] {
             fs::create_dir_all(folder)
                 .map_err(|err| StepFailure::Error(format!("making {}: {err}", folder.display())))?;
@@ -1658,7 +1842,7 @@ impl<'a> Worker<'a> {
         let ready = serve.ready.as_deref().map(|ready| self.fill(ready)).transpose()?;
         let root = self.host_root(serve.root)?;
         let folder = self.peer_work()?;
-        let logs = self.shared.bundle.logs(&self.machine.name);
+        let logs = self.shared.bundle.logs(&self.folder);
         fs::create_dir_all(&logs)
             .map_err(|err| StepFailure::Error(format!("making {}: {err}", logs.display())))?;
         let log = logs.join(format!(
@@ -1986,7 +2170,7 @@ impl<'a> Worker<'a> {
                 let log = self
                     .shared
                     .bundle
-                    .logs(&self.machine.name)
+                    .logs(&self.folder)
                     .join(format!("linux-boot-{}.log", self.boot));
                 let text =
                     self.driver.linux_twin(kit, &log, deadline).map_err(StepFailure::Error)?;
@@ -2157,7 +2341,7 @@ impl<'a> Worker<'a> {
     }
 
     fn screenshot(&mut self, test: &Test, name: &str) -> Result<(), String> {
-        let folder = self.shared.bundle.screenshots(&self.machine.name);
+        let folder = self.shared.bundle.screenshots(&self.folder);
         fs::create_dir_all(&folder).map_err(|err| format!("making {}: {err}", folder.display()))?;
         let path = folder.join(format!("{}-{name}.png", test.id.replace('/', "-")));
         self.driver.screenshot(&path)?;
@@ -2295,7 +2479,7 @@ impl<'a> Worker<'a> {
             Some(reason) => format!("Result: {result:?}: {reason}"),
             None => format!("Result: {result:?}"),
         });
-        let folder = self.shared.bundle.logs(&self.machine.name);
+        let folder = self.shared.bundle.logs(&self.folder);
         let path = folder.join(format!("{}.log", test.id.replace('/', "-")));
         let mut text = std::mem::take(&mut self.log).join("\n");
         text.push('\n');

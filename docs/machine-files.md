@@ -37,7 +37,7 @@ one for a real machine on a Shelly smart plug (see
 | `about` | yes | What the machine is, in one line. |
 | `driver` | yes | How the lab controls it: `qemu`; `amt` for a real machine with Intel AMT; or `plug` for a real machine with neither AMT nor a serial port, powered through a Shelly smart plug. |
 | `pool` | no | The pool the machine belongs to (below). |
-| `spare` | no | `true` keeps the machine out of a run on its pool (below). Needs `pool`. |
+| `spare` | no | `true` keeps the machine out of a run on its pool, which uses it to run failed tests again (below). Needs `pool`. |
 | `ready` | no | The serial console line that says the machine has booted. Default `Boot complete.` |
 | `[controls]` | no | Who does each control (below). |
 | `[qemu]` | no | A QEMU machine's hardware (below). |
