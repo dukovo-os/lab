@@ -40,6 +40,45 @@ pub struct Target {
     pub scratch: PathBuf,
 }
 
+/// When a command that has gone quiet is ended as stalled: it printed
+/// nothing for `after`, and the machine's console, the log at `console`,
+/// gained nothing either. A command that is silent while the console
+/// scrolls is the machine at work, not hung.
+#[derive(Clone, Debug)]
+pub struct Stall {
+    pub after: Duration,
+    pub console: PathBuf,
+}
+
+/// Follows a command's output and the console, and says when both have
+/// been still for as long as a [`Stall`] allows.
+pub struct Quiet<'a> {
+    stall: &'a Stall,
+    seen: (u64, u64),
+    moved: Instant,
+}
+
+impl<'a> Quiet<'a> {
+    pub fn new(stall: &'a Stall, now: Instant) -> Quiet<'a> {
+        Quiet { stall, seen: (0, 0), moved: now }
+    }
+
+    /// Whether the command is stalled at `now`, given how many bytes it
+    /// has printed and the console log holds.
+    pub fn stalled(&mut self, now: Instant, printed: u64, console: u64) -> bool {
+        if (printed, console) != self.seen {
+            self.seen = (printed, console);
+            self.moved = now;
+        }
+        now.saturating_duration_since(self.moved) >= self.stall.after
+    }
+}
+
+/// The size of the file at `path`; zero while it is not there.
+pub fn size_of(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |meta| meta.len())
+}
+
 /// What a command did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
@@ -51,14 +90,16 @@ pub struct Output {
 }
 
 impl Target {
-    /// Runs `command` on the machine, stopping it at `deadline` or when
-    /// the run is stopped.
+    /// Runs `command` on the machine, stopping it at `deadline`, when the
+    /// run is stopped, or when `stall` says it has gone quiet. The output
+    /// then has no status, whichever of the three ended it.
     pub fn run(
         &self,
         command: &str,
         input: Option<&str>,
         deadline: Instant,
         stop: &Stop,
+        stall: Option<&Stall>,
     ) -> Result<Output, String> {
         let output_file = File::create(&self.scratch)
             .map_err(|err| format!("making {}: {err}", self.scratch.display()))?;
@@ -77,11 +118,18 @@ impl Target {
             use std::io::Write as _;
             let _ = pipe.write_all(input.as_bytes());
         }
+        let mut quiet = stall.map(|stall| Quiet::new(stall, Instant::now()));
         let status = loop {
             if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
                 break status.code();
             }
-            if Instant::now() >= deadline || stop.requested() {
+            let stalled = match (&mut quiet, stall) {
+                (Some(quiet), Some(stall)) => {
+                    quiet.stalled(Instant::now(), size_of(&self.scratch), size_of(&stall.console))
+                }
+                _ => false,
+            };
+            if Instant::now() >= deadline || stop.requested() || stalled {
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -221,6 +269,22 @@ pub fn make_key(path: &Path) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_is_stalled_only_when_it_and_the_console_are_both_still() {
+        let stall = Stall { after: Duration::from_secs(180), console: "serial-1.log".into() };
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut quiet = Quiet::new(&stall, start);
+        assert!(!quiet.stalled(at(100), 0, 0));
+        // The command prints a line, which restarts the count.
+        assert!(!quiet.stalled(at(150), 10, 0));
+        assert!(!quiet.stalled(at(320), 10, 0));
+        // The console gains a line.
+        assert!(!quiet.stalled(at(330), 10, 55));
+        assert!(!quiet.stalled(at(500), 10, 55));
+        assert!(quiet.stalled(at(510), 10, 55));
+    }
 
     #[test]
     fn ignores_the_users_own_ssh_setup() {

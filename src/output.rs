@@ -62,6 +62,9 @@ pub enum Event<'a> {
         result: Outcome,
         milliseconds: u64,
         note: Option<&'a str>,
+        /// The lab PC's load per CPU as the step ended (see load.rs).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lab_pc_load: Option<f64>,
     },
     /// A step waits for a person to do it on the machine; `done` is the
     /// command that says it is done, which the runner page's Done button
@@ -265,11 +268,13 @@ mod tests {
             result: Outcome::Pass,
             milliseconds: 5,
             note: Some(short_note(&note)),
+            lab_pc_load: Some(0.31),
         });
         let text = std::fs::read_to_string(&path).unwrap();
         let line: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(line["event"], "step-ended");
         assert_eq!(line["note"].as_str().unwrap().len(), 1998, "cut at a character's start");
+        assert_eq!(line["lab_pc_load"], 0.31);
         assert!(line["at"].as_str().unwrap().ends_with('Z'));
     }
 }

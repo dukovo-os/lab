@@ -122,6 +122,27 @@ pub fn load_categories(dir: &Path) -> Result<Vec<Category>, Error> {
 /// The longest a test may take: a soak test runs overnight, not longer.
 const LONGEST_TEST: Duration = Duration::from_secs(24 * 3600);
 
+/// How long a wait for console text may be silent before it ends as
+/// stalled, unless the test says otherwise: text that has not come while
+/// the console showed no new line is not coming, and waiting out the
+/// test's limit costs its whole time.
+pub const STALL_TIME: Duration = Duration::from_secs(3 * 60);
+
+/// How long a `run` step may be silent before it ends as stalled, unless
+/// the test says otherwise. Longer than [`STALL_TIME`]: a suite piped
+/// through `tail` prints only at its end, and the longest such step that
+/// passed in the lab's runs (services/python) took 4 minutes; a soak that
+/// is quiet for its whole length sets `stall = "off"`.
+pub const RUN_STALL_TIME: Duration = Duration::from_secs(10 * 60);
+
+/// What a test or step says about stalling: how long it may be silent, or
+/// that it is quiet by nature and never stalls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stall {
+    After(Duration),
+    Off,
+}
+
 /// One test.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Test {
@@ -147,6 +168,9 @@ pub struct Test {
     /// The virtual machine's devices the test needs, which its boot gives
     /// the machine: [`Control::GuestAgent`] and [`Control::VirtioScsi`].
     pub hardware: Vec<Control>,
+    /// How long its `run` and `serial` steps may be silent, when the test
+    /// says; [`STALL_TIME`] otherwise.
+    pub stall: Option<Stall>,
 }
 
 /// The card reader a test's memory cards go in.
@@ -222,6 +246,8 @@ pub enum Step {
     Serial {
         text: String,
         early: bool,
+        /// How long the console may stay silent, when the step says.
+        stall: Option<Stall>,
     },
     Power(PowerAction),
     /// Plugs the network cable in (`true`) or pulls it (`false`).
@@ -503,6 +529,9 @@ pub struct Command {
     /// command does not end or print as the step says: a check that the
     /// machine is of the kind the test needs.
     pub or_skip: Option<String>,
+    /// How long a `run` step's command and the console may both stay
+    /// silent, when the step says.
+    pub stall: Option<Stall>,
 }
 
 /// What a `power` step does.
@@ -553,14 +582,31 @@ impl Step {
         }
     }
 
+    /// How long this step may be silent before it ends as stalled, in
+    /// `test`, or none when it never stalls. Only a `run` step and a wait
+    /// for console text can: the rest are quiet by design (a wait, a
+    /// person's step, a benchmark, a boot, a browser) or watch something
+    /// else (the screen, the lab PC).
+    pub fn stall_limit(&self, test: &Test) -> Option<Duration> {
+        let (own, default) = match self {
+            Step::Run(command) => (command.stall, RUN_STALL_TIME),
+            Step::Serial { stall, .. } => (*stall, STALL_TIME),
+            _ => return None,
+        };
+        match own.or(test.stall).unwrap_or(Stall::After(default)) {
+            Stall::After(time) => Some(time),
+            Stall::Off => None,
+        }
+    }
+
     /// The step in a few words, for `show` and the logs.
     pub fn describe(&self) -> String {
         match self {
             Step::Run(command) => describe_command(command),
-            Step::Serial { text, early: false } => {
+            Step::Serial { text, early: false, .. } => {
                 format!("wait for \"{text}\" on the serial console")
             }
-            Step::Serial { text, early: true } => {
+            Step::Serial { text, early: true, .. } => {
                 format!("wait for \"{text}\" on the console from the power-on")
             }
             Step::Power(action) => match action {
@@ -835,6 +881,7 @@ struct TestFile {
     cf: Option<String>,
     #[serde(default)]
     hardware: Vec<String>,
+    stall: Option<String>,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
@@ -873,6 +920,7 @@ struct StepFile {
     expect_not: Option<OneOrMore>,
     serial: Option<String>,
     early: Option<bool>,
+    stall: Option<String>,
     power: Option<PowerAction>,
     link: Option<LinkState>,
     usb: Option<UsbAction>,
@@ -1070,6 +1118,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
             }
         },
     };
+    let stall = file.stall.as_deref().map(parse_stall).transpose().map_err(bad)?;
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut steps = Vec::new();
     for (index, step) in file.steps.into_iter().enumerate() {
@@ -1159,7 +1208,21 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         host_needs: file.host_needs,
         cf,
         hardware,
+        stall,
     })
+}
+
+/// Reads a `stall` setting: `"off"`, or a length of time.
+fn parse_stall(text: &str) -> Result<Stall, String> {
+    if text == "off" {
+        return Ok(Stall::Off);
+    }
+    match parse_duration(text) {
+        Ok(time) if !time.is_zero() => Ok(Stall::After(time)),
+        _ => Err(format!(
+            "stall = \"{text}\": \"off\", or a length of time more than 0s, such as \"10m\""
+        )),
+    }
 }
 
 /// Turns a step as written into a [`Step`], checking that it has exactly
@@ -1246,6 +1309,10 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         return Err(format!("input holds at most {} KiB", INPUT_MAX / 1024));
     }
     only_with("early", step.early.is_some(), "serial")?;
+    if step.stall.is_some() && !matches!(given[0], "run" | "serial") {
+        return Err("stall goes only with run or serial".into());
+    }
+    let stall = step.stall.as_deref().map(parse_stall).transpose()?;
     only_with("background", step.background.is_some(), "host")?;
     if step.ready.is_some() && !background {
         return Err("ready goes only with host and background = true".into());
@@ -1272,6 +1339,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         root: step.root.unwrap_or(false),
         input: step.input.clone(),
         or_skip: step.or_skip.clone(),
+        stall,
     };
     if let Some(text) = step.run.clone() {
         if text.trim().is_empty() {
@@ -1321,7 +1389,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         if text.is_empty() {
             return Err("serial needs the text to wait for".into());
         }
-        return Ok(Step::Serial { text, early: step.early.unwrap_or(false) });
+        return Ok(Step::Serial { text, early: step.early.unwrap_or(false), stall });
     }
     if let Some(action) = step.power {
         return Ok(Step::Power(action));
@@ -1841,7 +1909,10 @@ expect = "1 received"
         assert_eq!(test.time, Duration::from_secs(180));
         assert!(!test.fresh);
         assert_eq!(test.steps[0], Step::Link(false));
-        assert_eq!(test.steps[1], Step::Serial { text: "link down".into(), early: false });
+        assert_eq!(
+            test.steps[1],
+            Step::Serial { text: "link down".into(), early: false, stall: None }
+        );
         assert_eq!(
             test.steps[3],
             Step::Run(Command {
@@ -1852,6 +1923,7 @@ expect = "1 received"
                 root: false,
                 input: None,
                 or_skip: None,
+                stall: None,
             })
         );
         let controls: Vec<Control> = test.controls().into_iter().collect();
@@ -2380,6 +2452,44 @@ expect = "1 received"
     }
 
     #[test]
+    fn only_run_and_serial_steps_can_stall_and_a_test_or_step_sets_how_long() {
+        let dir = TempDir::new("suite-stall");
+        dir.write(
+            "boot/quiet.toml",
+            "about = \"x\"\ntime = \"1h\"\nstall = \"10m\"\n\
+             [[step]]\nrun = \"true\"\n[[step]]\nrun = \"true\"\nstall = \"off\"\n\
+             [[step]]\nserial = \"done\"\nstall = \"30s\"\n[[step]]\nwait = \"5m\"\n\
+             [[step]]\nhost = \"true\"\n[[step]]\nwait = \"ready\"\n",
+        );
+        dir.write("boot/plain.toml", "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n");
+        let tests = load(dir.path()).unwrap();
+        let (plain, quiet) = (&tests[0], &tests[1]);
+        assert_eq!(plain.steps[0].stall_limit(plain), Some(RUN_STALL_TIME));
+        let limits: Vec<Option<Duration>> =
+            quiet.steps.iter().map(|step| step.stall_limit(quiet)).collect();
+        let seconds = |seconds| Some(Duration::from_secs(seconds));
+        assert_eq!(limits, [seconds(600), None, seconds(30), None, None, None]);
+    }
+
+    #[test]
+    fn a_stall_is_off_or_a_length_of_time_and_goes_with_run_or_serial() {
+        let dir = TempDir::new("suite-stall-bad");
+        let load_with = |text: &str| {
+            dir.write("boot/x.toml", &format!("about = \"x\"\ntime = \"1m\"\n{text}"));
+            match load(dir.path()) {
+                Err(Error::Usage(why)) => why,
+                _ => String::new(),
+            }
+        };
+        let why = load_with("stall = \"soon\"\n[[step]]\nrun = \"true\"\n");
+        assert!(why.contains("stall = \"soon\": \"off\", or a length of time"), "{why}");
+        let why = load_with("[[step]]\nrun = \"true\"\nstall = \"0s\"\n");
+        assert!(why.contains("step 1: stall = \"0s\""), "{why}");
+        let why = load_with("[[step]]\nwait = \"5s\"\nstall = \"1m\"\n");
+        assert!(why.contains("stall goes only with run or serial"), "{why}");
+    }
+
+    #[test]
     fn reads_an_or_skip_step() {
         let dir = TempDir::new("suite-or-skip");
         dir.write(
@@ -2417,6 +2527,7 @@ expect = "1 received"
                 root: false,
                 input: None,
                 or_skip: None,
+                stall: None,
             })
         );
         assert_eq!(
@@ -2580,7 +2691,10 @@ expect = "1 received"
         );
         let tests = load(dir.path()).unwrap();
         let (early, late) = (&tests[0], &tests[1]);
-        assert_eq!(early.steps[0], Step::Serial { text: "GNU GRUB".into(), early: true });
+        assert_eq!(
+            early.steps[0],
+            Step::Serial { text: "GNU GRUB".into(), early: true, stall: None }
+        );
         assert!(early.controls().contains(&Control::EarlyConsole));
         assert!(!late.controls().contains(&Control::EarlyConsole));
         // QEMU and AMT have it; a plug machine's netlog console starts with

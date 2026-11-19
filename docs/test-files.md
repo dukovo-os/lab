@@ -40,6 +40,7 @@ expect_not = "NO-CARRIER"
 | `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
 | `cf` | no | A CompactFlash card in an IDE adapter for the test to format, of this size, from `1M` to `128G`: see [CompactFlash tests](#compactflash-tests). |
 | `hardware` | no | A virtual machine's devices the test needs, which its boot gives the machine: `guest-agent` (a QEMU guest agent channel, whose host end a host step reaches as `{guest-agent}`) and `virtio-scsi` (a blank 1 GiB disk on a virtio SCSI adapter). The test boots afresh with them and its boot is not shared. A machine that cannot give them, as a real one, skips the test. |
+| `stall` | no | How long a `run` step or a wait for console text may be silent before it ends as stalled: a length of time as `time` is written, or `"off"`. Three minutes by default. See [Steps that go silent](#steps-that-go-silent). |
 | `[[step]]` | at least one | The steps, in order. |
 
 ## Categories
@@ -104,6 +105,42 @@ Each step has exactly one action key, and only the options that go with it.
 | `wait = "<time>"` | | Waits that long. | |
 
 Every test also needs `power` and `serial`, for the boot it starts with.
+
+## Steps that go silent
+
+A `run` step whose command prints nothing, while the machine's console
+shows no new line either, is hung more often than at work. Rather than
+wait out the test's time limit, the step ends as failed after the stall
+time, ten minutes unless the test says otherwise (a suite piped through
+`tail` prints only at its end), with a reason that starts `stalled: no
+output for 10 min`. It then names the console's last line and shows what
+the command had printed, so the hang can be found. A `serial` step stalls
+the same way when the console shows no new line for three minutes while
+it waits for its text. A stall is a failure of the test,
+as a hang is Dukovo's.
+
+A step that is quiet by nature takes a longer time, or turns the check
+off, with `stall` on the test or on the step; a step's own `stall` wins
+over the test's:
+
+```toml
+about = "A long job that prints only when it ends"
+time = "30m"
+stall = "10m"            # every run and serial step of this test
+
+[[step]]
+run = "sh -c 'sleep 900; echo done'"
+stall = "off"            # this one never stalls
+```
+
+`stall` goes only with `run` and `serial`. These steps never stall, as
+they are quiet by design or watch something else: `wait` (a time, `"ready"` or
+`"off"`), a boot (a fresh boot, the install stick or DVD, the Linux twin),
+`bench`, `power`, `link`, the media steps, `keys`, `type`, `point`,
+`click`, the steps that read the screen, a step a person does, and the
+steps that run on the lab PC or the attacker (`host`, `attack`,
+`browser`). The command that grows the root, sets the clock and checks the
+machine's health after a fresh boot is not a step, and never stalls.
 
 ## Running as root
 
@@ -252,6 +289,13 @@ rows = ["posix_fork_wait", "posix_fork_exec_wait"]
 - A failing step names the rows over their limit and shows the table of
   both systems' times; the Linux boot's console is kept in the bundle as
   `logs/<machine>/linux-boot-<n>.log`.
+- Each step's record notes the lab PC's load (`lab_pc_load` in
+  results.json, see [Commands](commands.md#results-bundles)). A bench or
+  browser step that ends while the lab PC is busy, more than 0.75 of its
+  CPUs' time over the last minute, says so in its note and the test's
+  log: "the lab PC was busy (load 0.92 per CPU), so this step's times may
+  be slow". The result is not changed, but a slow run can be told from a
+  slow Dukovo.
 - Numbers from an emulator mean little, so on QEMU without KVM a bench
   step still runs and keeps both tables, then is skipped rather than
   passed or failed.
@@ -461,7 +505,9 @@ The step fails when any engine failed, and says why with a line for each,
 `<engine>: <message>`. When every engine was skipped the step is skipped.
 Otherwise it passes, and its note says what ran: `passed in chromium;
 skipped firefox (firefox is not in the browser kit), webkit (...)`. The
-test's log shows each engine's output below the note.
+test's log shows each engine's output below the note. A browser step that
+ends while the lab PC is busy adds a line to its note, as a bench step does
+(see [Performance tests](#performance-tests)).
 
 A run given no kit (no `--browsers`) skips the step, as does a lab PC with
 no `node`: the runner needs Node.js 22 or later. A machine whose driver
@@ -746,10 +792,13 @@ Floppy drive tests live under `lab/tests/storage/` too.
    off, the machine boots from a clean disk holding the image under test
    and the runner waits until it is ready: the machine's ready line (by
    default `Boot complete.`) on the serial console, then SSH answering.
-   That boot counts as the test's first step.
+   That boot counts as the test's first step. A real machine's root is
+   grown, its clock set and its health checked before the test's first
+   step (see [Real machines](real-machines.md#the-health-check)).
 2. The steps run in order. The first that fails ends the test; when the
    machine can take screenshots, the screen is kept as
-   `<category>-<test>-at-failure.png`.
+   `<category>-<test>-at-failure.png`. A `run` or `serial` step that goes
+   silent fails as stalled instead of waiting out the time limit.
 3. The test passes when every step passed within its time limit.
 
 A test that needs a control the machine does not have is skipped there.

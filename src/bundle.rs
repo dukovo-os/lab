@@ -174,6 +174,12 @@ pub struct StepRecord {
     pub milliseconds: u64,
     /// What went wrong, or what the step saw.
     pub note: Option<String>,
+    /// The lab PC's one-minute load average per CPU when the step ended,
+    /// which a slow browser or performance step is read against. Absent
+    /// where the lab PC has no `/proc/loadavg`, and in runs from before it
+    /// was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lab_pc_load: Option<f64>,
 }
 
 /// A bundle being written.

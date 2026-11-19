@@ -397,6 +397,7 @@ fn results_from_events(run: &RunRecord, events: &[Value]) -> Vec<ResultRecord> {
                         result,
                         milliseconds: event["milliseconds"].as_u64().unwrap_or(0),
                         note: event["note"].as_str().map(String::from),
+                        lab_pc_load: event["lab_pc_load"].as_f64(),
                     });
                 }
             }

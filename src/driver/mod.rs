@@ -79,6 +79,13 @@ pub trait Driver: Send {
         false
     }
 
+    /// Whether the runner checks the machine's health after each fresh
+    /// boot ([`crate::health`]): a real machine keeps what a test left it,
+    /// and a bad setup there fails every test after it.
+    fn checks_health(&self) -> bool {
+        false
+    }
+
     /// Writes a line to the driver's own log, when it keeps one.
     fn note(&mut self, _line: &str) {}
 
@@ -219,14 +226,15 @@ pub trait Driver: Send {
 
     /// Runs `command` on the machine as the lab account, with `input` as
     /// its standard input (none: empty), stopping it at `deadline`, or
-    /// sooner when the run is stopped (the output's status is then none).
-    /// Fails when there is no way to run it: the machine is off, or the
-    /// lab has no key.
+    /// sooner when the run is stopped or `stall` says it has gone quiet
+    /// (the output's status is then none). Fails when there is no way to
+    /// run it: the machine is off, or the lab has no key.
     fn run_command(
         &mut self,
         command: &str,
         input: Option<&str>,
         deadline: Instant,
+        stall: Option<&ssh::Stall>,
     ) -> Result<ssh::Output, String>;
 
     /// Says whether the next [`Driver::boot_fresh`] gives the machine a

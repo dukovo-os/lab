@@ -405,6 +405,10 @@ impl Driver for PlugDriver {
         true
     }
 
+    fn checks_health(&self) -> bool {
+        true
+    }
+
     /// Writes a line to plug.log, with the seconds since the driver began.
     fn note(&mut self, line: &str) {
         self.netboot.note(line);
@@ -451,12 +455,13 @@ impl Driver for PlugDriver {
         command: &str,
         input: Option<&str>,
         deadline: Instant,
+        stall: Option<&ssh::Stall>,
     ) -> Result<ssh::Output, String> {
         let target = ssh_target(&self.setup, &self.settings.machine_address, self.boot)?;
         if !self.is_on() {
             return Err("the machine is off".into());
         }
-        target.run(command, input, deadline, &self.setup.stop)
+        target.run(command, input, deadline, &self.setup.stop, stall)
     }
 
     fn peer_address(&self) -> Option<String> {
@@ -774,7 +779,7 @@ mod tests {
         assert!(bench.driver.screen_dump(Path::new("x.ppm")).unwrap_err().contains("no screen"));
         let err = bench.driver.set_link(false).unwrap_err();
         assert!(err.contains("the plug driver cannot plug or pull the network cable"), "{err}");
-        let err = bench.driver.run_command("true", None, soon()).unwrap_err();
+        let err = bench.driver.run_command("true", None, soon(), None).unwrap_err();
         assert!(err.contains("the lab has no key"), "{err}");
     }
 

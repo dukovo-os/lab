@@ -1563,6 +1563,7 @@ impl Driver for Qemu {
         command: &str,
         input: Option<&str>,
         deadline: Instant,
+        stall: Option<&ssh::Stall>,
     ) -> Result<ssh::Output, String> {
         let key = self
             .setup
@@ -1579,7 +1580,7 @@ impl Driver for Qemu {
             known_hosts: self.setup.work.join(format!("known_hosts-{}", self.boot)),
             scratch: self.setup.work.join("ssh-output"),
         };
-        target.run(command, input, deadline, &self.setup.stop)
+        target.run(command, input, deadline, &self.setup.stop, stall)
     }
 
     fn want_attacker(&mut self, yes: bool) {
@@ -1661,7 +1662,7 @@ impl Driver for Qemu {
                 ));
             }
             let soon = (Instant::now() + Duration::from_secs(5)).min(deadline);
-            if let Ok(output) = target.run("true", None, soon, &self.setup.stop)
+            if let Ok(output) = target.run("true", None, soon, &self.setup.stop, None)
                 && output.status == Some(0)
             {
                 return Ok(());
@@ -1691,7 +1692,7 @@ impl Driver for Qemu {
             attacker.ssh_port
         };
         let target = self.attacker_target(ssh_port, key);
-        target.run(command, input, deadline, &self.setup.stop)
+        target.run(command, input, deadline, &self.setup.stop, None)
     }
 
     fn peer_address(&self) -> Option<String> {
@@ -1908,7 +1909,7 @@ mod tests {
         qemu.click(Button::Left).unwrap();
         qemu.click(Button::Right).unwrap();
 
-        let error = qemu.run_command("true", None, soon()).unwrap_err();
+        let error = qemu.run_command("true", None, soon(), None).unwrap_err();
         assert!(error.contains("no key"), "{error}");
 
         qemu.power(PowerAction::Reset, soon()).unwrap();

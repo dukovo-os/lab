@@ -58,6 +58,11 @@ struct FakeMachine {
     /// Whether it asks for its clock to be set after a fresh boot, as a
     /// real machine's driver does; the machine named `clocked` does.
     sets_clock: bool,
+    /// The machine's name, which says how its health check answers: the
+    /// machines named `checked...` have one. `checked` is healthy,
+    /// `checked-once` has a full root on its first boot only, and
+    /// `checked-bad` has a clock 41 seconds ahead of the lab PC's.
+    name: String,
 }
 
 /// The characters the fake console draws, in the test font.
@@ -194,6 +199,10 @@ impl Driver for FakeMachine {
 
     fn sets_clock(&self) -> bool {
         self.sets_clock
+    }
+
+    fn checks_health(&self) -> bool {
+        self.name.starts_with("checked")
     }
 
     /// Keeps the driver's lines in a log of its own, as a real driver's.
@@ -340,6 +349,7 @@ impl Driver for FakeMachine {
         command: &str,
         input: Option<&str>,
         deadline: Instant,
+        stall: Option<&crate::ssh::Stall>,
     ) -> Result<Output, String> {
         self.note(&format!("ran {command}"));
         let (status, text) = match command {
@@ -395,11 +405,37 @@ impl Driver for FakeMachine {
             },
             // A fault in the lab itself, not in the machine under test.
             "panic" => panic!("the fake machine broke"),
-            "hang" => {
+            // Prints nothing until the time limit, or until the stall ends
+            // it; `chatter` also keeps the console scrolling meanwhile.
+            "hang" | "chatter" => {
+                let mut quiet = stall.map(|stall| crate::ssh::Quiet::new(stall, Instant::now()));
                 while Instant::now() < deadline && !self.stop.requested() {
+                    if command == "chatter" {
+                        self.say("tick");
+                    }
+                    if let (Some(quiet), Some(stall)) = (&mut quiet, stall)
+                        && quiet.stalled(Instant::now(), 0, crate::ssh::size_of(&stall.console))
+                    {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 (None, String::new())
+            }
+            // The health check: the root's free space and the clock.
+            cmd if cmd == crate::health::COMMAND => {
+                let free = if self.name == "checked-once" && self.boot == 1 {
+                    300 * 1024
+                } else {
+                    6_000_000
+                };
+                let ahead = if self.name == "checked-bad" { 41 } else { 0 };
+                let clock = crate::clock::Utc::now().seconds() + ahead;
+                let text = format!(
+                    "Filesystem 1K-blocks Used Available Use% Mounted on\n\
+                     /dev/sda2 7000000 1000000 {free} 15% /\nclock={clock}\n"
+                );
+                (Some(0), text)
             }
             other => (Some(127), format!("{other}: not found\n")),
         };
@@ -516,9 +552,10 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         stick: None,
         jammed: machine.name == "jammed",
         real: machine.name == "real",
-        grows_root: machine.name.starts_with("grows"),
+        grows_root: machine.name.starts_with("grows") || machine.name.starts_with("checked"),
         grow_fails: machine.name == "grows-badly",
         sets_clock: machine.name == "clocked",
+        name: machine.name.clone(),
     }))
 }
 
@@ -1930,4 +1967,177 @@ fn run_with_password(setting: &Setting, machines: Vec<&Machine>) -> (Done, Vec<R
     let results: crate::bundle::ResultsFile =
         serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
     (Done { summary: ended.summary, bundle }, results.results)
+}
+
+/// Three tests that each boot afresh, so each meets the health check.
+const FRESH_TESTS: &[(&str, &str)] = &[
+    (
+        "boot/a.toml",
+        "about = \"a\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    ),
+    (
+        "boot/b.toml",
+        "about = \"b\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    ),
+    (
+        "boot/c.toml",
+        "about = \"c\"\ntime = \"1m\"\nfresh = true\n[[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+    ),
+];
+
+fn named(setting: &Setting, name: &str) -> Machine {
+    let mut machine = setting.qemu.clone();
+    machine.name = name.into();
+    machine
+}
+
+#[test]
+fn a_healthy_machine_passes_its_health_check_and_the_log_says_so() {
+    let setting = setting_with(&FRESH_TESTS[..1]);
+    let checked = named(&setting, "checked");
+    let (done, results) = run_with_password(&setting, vec![&checked, &setting.qemu]);
+    assert_eq!(done.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
+    let log = log_of(&done, results.iter().find(|result| result.machine == "checked").unwrap());
+    let line = log.lines().find(|line| line.starts_with("Health check")).expect(&log);
+    assert!(
+        line.starts_with("Health check after boot 1: root 5859 MiB free; clock ")
+            && line.ends_with("s off the lab PC's: ok"),
+        "{line}"
+    );
+    // A machine whose driver does not check never gets the command.
+    let qemu = results.iter().find(|result| result.machine == "qemu").unwrap();
+    assert!(!log_of(&done, qemu).contains("Health check"));
+}
+
+#[test]
+fn a_failed_health_check_is_a_lab_error_and_the_next_fresh_boot_is_tried() {
+    let setting = setting_with(FRESH_TESTS);
+    let checked = named(&setting, "checked-once");
+    let (done, results) = run_with_password(&setting, vec![&checked]);
+    assert_eq!(done.summary, Summary { passed: 2, failed: 0, skipped: 0, errors: 1 });
+    assert_eq!(
+        outcomes(&results, "checked-once"),
+        [
+            ("boot/a".into(), Outcome::Error, Some(1)),
+            ("boot/b".into(), Outcome::Pass, Some(2)),
+            ("boot/c".into(), Outcome::Pass, Some(3)),
+        ]
+    );
+    let why = results[0].reason.as_deref().unwrap();
+    assert!(
+        why.starts_with(
+            "health check failed after the fresh boot: root has 300 MiB free, \
+             under the 1024 MiB needed. "
+        ) && why.contains("`storage grow`"),
+        "{why}"
+    );
+    let log = log_of(&done, &results[0]);
+    assert!(log.contains("Health check after boot 1: root 300 MiB free;"), "{log}");
+    assert!(log.contains("FAILED"), "{log}");
+    assert!(!log.contains("benched"), "{log}");
+}
+
+#[test]
+fn a_machine_that_fails_two_fresh_boots_in_a_row_is_benched_and_the_others_carry_on() {
+    let setting = setting_with(FRESH_TESTS);
+    let bad = named(&setting, "checked-bad");
+    let (done, results) = run_with_password(&setting, vec![&bad, &setting.qemu]);
+    assert_eq!(done.summary, Summary { passed: 3, failed: 0, skipped: 1, errors: 2 });
+    let bad_results: Vec<&ResultRecord> =
+        results.iter().filter(|result| result.machine == "checked-bad").collect();
+    assert_eq!(bad_results[0].result, Outcome::Error);
+    assert_eq!(bad_results[1].result, Outcome::Error);
+    let why = bad_results[0].reason.as_deref().unwrap();
+    assert!(
+        why.contains("clock 4") && why.contains("s off the lab PC's, over the 5 s allowed"),
+        "{why}"
+    );
+    assert!(why.contains("`timedatectl set-time`"), "{why}");
+    let benched = bad_results[2];
+    assert_eq!(benched.result, Outcome::Skip);
+    assert_eq!(benched.boot, None);
+    let reason = benched.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("checked-bad was benched: its health check failed twice (clock 4")
+            && reason.ends_with("s off the lab PC's, over the 5 s allowed)"),
+        "{reason}"
+    );
+    assert!(
+        log_of(&done, bad_results[1]).contains("checked-bad is benched for the rest of the run.")
+    );
+    assert_eq!(
+        outcomes(&results, "qemu").iter().map(|(_, outcome, _)| *outcome).collect::<Vec<_>>(),
+        [Outcome::Pass; 3]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn each_step_records_the_lab_pc_s_load() {
+    let setting = setting_with(&FRESH_TESTS[..1]);
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    assert!(!results[0].steps.is_empty());
+    assert!(results[0].steps.iter().all(|step| step.lab_pc_load.is_some()), "{:?}", results[0]);
+}
+
+/// A test whose one step is `step`, under `header`'s keys.
+fn stall_test(header: &str, step: &str) -> Setting {
+    setting_with(&[(
+        "stress/quiet.toml",
+        &format!("about = \"quiet\"\n{header}[[step]]\n{step}\n"),
+    )])
+}
+
+#[test]
+fn a_command_that_goes_silent_ends_as_stalled_and_fails_the_test() {
+    let setting = stall_test("time = \"1m\"\nstall = \"1s\"\n", "run = \"hang\"");
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    let result = &results[0];
+    assert_eq!(result.result, Outcome::Fail);
+    assert!(result.milliseconds < 20_000, "{} ms", result.milliseconds);
+    let reason = result.reason.as_deref().unwrap();
+    assert!(
+        reason.starts_with("step 1: stalled: no output for 1 s\nthe last console line was \"")
+            && reason.contains("$ hang"),
+        "{reason}"
+    );
+    // The same hang is one finding, whatever the console's last line was.
+    assert_eq!(crate::findings::signature(reason), "step 1: stalled: no output for 1 s");
+}
+
+#[test]
+fn a_command_is_not_stalled_while_the_console_scrolls() {
+    let setting = stall_test("time = \"2s\"\nstall = \"1s\"\n", "run = \"chatter\"");
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    let reason = results[0].reason.as_deref().unwrap();
+    assert!(reason.contains("it was still running at the test's time limit"), "{reason}");
+    assert!(!reason.contains("stalled"), "{reason}");
+}
+
+#[test]
+fn a_wait_for_console_text_that_never_comes_ends_as_stalled() {
+    let setting = stall_test("time = \"1m\"\nstall = \"1s\"\n", "serial = \"never printed\"");
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(results[0].result, Outcome::Fail);
+    let reason = results[0].reason.as_deref().unwrap();
+    assert!(reason.starts_with("step 1: stalled: no output for 1 s\n"), "{reason}");
+    assert!(reason.contains("waiting for \"never printed\""), "{reason}");
+}
+
+#[test]
+fn stall_off_and_steps_quiet_by_design_are_never_cut() {
+    // A wait is quiet by design, whatever the test's stall.
+    let setting = stall_test("time = \"1m\"\nstall = \"1s\"\n", "wait = \"2s\"");
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(results[0].result, Outcome::Pass, "{:?}", results[0].reason);
+    // `stall = "off"` waits out the time limit.
+    let setting = stall_test("time = \"3s\"\nstall = \"off\"\n", "run = \"hang\"");
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    let reason = results[0].reason.as_deref().unwrap();
+    assert!(reason.contains("still running at the test's time limit"), "{reason}");
+    // A step's own stall wins over the test's.
+    let setting = stall_test("time = \"1m\"\nstall = \"off\"\n", "run = \"hang\"\nstall = \"1s\"");
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    let reason = results[0].reason.as_deref().unwrap();
+    assert!(reason.starts_with("step 1: stalled: no output for 1 s"), "{reason}");
 }
