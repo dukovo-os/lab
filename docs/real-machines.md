@@ -7,9 +7,9 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 
 The lab runs the same tests on real machines as on QEMU, through the
 `amt` driver: Intel AMT turns the machine on and off, picks its next
-boot, brings its serial console to the lab PC over Serial-over-LAN, and
-shows its screen and works its keyboard and mouse; a net boot writes the
-image under test to its disk before each fresh boot, and the lab network
+boot, and shows its screen and works its keyboard and mouse; a serial
+cable brings its console to the lab PC; a net boot writes the image
+under test to its disk before each fresh boot, and the lab network
 carries SSH and the lab PC's side of a test.
 
 A machine with neither AMT nor a serial port runs through the `plug`
@@ -21,10 +21,11 @@ it says of net boot, the lab network and the lab PC holds for both.
 ## What a machine needs
 
 - Intel AMT (a vPro machine), with its network port on the lab network.
-  AMT's Serial-over-LAN is the machine's serial console: no cable. A
-  serial cable from a port of the machine's to one of the lab PC's
-  still works, for a machine whose AMT cannot do Serial-over-LAN (see
-  [The serial console](#the-serial-console)).
+- A serial cable from a port of the machine's to one of the lab PC's,
+  for its console. AMT's Serial-over-LAN can carry the console with no
+  cable, but the disk writer's download stalls while a session is open
+  (see [The serial console](#the-serial-console)), so a machine with a
+  serial port keeps its cable.
 - A disk the lab may overwrite: every fresh boot writes the image over
   it.
 - For tests that use the screen, keyboard or mouse: the picture on the
@@ -79,11 +80,11 @@ and needs the lab card's address.
 2. Make sure dnsmasq is there: `sudo apt install dnsmasq-base`.
    NetworkManager brings it on Mint, Ubuntu and Debian; the `dnsmasq`
    package's own service is not needed.
-3. For a machine on a serial cable only: let the lab's user read the
-   serial port, then sign in again: `sudo usermod -aG dialout $USER`.
+3. Let the lab's user read the serial cable's port, then sign in
+   again: `sudo usermod -aG dialout $USER`.
 4. Copy [machines/optiplex.toml](../machines/optiplex.toml) to
-   `~/.config/dukovo-lab/machines/`, and put in the MAC address and the
-   disk's serial number.
+   `~/.config/dukovo-lab/machines/`, and put in the MAC address, the
+   disk's serial number and the serial cable's port.
 5. Put AMT's password in a file of its own beside it, which only you can
    read:
 
@@ -139,6 +140,19 @@ you steps, with those controls set to `person` in the machine file.
 
 ### The serial console
 
+A machine file that names a `serial` port has its console read from
+that cable, and Serial-over-LAN is left as it is. That is how the lab's
+machines run: on the lab's OptiPlex 7040 (AMT 11.8, an I219-LM network
+port), the disk writer's download stalled at 40 to 50% of the image in
+every boot of the first run with Serial-over-LAN open, and never
+finished, where the same write over the cable takes 14 seconds. As its
+network driver starts, the writer's Linux says `Reset blocked by ME`:
+while a Serial-over-LAN session is open, AMT keeps the network port's
+PHY from being reset. Whether that is the cause is not known yet. A
+machine file with no `serial` port reads the console over
+Serial-over-LAN, as follows: for a machine with no serial port of its
+own, once the stall is solved.
+
 AMT's management engine shows the system a serial port of its own, at
 PCI 00:16.3 on Intel boards, and hands what the system writes there to
 one console on the network at a time, on AMT's port 16994. With no
@@ -154,12 +168,10 @@ its menu there too (`pci,00:16.3`), as the install stick's menu does.
 The session is AMT's one: while the lab has it, a person's terminal
 (MeshCommander, `amtterm`) cannot open another, and while a person's
 is open, the run cannot start. AMT turns power changes down while a
-remote screen session is open; should it turn one down while
-Serial-over-LAN is open, the driver closes the session, asks again,
+remote screen session is open, and AMT 11.8 while a Serial-over-LAN
+session is open too: the driver then closes its session, asks again,
 and opens it once the change is made, and `amt.log` says so.
 
-A machine file that names a `serial` port has its console read from
-that cable instead, and Serial-over-LAN is left as it is.
 Booting the install stick or DVD, and the attacker, are not done on
 real machines yet; tests that need them are skipped there.
 
@@ -274,9 +286,9 @@ alone:
   machine's address by (`dhcp-host=<mac>,<machine_address>,<name>`), so
   give each machine its own `machine_address` as well.
 - `disk`: the serial number of its disk, from `lsblk -o NAME,SERIAL`.
-- `serial`, for a machine on a cable: its own serial cable's port, best
-  by its `/dev/serial/by-id/` name, as USB serial ports are renumbered
-  when cables move.
+- `serial`: its own serial cable's port, best by its
+  `/dev/serial/by-id/` name, as USB serial ports are renumbered when
+  cables move.
 - `boot_port`: the first of its four net-boot ports. Machines in one run
   need ports of their own, so each machine's is four more than the one
   before.
