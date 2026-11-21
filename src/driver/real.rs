@@ -16,7 +16,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::Setup;
@@ -56,10 +56,37 @@ impl LabSide<'_> {
 }
 
 /// A driver's log file, whose lines begin with the seconds since the
-/// driver did.
-struct DriverLog {
-    file: File,
+/// driver began. Clones write to the same file, each line whole, as the
+/// Serial-over-LAN reader of an AMT machine does from its own thread.
+#[derive(Clone)]
+pub struct DriverLog {
+    file: Arc<Mutex<File>>,
     started: Instant,
+}
+
+impl DriverLog {
+    /// Opens the log at `path`, adding to what it holds; the driver
+    /// begins now.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the file cannot be opened.
+    pub fn open(path: &Path) -> Result<DriverLog, String> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|err| format!("making {}: {err}", path.display()))?;
+        Ok(DriverLog { file: Arc::new(Mutex::new(file)), started: Instant::now() })
+    }
+
+    /// Writes `line`, after the seconds since the driver began.
+    pub fn note(&self, line: &str) {
+        let at = self.started.elapsed().as_secs_f64();
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        // A log that cannot be written must not fail the boot it describes.
+        let _ = writeln!(file, "{at:9.1}s {line}");
+    }
 }
 
 /// The lab PC's side of a real machine's net boots: the server that hands
@@ -92,17 +119,12 @@ impl NetBoot {
             format!("{err} (the writer's kit; `ob lab` installs it in {})", side.writer.display())
         })?;
         let server = Server::start(side.lab_ip()?, side.boot_port)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-            .map_err(|err| format!("making {}: {err}", log.display()))?;
         Ok(NetBoot {
             server,
             script: netboot::script_path(side.tftp, side.mac),
             writer,
             image: None,
-            log: DriverLog { file, started: Instant::now() },
+            log: DriverLog::open(log)?,
             event_copy: None,
         })
     }
@@ -110,9 +132,12 @@ impl NetBoot {
     /// Writes a line to the driver's log, with the seconds since the
     /// driver began.
     pub fn note(&mut self, line: &str) {
-        let at = self.log.started.elapsed().as_secs_f64();
-        // A log that cannot be written must not fail the boot it describes.
-        let _ = writeln!(self.log.file, "{at:9.1}s {line}");
+        self.log.note(line);
+    }
+
+    /// The driver's log, for a reader that notes from a thread of its own.
+    pub fn log(&self) -> DriverLog {
+        self.log.clone()
     }
 
     /// The ports the net-boot server listens on, for a line in the log.

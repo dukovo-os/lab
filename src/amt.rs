@@ -16,7 +16,8 @@
 //! `CIM_BootService.SetBootConfigRole` for a one-time boot from the
 //! network, and for the remote screen (KVM) on the standard VNC port,
 //! `IPS_KVMRedirectionSettingData`, `AMT_RedirectionService`'s listener and
-//! `CIM_KVMRedirectionSAP.RequestStateChange`.
+//! `CIM_KVMRedirectionSAP.RequestStateChange`; for Serial-over-LAN, which
+//! sol.rs reads, the listener and `AMT_RedirectionService.RequestStateChange`.
 
 use crate::wsman::{self, Client, Selector};
 
@@ -27,6 +28,11 @@ const AMT: &str = "http://intel.com/wbem/wscim/1/amt-schema/1";
 /// The keys of AMT's services, which a Put or a method names them by.
 const SERVICE_KEYS: [&str; 4] =
     ["CreationClassName", "Name", "SystemCreationClassName", "SystemName"];
+
+/// `AMT_RedirectionService`'s EnabledState with no redirection on; one
+/// more for each on: 1 storage (IDE-R), 2 Serial-over-LAN.
+const REDIRECTION_NONE: u32 = 32768;
+const REDIRECTION_SOL: u32 = 2;
 
 /// What the machine's power is to become.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +91,15 @@ pub struct RemoteScreen {
     /// Whether AMT asks someone at the machine for a code before each
     /// session: `IPS_OptInService`'s OptInRequired, 0 for never.
     pub consent: u32,
+}
+
+/// AMT's Serial-over-LAN, as `machines check` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SerialOverLan {
+    /// Whether it is on.
+    pub on: bool,
+    /// Whether AMT listens for redirection sessions at all.
+    pub listener: bool,
 }
 
 /// A password for AMT's remote screen, made afresh for each run: VNC's
@@ -247,18 +262,7 @@ impl Amt {
         self.client
             .put(&kvm, &selectors(&settings, &["InstanceID"]), &wsman::instance(&kvm, &settings))
             .map_err(|err| format!("turning on port 5900 for the remote screen: {err}"))?;
-        let redirection = format!("{AMT}/AMT_RedirectionService");
-        let mut service = self.instance(&redirection)?;
-        if value(&service, "ListenerEnabled") != Some("true") {
-            set(&mut service, "ListenerEnabled", "true");
-            self.client
-                .put(
-                    &redirection,
-                    &selectors(&service, &SERVICE_KEYS),
-                    &wsman::instance(&redirection, &service),
-                )
-                .map_err(|err| format!("turning on AMT's redirection listener: {err}"))?;
-        }
+        self.turn_on_listener()?;
         // KVM itself: 2 is on with a session, 6 on and waiting for one.
         let point = format!("{CIM}/CIM_KVMRedirectionSAP");
         let access = self.instance(&point)?;
@@ -277,6 +281,67 @@ impl Amt {
                 .map_err(|err| format!("turning on KVM: {err}"))?;
         }
         Ok(())
+    }
+
+    /// Whether Serial-over-LAN is on, and AMT's redirection listener.
+    pub fn serial_over_lan(&self) -> Result<SerialOverLan, String> {
+        let service = self.instance(&format!("{AMT}/AMT_RedirectionService"))?;
+        let state = redirection_state(&service)?;
+        Ok(SerialOverLan {
+            on: state & REDIRECTION_SOL != 0,
+            listener: value(&service, "ListenerEnabled") == Some("true"),
+        })
+    }
+
+    /// Turns Serial-over-LAN on, and the redirection listener every
+    /// remote session needs. What is on already is left as it is, storage
+    /// redirection too.
+    pub fn turn_on_serial_over_lan(&self) -> Result<(), String> {
+        self.turn_on_listener()?;
+        let redirection = format!("{AMT}/AMT_RedirectionService");
+        let service = self.instance(&redirection)?;
+        let state = redirection_state(&service)?;
+        if state & REDIRECTION_SOL != 0 {
+            return Ok(());
+        }
+        let arguments = format!(
+            "<h:RequestStateChange_INPUT xmlns:h=\"{redirection}\">\
+             <h:RequestedState>{}</h:RequestedState></h:RequestStateChange_INPUT>",
+            state | REDIRECTION_SOL
+        );
+        self.client
+            .invoke(
+                &redirection,
+                "RequestStateChange",
+                &selectors(&service, &SERVICE_KEYS),
+                &arguments,
+            )
+            .map(drop)
+            .map_err(|err| {
+                format!(
+                    "turning on Serial-over-LAN: {err} (if it stays off, turn SOL on in MEBx's \
+                     SOL/Storage Redirection, Ctrl+P as the machine starts)"
+                )
+            })
+    }
+
+    /// Turns on AMT's listener for redirection sessions, the remote
+    /// screen's and Serial-over-LAN's, unless it is on.
+    fn turn_on_listener(&self) -> Result<(), String> {
+        let redirection = format!("{AMT}/AMT_RedirectionService");
+        let mut service = self.instance(&redirection)?;
+        if value(&service, "ListenerEnabled") == Some("true") {
+            return Ok(());
+        }
+        set(&mut service, "ListenerEnabled", "true");
+        self.client
+            .put(
+                &redirection,
+                &selectors(&service, &SERVICE_KEYS),
+                &wsman::instance(&redirection, &service),
+            )
+            .map(drop)
+            .map_err(|err| format!("turning on AMT's redirection listener: {err}"))
     }
 
     /// The properties of the one instance of `class`.
@@ -298,6 +363,17 @@ impl Amt {
             .filter_map(|state| state.parse().ok())
             .collect())
     }
+}
+
+/// `AMT_RedirectionService`'s EnabledState.
+fn redirection_state(service: &[(String, String)]) -> Result<u32, String> {
+    let state =
+        value(service, "EnabledState").ok_or("AMT did not say which redirections are on")?;
+    state
+        .parse()
+        .ok()
+        .filter(|state| (REDIRECTION_NONE..=REDIRECTION_NONE + 3).contains(state))
+        .ok_or_else(|| format!("AMT gave the redirection state \"{state}\""))
 }
 
 /// AMT's power management service.
@@ -357,6 +433,9 @@ pub mod fake {
         /// Whether a remote screen session is open: AMT turns power
         /// changes down then, with ReturnValue 2.
         pub screen_busy: Option<Busy>,
+        /// AMT_RedirectionService's EnabledState: 32768, and 1 for storage
+        /// redirection, 2 for Serial-over-LAN.
+        pub redirection: u32,
         /// Whether AMT answers: when not, it hangs up on each request.
         pub answering: bool,
         /// How many of the next connections it hangs up on before an
@@ -423,6 +502,7 @@ pub mod fake {
                 calls: Vec::new(),
                 on_boot: None,
                 screen_busy: None,
+                redirection: 32769,
                 answering: true,
                 dropped_connections: 0,
                 off_after_on: 0,
@@ -564,11 +644,11 @@ pub mod fake {
             "Get" if class_name == "AMT_RedirectionService" => format!(
                 "<h:AMT_RedirectionService><h:CreationClassName>AMT_RedirectionService</h:CreationClassName>\
                  <h:ElementName>Intel(r) AMT Redirection Service</h:ElementName>\
-                 <h:EnabledState>32771</h:EnabledState><h:ListenerEnabled>{}</h:ListenerEnabled>\
+                 <h:EnabledState>{}</h:EnabledState><h:ListenerEnabled>{}</h:ListenerEnabled>\
                  <h:Name>Intel(r) AMT Redirection Service</h:Name>\
                  <h:SystemCreationClassName>CIM_ComputerSystem</h:SystemCreationClassName>\
                  <h:SystemName>Intel(r) AMT</h:SystemName></h:AMT_RedirectionService>",
-                state_now.screen.listener
+                state_now.redirection, state_now.screen.listener
             ),
             "Get" if class_name == "CIM_KVMRedirectionSAP" => format!(
                 "<h:CIM_KVMRedirectionSAP><h:CreationClassName>CIM_KVMRedirectionSAP</h:CreationClassName>\
@@ -595,6 +675,20 @@ pub mod fake {
                 state_now.screen.listener = wsman::text(&body, "ListenerEnabled").as_deref() == Some("true");
                 state_now.calls.push(format!("Put {class_name}"));
                 "<h:AMT_RedirectionService/>".into()
+            }
+            "RequestStateChange" if class_name == "AMT_RedirectionService"
+                && wsman::texts(&body, "Selector").len() == 4 =>
+            {
+                let wanted = wsman::text(&body, "RequestedState").unwrap_or_default();
+                state_now.calls.push(format!("{method} {wanted}"));
+                let value = match wanted.parse() {
+                    Ok(wanted @ 32768..=32771) => {
+                        state_now.redirection = wanted;
+                        0
+                    }
+                    _ => 36,
+                };
+                format!("<h:RequestStateChange_OUTPUT><h:ReturnValue>{value}</h:ReturnValue></h:RequestStateChange_OUTPUT>")
             }
             "RequestStateChange" if class_name == "CIM_KVMRedirectionSAP" => {
                 let wanted = wsman::text(&body, "RequestedState").unwrap_or_default();
@@ -764,6 +858,34 @@ mod tests {
         let err = amt.turn_on_remote_screen("Lk7!pQ2#").unwrap_err();
         assert!(err.contains("KVM Feature Selection"), "{err}");
         assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn turns_serial_over_lan_on() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        // Storage redirection on, Serial-over-LAN off, no listener.
+        assert_eq!(amt.serial_over_lan().unwrap(), SerialOverLan { on: false, listener: false });
+        amt.turn_on_serial_over_lan().unwrap();
+        assert_eq!(amt.serial_over_lan().unwrap(), SerialOverLan { on: true, listener: true });
+        // Storage redirection is left on.
+        assert_eq!(fake.state.lock().unwrap().redirection, 32771);
+        assert_eq!(fake.calls(), ["Put AMT_RedirectionService", "RequestStateChange 32771"]);
+        // Once on, nothing changes.
+        amt.turn_on_serial_over_lan().unwrap();
+        assert_eq!(fake.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_redirection_state_amt_should_not_give_is_refused() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        fake.state.lock().unwrap().redirection = 2;
+        let err = amt.serial_over_lan().unwrap_err();
+        assert!(err.contains("the redirection state \"2\""), "{err}");
+        let err = amt.turn_on_serial_over_lan().unwrap_err();
+        assert!(err.contains("the redirection state \"2\""), "{err}");
+        assert_eq!(fake.calls(), ["Put AMT_RedirectionService"]);
     }
 
     #[test]

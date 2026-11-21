@@ -5,8 +5,9 @@
 //! PC's (a USB serial cable, as a rule) into the current boot's log.
 //!
 //! One thread reads the port for the whole run and appends what comes to
-//! whichever log the driver last named, so each boot, the writer's and
-//! the Linux twin's too, gets a log of its own. The port is set to the
+//! a [`ConsoleLog`], whichever log the driver last named, so each boot,
+//! the writer's and the Linux twin's too, gets a log of its own; the
+//! reader of AMT's Serial-over-LAN (sol.rs) writes to one the same way. The port is set to the
 //! machine file's speed, raw, with `stty`, and read without waiting, so
 //! the thread notices when to stop. A port that goes away (the cable
 //! pulled out) is opened again until it comes back.
@@ -29,27 +30,59 @@ const O_NOCTTY: i32 = 0o400;
 /// a modem's carrier or for text.
 const O_NONBLOCK: i32 = 0o4000;
 
-/// Reads one serial port into the current log.
-pub struct SerialReader {
-    log: Arc<Mutex<Log>>,
-    done: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+/// The log a console reader appends to: the current boot's, which the
+/// driver switches to a new file at each boot. Clones append to the same
+/// file.
+#[derive(Clone)]
+pub struct ConsoleLog {
+    file: Arc<Mutex<File>>,
 }
 
-/// Where what is read goes now.
-struct Log {
-    file: Option<File>,
+impl ConsoleLog {
+    /// Makes `path`, empty, the log.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `path` or its folder cannot be made.
+    pub fn create(path: &Path) -> Result<ConsoleLog, String> {
+        Ok(ConsoleLog { file: Arc::new(Mutex::new(open_log(path)?)) })
+    }
+
+    /// Sends what is read from now on to `path`, a new file.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `path` or its folder cannot be made; the log stays as
+    /// it was.
+    pub fn switch_to(&self, path: &Path) -> Result<(), String> {
+        let file = open_log(path)?;
+        *self.file.lock().unwrap_or_else(PoisonError::into_inner) = file;
+        Ok(())
+    }
+
+    /// Appends `bytes`. A log that cannot be written loses them; the run
+    /// goes on.
+    pub fn append(&self, bytes: &[u8]) {
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = file.write_all(bytes);
+    }
+}
+
+/// Reads one serial port into the current log.
+pub struct SerialReader {
+    log: ConsoleLog,
+    done: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl SerialReader {
     /// Starts reading `port` at `baud` into `log`.
     pub fn start(port: &Path, baud: u32, log: &Path) -> Result<SerialReader, String> {
-        let file = open_log(log)?;
-        let log = Arc::new(Mutex::new(Log { file: Some(file) }));
+        let log = ConsoleLog::create(log)?;
         let done = Arc::new(AtomicBool::new(false));
         let mut device = open_port(port, baud)?;
         let thread = {
-            let (log, done, port) = (Arc::clone(&log), Arc::clone(&done), port.to_path_buf());
+            let (log, done, port) = (log.clone(), Arc::clone(&done), port.to_path_buf());
             std::thread::spawn(move || {
                 let mut buffer = [0u8; 4096];
                 while !done.load(Ordering::Relaxed) {
@@ -60,12 +93,7 @@ impl SerialReader {
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(20));
                         }
-                        Ok(read) => {
-                            let mut log = log.lock().unwrap_or_else(PoisonError::into_inner);
-                            if let Some(file) = &mut log.file {
-                                let _ = file.write_all(&buffer[..read]);
-                            }
-                        }
+                        Ok(read) => log.append(&buffer[..read]),
                         Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => {
                             // Gone; wait for it to come back.
@@ -81,11 +109,9 @@ impl SerialReader {
         Ok(SerialReader { log, done, thread: Some(thread) })
     }
 
-    /// Sends what is read from now on to `log`, a new file.
-    pub fn switch_to(&self, log: &Path) -> Result<(), String> {
-        let file = open_log(log)?;
-        self.log.lock().unwrap_or_else(PoisonError::into_inner).file = Some(file);
-        Ok(())
+    /// The log it appends to.
+    pub fn log(&self) -> &ConsoleLog {
+        &self.log
     }
 }
 
@@ -144,7 +170,6 @@ fn open_port(port: &Path, baud: u32) -> Result<File, String> {
     Ok(file)
 }
 
-/// Whether `port` opens for reading now, for `machines check`.
 /// A serial log's text so far, with any bytes that are not UTF-8 (noise
 /// on the line at power on) shown as U+FFFD; empty while the file is not
 /// there yet.
@@ -152,6 +177,7 @@ pub fn read_log(path: &Path) -> String {
     String::from_utf8_lossy(&fs::read(path).unwrap_or_default()).into_owned()
 }
 
+/// Whether `port` opens for reading now, for `machines check`.
 pub fn check_port(port: &Path, baud: u32) -> Result<(), String> {
     open_port(port, baud).map(drop)
 }
@@ -183,7 +209,7 @@ mod tests {
         writing.write_all(b"writer: wrote it\n").unwrap();
         assert!(wait_for(&first, "writer: wrote it"));
         let second = dir.path().join("logs/serial-2.log");
-        reader.switch_to(&second).unwrap();
+        reader.log().switch_to(&second).unwrap();
         writing.write_all(b"Boot complete.\n").unwrap();
         assert!(wait_for(&second, "Boot complete."));
         assert!(!fs::read_to_string(&first).unwrap().contains("Boot complete."));

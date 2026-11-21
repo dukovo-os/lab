@@ -261,6 +261,34 @@ impl Client {
     }
 }
 
+/// A digest sign-in with a client nonce (RFC 2617, 3.2.2.1), as AMT
+/// checks it over HTTP and in its redirection sessions alike.
+pub struct Digest<'a> {
+    pub user: &'a str,
+    pub password: &'a str,
+    pub realm: &'a str,
+    /// The server's nonce.
+    pub nonce: &'a str,
+    pub method: &'a str,
+    pub uri: &'a str,
+    /// How many times the nonce has been used, in eight hex digits.
+    pub count: &'a str,
+    /// The client's nonce.
+    pub cnonce: &'a str,
+    pub qop: &'a str,
+}
+
+impl Digest<'_> {
+    /// The response that shows the password is known.
+    pub fn response(&self) -> String {
+        let ha1 = md5_hex(format!("{}:{}:{}", self.user, self.realm, self.password).as_bytes());
+        let ha2 = md5_hex(format!("{}:{}", self.method, self.uri).as_bytes());
+        let signed =
+            format!("{ha1}:{}:{}:{}:{}:{ha2}", self.nonce, self.count, self.cnonce, self.qop);
+        md5_hex(signed.as_bytes())
+    }
+}
+
 /// The `Authorization: Digest` header's value for a request (RFC 2617,
 /// `qop=auth`).
 fn digest_header(
@@ -272,10 +300,18 @@ fn digest_header(
     cnonce: &str,
 ) -> String {
     let count = format!("{:08x}", challenge.count);
-    let ha1 = md5_hex(format!("{user}:{}:{password}", challenge.realm).as_bytes());
-    let ha2 = md5_hex(format!("{method}:{uri}").as_bytes());
-    let response =
-        md5_hex(format!("{ha1}:{}:{count}:{cnonce}:auth:{ha2}", challenge.nonce).as_bytes());
+    let response = Digest {
+        user,
+        password,
+        realm: &challenge.realm,
+        nonce: &challenge.nonce,
+        method,
+        uri,
+        count: &count,
+        cnonce,
+        qop: "auth",
+    }
+    .response();
     let mut header = format!(
         "Digest username=\"{user}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", \
          qop=auth, nc={count}, cnonce=\"{cnonce}\", response=\"{response}\"",

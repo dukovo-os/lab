@@ -7,10 +7,10 @@ SPDX-License-Identifier: Apache-2.0 OR MIT
 
 The lab runs the same tests on real machines as on QEMU, through the
 `amt` driver: Intel AMT turns the machine on and off, picks its next
-boot, and shows its screen and works its keyboard and mouse; a net boot
-writes the image under test to its disk before each fresh boot, a serial
-cable brings its console to the lab PC, and the lab network carries SSH
-and the lab PC's side of a test.
+boot, brings its serial console to the lab PC over Serial-over-LAN, and
+shows its screen and works its keyboard and mouse; a net boot writes the
+image under test to its disk before each fresh boot, and the lab network
+carries SSH and the lab PC's side of a test.
 
 A machine with neither AMT nor a serial port runs through the `plug`
 driver instead: a Shelly smart plug turns it on and off, and its console
@@ -21,8 +21,10 @@ it says of net boot, the lab network and the lab PC holds for both.
 ## What a machine needs
 
 - Intel AMT (a vPro machine), with its network port on the lab network.
-- A serial port (on the board, or a card Dukovo drives), cabled to a
-  serial port of the lab PC's, such as a USB serial cable.
+  AMT's Serial-over-LAN is the machine's serial console: no cable. A
+  serial cable from a port of the machine's to one of the lab PC's
+  still works, for a machine whose AMT cannot do Serial-over-LAN (see
+  [The serial console](#the-serial-console)).
 - A disk the lab may overwrite: every fresh boot writes the image over
   it.
 - For tests that use the screen, keyboard or mouse: the picture on the
@@ -55,7 +57,8 @@ Once, at the machine:
    the default, turn AMT on, give it the static address `10.77.0.10/24`,
    set Admin Control Mode, set User Opt-in (user consent) to none, and
    turn Serial-over-LAN, storage redirection and KVM Feature Selection
-   on. The driver turns on the remote screen's port 5900 itself.
+   on. The driver turns on the remote screen's port 5900 itself, and
+   Serial-over-LAN's listener if it is off.
 4. Note the network card's MAC address and the disk's serial number
    (`lsblk -o NAME,SERIAL` from a Linux live USB) for the machine file.
 
@@ -76,8 +79,8 @@ and needs the lab card's address.
 2. Make sure dnsmasq is there: `sudo apt install dnsmasq-base`.
    NetworkManager brings it on Mint, Ubuntu and Debian; the `dnsmasq`
    package's own service is not needed.
-3. Let the lab's user read the serial port, then sign in again:
-   `sudo usermod -aG dialout $USER`.
+3. For a machine on a serial cable only: let the lab's user read the
+   serial port, then sign in again: `sudo usermod -aG dialout $USER`.
 4. Copy [machines/optiplex.toml](../machines/optiplex.toml) to
    `~/.config/dukovo-lab/machines/`, and put in the MAC address and the
    disk's serial number.
@@ -114,8 +117,8 @@ each missing program and how many tests need it.
 | `power = "reset"` | AMT's reset. |
 | `power = "cut"` (`cord`) | AMT's hard off: the system gets no warning, as when the cord is pulled. |
 | `power = "button"` and `"off"` | AMT asks the system to shut down, as the power button does. AMT does this only when the system answers it, which Dukovo does not yet, so these steps fail here; `machines check` says so. |
-| `serial` | The serial cable: each boot's console is `logs/<machine>/serial-<n>.log`. |
-| `early-console` | The same cable: it carries the firmware's and GRUB's lines and the system's last lines before a power-off, which a `serial` step with `early = true` waits for. |
+| `serial` | AMT's Serial-over-LAN, or the serial cable the machine file names: each boot's console is `logs/<machine>/serial-<n>.log`. |
+| `early-console` | The same: it carries the firmware's and GRUB's lines and the system's last lines before a power-off, which a `serial` step with `early = true` waits for. |
 | `ssh` | The machine's own address on the lab network. |
 | `peer` | The lab PC is `{peer}` (`10.77.0.1`) and the machine `{machine}` (`10.77.0.2`); the machine's ports are reached as they are. |
 | `amt` | `{amt}` is AMT's own address (`10.77.0.10`), for a test that checks AMT keeps answering while the system runs. |
@@ -133,6 +136,30 @@ change, and the next step that uses the screen opens another.
 
 A person handles the network cable, USB sticks, cards and discs: Needs
 you steps, with those controls set to `person` in the machine file.
+
+### The serial console
+
+AMT's management engine shows the system a serial port of its own, at
+PCI 00:16.3 on Intel boards, and hands what the system writes there to
+one console on the network at a time, on AMT's port 16994. With no
+console there, AMT drops the text. So the driver turns Serial-over-LAN
+on as it starts, opens a session, signs in with AMT's user and password
+(by HTTP digest: the password never goes over the network), and keeps
+the session open until the run ends, across every boot and power
+change, opening another at once if one ends. Linux names the port
+`ttyS4` and Dukovo does too, and Dukovo writes its log to every serial
+port, AMT's among them, from the kernel's first lines on. GRUB shows
+its menu there too (`pci,00:16.3`), as the install stick's menu does.
+
+The session is AMT's one: while the lab has it, a person's terminal
+(MeshCommander, `amtterm`) cannot open another, and while a person's
+is open, the run cannot start. AMT turns power changes down while a
+remote screen session is open; should it turn one down while
+Serial-over-LAN is open, the driver closes the session, asks again,
+and opens it once the change is made, and `amt.log` says so.
+
+A machine file that names a `serial` port has its console read from
+that cable instead, and Serial-over-LAN is left as it is.
 Booting the install stick or DVD, and the attacker, are not done on
 real machines yet; tests that need them are skipped there.
 
@@ -247,8 +274,9 @@ alone:
   machine's address by (`dhcp-host=<mac>,<machine_address>,<name>`), so
   give each machine its own `machine_address` as well.
 - `disk`: the serial number of its disk, from `lsblk -o NAME,SERIAL`.
-- `serial`: its own serial cable's port, best by its `/dev/serial/by-id/`
-  name, as USB serial ports are renumbered when cables move.
+- `serial`, for a machine on a cable: its own serial cable's port, best
+  by its `/dev/serial/by-id/` name, as USB serial ports are renumbered
+  when cables move.
 - `boot_port`: the first of its four net-boot ports. Machines in one run
   need ports of their own, so each machine's is four more than the one
   before.
@@ -291,13 +319,22 @@ and why (a `machine-out` event). See [run](commands.md#run).
   remote screen session, and what growing the root printed.
 - `logs/<machine>/writer-<n>.log` is the writer's console for boot `n`.
   When it and `serial-<n>.log` stay empty while `amt.log` shows the
-  writer at work, the machine file's `console` names another port than
-  the one cabled: with Serial-over-LAN on, AMT's own port is `ttyS4`,
-  and a serial card's ports come after it, from `ttyS5`. When they hold
-  mostly zero bytes, the port runs at another speed than the machine
-  file's `baud`. The lab puts the machine's `console` alone on the
-  writer's and the twin's command lines, in place of the kit's own,
-  because Linux keeps the speed of a port's first `console=`.
+  writer at work, look in `amt.log` for the Serial-over-LAN session:
+  each one opened, each that ended and why, and why one would not
+  open. With the session open, the machine file's `console` names
+  another port than the one the lab reads: AMT's own is `ttyS4`, and a
+  serial card's ports come after it, from `ttyS5`; a cable on the
+  board's COM1 is `ttyS0`. Dukovo says `Serial: the Intel AMT
+  Serial-over-LAN port at ... is the terminal /devices/ttyS4` when it
+  finds AMT's port. On a cable, logs holding mostly zero bytes mean the
+  port runs at another speed than the machine file's `baud`. The lab
+  puts the machine's `console` alone on the writer's and the twin's
+  command lines, in place of the kit's own, because Linux keeps the
+  speed of a port's first `console=`.
+- A Serial-over-LAN session that will not open says why in the run's
+  first lines: AMT turns it down while another console, such as a
+  person's terminal, holds it; a wrong password is tried again only
+  once a minute, as AMT locks a user out after several.
 - AMT refuses connections for a moment when the machine has been off
   and AMT left alone for a while: its engine dozes, and the first
   connection wakes it. The driver keeps trying for 20 seconds before it
@@ -326,8 +363,9 @@ and why (a `machine-out` event). See [run](commands.md#run).
   and `journalctl -u dukovo-lab-dnsmasq` shows whether the machine asked
   for an address and the boot script.
 - `dukovo-lab machines check <machine>` checks AMT, its remote screen,
-  the serial port, the lab network, the TFTP folder, the network GRUB,
-  the writer and the lab key, without changing anything.
+  Serial-over-LAN (a session opens and closes) or the serial port, the
+  lab network, the TFTP folder, the network GRUB, the writer and the lab
+  key, without changing anything.
 - A screen that stays black over the remote screen while the machine
   runs needs a monitor or a display emulator plug on the board's Intel
   graphics.

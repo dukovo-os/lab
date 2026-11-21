@@ -124,7 +124,7 @@ What each driver does by itself:
 | Driver | Controls |
 | --- | --- |
 | `qemu` | All of them but `amt`. |
-| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial` and `early-console` (the serial cable, which carries the firmware's and GRUB's lines too), `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
+| `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial` and `early-console` (AMT's Serial-over-LAN, or the serial cable the machine file names, either of which carries the firmware's and GRUB's lines too), `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
 | `plug` | `power` (the plug switches the machine on, and a reset is the plug off and on again; the power button and a graceful `off` are not available), `cord` (the plug off: a hard power loss the system gets no warning of), `serial` (the console over netlog, which starts once the network is up and stops when it goes down), `ssh` and `peer`. `early-console`, `keys`, `mouse`, `screen`, `linux` and `amt` are `none`. Cables, sticks, cards and discs can be handed to a person. |
 
 ## QEMU hardware
@@ -157,14 +157,14 @@ lab network. [Real machines](real-machines.md) sets one up.
 | `password_file` | (required) | A file holding AMT's password alone, readable by this user alone (`chmod 600`). A relative path is from the machine file's folder. |
 | `mac` | (required) | The MAC address of the machine's network card on the lab network, written `aa:bb:cc:dd:ee:ff`. |
 | `disk` | (required) | The serial number of the disk each fresh boot writes the image to, as `lsblk -o NAME,SERIAL` shows it. No other disk is ever written. |
-| `serial` | (required) | The lab PC's serial port the machine's console is cabled to, such as `/dev/ttyUSB0`. |
-| `baud` | `115200` | The serial console's speed. |
+| `serial` | (none) | The lab PC's serial port the machine's console is cabled to, such as `/dev/ttyUSB0`. With none, the console is read from AMT's Serial-over-LAN, which the driver turns on (see [Real machines](real-machines.md#the-serial-console)). |
+| `baud` | `115200` | The serial cable's speed. |
 | `machine_address` | `10.77.0.2` | The machine's address on the lab network, for SSH and `{machine}`. |
 | `lab_address` | `10.77.0.1` | The lab PC's address on the lab network: the net-boot server listens there, and tests reach the lab PC there as `{peer}`. |
 | `boot_port` | `7431` | The first of the net-boot server's four ports, which boots take in turn ([Net boot](net-boot.md) says why). Machines in the same run need four ports of their own. |
 | `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
-| `console` | `ttyS0,115200` | The machine's serial port as Linux names it, for the writer and the Linux twin. A board's own ports are `ttyS0` to `ttyS3`; PCI ports come after, from `ttyS4`, and with Serial-over-LAN on, AMT's own port is the first of them, so a serial card's first port is then `ttyS5`. |
+| `console` | `ttyS4,115200`, or `ttyS0,115200` with a `serial` cable | The machine's serial port as Linux names it, for the writer and the Linux twin. A board's own ports are `ttyS0` to `ttyS3`; PCI ports come after, from `ttyS4`, and with Serial-over-LAN on, AMT's own port is the first of them, so a serial card's first port is then `ttyS5`. |
 | `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. A QEMU machine's disk is an 8 GiB overlay over the image, and its `[qemu]` section takes the same setting. |
 
 ## Plug settings

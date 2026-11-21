@@ -182,7 +182,8 @@ pub enum DriverKind {
     Qemu,
     /// A real machine with Intel AMT, on the lab network: power and the
     /// next boot through AMT, a fresh disk for each test through net
-    /// boot, its console through a serial cable to the lab PC.
+    /// boot, its console through AMT's Serial-over-LAN, or a serial cable
+    /// to the lab PC.
     Amt,
     /// A real machine with neither AMT nor a serial port, on the lab
     /// network: power through a Shelly smart plug, a fresh disk for each
@@ -308,9 +309,12 @@ pub struct AmtSettings {
     /// The serial number of the disk the image is written to, the only
     /// disk the writer may write (`lsblk -o NAME,SERIAL` shows it).
     pub disk: String,
-    /// The lab PC's serial port that the machine's console is cabled to.
-    pub serial: PathBuf,
-    /// The serial console's speed.
+    /// The lab PC's serial port that the machine's console is cabled to,
+    /// if it is: with none, the console is read from AMT's
+    /// Serial-over-LAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<PathBuf>,
+    /// The serial cable's speed.
     #[serde(default = "default_baud")]
     pub baud: u32,
     /// The machine's address on the lab network, for SSH and the lab
@@ -332,9 +336,9 @@ pub struct AmtSettings {
     #[serde(default = "default_writer")]
     pub writer: PathBuf,
     /// The serial console as Linux names it, for the writer and the Linux
-    /// twin: `console=` gets this.
-    #[serde(default = "default_console")]
-    pub console: String,
+    /// twin: `console=` gets this. See [`AmtSettings::console`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
     /// Whether a fresh boot's root is grown to the end of the disk before
     /// the test starts (see [`GROW_ROOT`](crate::run::GROW_ROOT)).
     #[serde(default = "default_grow_root")]
@@ -362,8 +366,19 @@ fn default_tftp() -> PathBuf {
 fn default_writer() -> PathBuf {
     "/srv/dukovo-lab/writer".into()
 }
-fn default_console() -> String {
-    "ttyS0,115200".into()
+impl AmtSettings {
+    /// The serial console as Linux names it: the machine file's, or the
+    /// port the lab reads. A cable is on COM1 as a rule, `ttyS0`. Linux
+    /// names ports on PCI from `ttyS4` in the order it finds them, and
+    /// AMT's Serial-over-LAN port, at PCI 00:16.3, comes first unless a
+    /// serial card is found before it.
+    pub fn console(&self) -> &str {
+        match (&self.console, &self.serial) {
+            (Some(console), _) => console,
+            (None, Some(_)) => "ttyS0,115200",
+            (None, None) => "ttyS4,115200",
+        }
+    }
 }
 
 /// How the lab reaches a real machine with no AMT and no serial port, and
@@ -770,8 +785,10 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
     if ![9600, 19_200, 38_400, 57_600, 115_200].contains(&settings.baud) {
         return Err("amt.baud must be 9600, 19200, 38400, 57600 or 115200".into());
     }
-    if settings.console.is_empty() || settings.console.contains(char::is_whitespace) {
-        return Err("amt.console must be one Linux console name, such as ttyS0,115200".into());
+    if let Some(console) = &settings.console
+        && (console.is_empty() || console.contains(char::is_whitespace))
+    {
+        return Err("amt.console must be one Linux console name, such as ttyS4,115200".into());
     }
     Ok(())
 }
@@ -1291,6 +1308,28 @@ mod tests {
         assert_eq!(amt.machine_address, "10.77.0.2");
         assert_eq!(amt.lab_address, "10.77.0.1");
         assert_eq!(amt.tftp, Path::new("/srv/dukovo-lab/tftp"));
+        // A cable on COM1 is ttyS0 to Linux.
+        assert_eq!(amt.serial.as_deref(), Some(Path::new("/dev/ttyUSB0")));
+        assert_eq!(amt.console(), "ttyS0,115200");
+    }
+
+    #[test]
+    fn a_real_machine_without_a_cable_has_its_console_from_serial_over_lan() {
+        let dir = TempDir::new("machines-amt-sol");
+        let file = "about = \"a box\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.10\"\n\
+                    password_file = \"p\"\nmac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n";
+        dir.write("box.toml", file);
+        let machines = load(dir.path()).unwrap();
+        let amt = machines[0].amt.as_ref().unwrap();
+        assert_eq!(amt.serial, None);
+        // AMT's own port, the first on PCI.
+        assert_eq!(amt.console(), "ttyS4,115200");
+        assert_eq!(machines[0].who(Control::Serial), Who::Driver);
+        assert_eq!(machines[0].who(Control::EarlyConsole), Who::Driver);
+        // A console the machine file names is the one used.
+        dir.write("box.toml", &format!("{file}console = \"ttyS5,115200\"\n"));
+        let machines = load(dir.path()).unwrap();
+        assert_eq!(machines[0].amt.as_ref().unwrap().console(), "ttyS5,115200");
     }
 
     #[test]
