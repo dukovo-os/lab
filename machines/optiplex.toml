@@ -24,11 +24,13 @@ mac = "00:00:00:00:00:00"
 # The serial number of the disk each test's image is written to, from
 # `lsblk -o NAME,SERIAL`. No other disk is ever written.
 disk = "SERIAL-OF-THE-SSD"
-# The console comes from AMT's Serial-over-LAN, on AMT's own serial
-# port, which Linux and Dukovo name ttyS4. For a serial cable into the
-# board's COM1 instead, name the lab PC's end of it:
-# serial = "/dev/serial/by-id/usb-FTDI_..."
-# console = "ttyS0,115200"
+# The console comes over a serial cable into the board's COM1 (ttyS0):
+# the lab PC's end of it, by its /dev/serial/by-id/ name. With no serial
+# port named, it comes from AMT's Serial-over-LAN (ttyS4) instead, but
+# the disk writer's download stalls while a session is open (see
+# docs/real-machines.md, The serial console).
+serial = "/dev/serial/by-id/usb-FTDI_..."
+console = "ttyS0,115200"
 
 [controls]
 # Cables and sticks are handled by a person at the machine.

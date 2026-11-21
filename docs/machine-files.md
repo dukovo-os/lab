@@ -157,7 +157,7 @@ lab network. [Real machines](real-machines.md) sets one up.
 | `password_file` | (required) | A file holding AMT's password alone, readable by this user alone (`chmod 600`). A relative path is from the machine file's folder. |
 | `mac` | (required) | The MAC address of the machine's network card on the lab network, written `aa:bb:cc:dd:ee:ff`. |
 | `disk` | (required) | The serial number of the disk each fresh boot writes the image to, as `lsblk -o NAME,SERIAL` shows it. No other disk is ever written. |
-| `serial` | (none) | The lab PC's serial port the machine's console is cabled to, such as `/dev/ttyUSB0`. With none, the console is read from AMT's Serial-over-LAN, which the driver turns on (see [Real machines](real-machines.md#the-serial-console)). |
+| `serial` | (none) | The lab PC's serial port the machine's console is cabled to, such as `/dev/ttyUSB0`. With none, the console is read from AMT's Serial-over-LAN, which the driver turns on; the disk writer's download stalls while it is open, so a machine with a serial port names its cable (see [Real machines](real-machines.md#the-serial-console)). |
 | `baud` | `115200` | The serial cable's speed. |
 | `machine_address` | `10.77.0.2` | The machine's address on the lab network, for SSH and `{machine}`. |
 | `lab_address` | `10.77.0.1` | The lab PC's address on the lab network: the net-boot server listens there, and tests reach the lab PC there as `{peer}`. |
