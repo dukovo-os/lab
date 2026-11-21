@@ -12,9 +12,10 @@ cable brings its console to the lab PC; a net boot writes the image
 under test to its disk before each fresh boot, and the lab network
 carries SSH and the lab PC's side of a test.
 
-A machine with neither AMT nor a serial port runs through the `plug`
-driver instead: a Shelly smart plug turns it on and off, and its console
-comes over the network. [A machine on a smart plug](#a-machine-on-a-smart-plug)
+A machine without AMT runs through the `plug` driver instead: a Shelly
+smart plug turns it on and off, and its console comes over the network.
+Cables to the lab PC can add its screen, keyboard and mouse, and a console
+from power-on. [A machine on a smart plug](#a-machine-on-a-smart-plug)
 below sets one up; the rest of this page is about AMT machines, and what
 it says of net boot, the lab network and the lab PC holds for both.
 
@@ -305,8 +306,8 @@ dukovo-lab run --all --machine pool:optiplex --image ...
 A machine named on its own, such as `optiplex-1`, still runs every test.
 Mark a machine `spare = true` to keep it for reruns and bisects: a run on
 the pool leaves it out, and it is named directly when wanted. Plug
-machines in a pool each need their own `netlog_port`, `machine_address` and
-`boot_port` (see [A machine on a smart plug](#a-machine-on-a-smart-plug)).
+machines in a pool each need their own `machine_address`, `boot_port` and
+Shelly plug (see [A machine on a smart plug](#a-machine-on-a-smart-plug)).
 
 If one machine of a pool will not start, or its health check benches it,
 the others take its share of the queue and the run says which machine left
@@ -384,8 +385,11 @@ and why (a `machine-out` event). See [run](commands.md#run).
 
 ## A machine on a smart plug
 
-A real machine with no AMT and no serial port, such as a ThinkCentre M75q,
-runs through the `plug` driver. What it needs:
+A real machine without AMT, such as a ThinkCentre M75q or an OptiPlex 7040
+with AMT turned off, runs through the `plug` driver. With no cables it has
+a console over the network and nothing else; [the cables](#the-cables-of-a-plug-machine)
+below add a screen, a keyboard and mouse, and a console from power-on.
+What it needs:
 
 - A firmware that boots from the network (UEFI IPv4 PXE) before its
   disk, every time, and powers the machine on after a power loss
@@ -408,8 +412,9 @@ runs through the `plug` driver. What it needs:
   to. An image that does not name the lab PC, or a machine whose network
   does not come up, leaves the console log empty.
 
-Setting it up is the AMT machine's steps without MEBx and the serial
-cable: the firmware settings above, then the plug machine's file
+Setting it up is the AMT machine's steps without MEBx, and without the
+cables until [they are added](#the-cables-of-a-plug-machine): the
+firmware settings above, then the plug machine's file
 ([machines/m75q.toml](../machines/m75q.toml)) with its MAC address, the
 plug's address and the disk's serial number, then
 `dukovo-lab machines check <machine>`.
@@ -428,13 +433,84 @@ written before that.
 | `power = "reset"` | The plug off, 5 seconds, on. |
 | `power = "cut"` (`cord`) | The plug off: a hard power loss, as when the cord is pulled. |
 | `power = "button"` and `"off"` | Not available: a plug cannot ask the system to shut down, so these steps fail here, as on an AMT machine that does not answer; `machines check` says so. |
-| `serial` | The netlog: each boot's console is `logs/<machine>/serial-<n>.log`, one line to a record, as a serial log reads. |
+| `serial` | The netlog, or the serial cable when the file names one: each boot's console is `logs/<machine>/serial-<n>.log`. Over netlog it is one line to a record, as a serial log reads. |
 | `ssh`, `peer` | As for AMT: the machine's address and the lab PC's on the lab network. |
-| `early-console`, `keys`, `mouse`, `screen`, `linux` | `none`: tests that need them are skipped. A `serial` step with `early = true` needs `early-console`: the netlog starts once the network is up and stops when it goes down, so it shows neither the firmware's and GRUB's lines nor the system's last lines before a power-off. |
+| `early-console`, `linux` | The serial cable, when the file names one (`plug.serial`); otherwise `none`. A `serial` step with `early = true` needs `early-console`: the netlog starts once the network is up and stops when it goes down, so it shows neither the firmware's and GRUB's lines nor the system's last lines before a power-off. |
+| `screen` | The HDMI capture stick, when the file names one (`plug.capture`); otherwise `none`. |
+| `keys`, `mouse` | The CH9329 cable, when the file names one (`plug.hid`); otherwise `none`. |
 
-The lab listens for one machine's netlog on one UDP port, so a run drives
-one plug machine at a time. A second one needs its own `machine_address`,
-and, at the same time, its own `netlog_port` and `boot_port`.
+Several plug machines run at once. They share the netlog port, and the lab
+sorts each datagram by the machine's `machine_address`, so each machine
+needs a `machine_address` of its own (two machines with the same one in a
+run are refused), its own `boot_port`, and its own Shelly plug.
+
+### The cables of a plug machine
+
+A plug machine may have up to three cables to the lab PC. Each is optional,
+and each turns on the controls in the table above; without it those
+controls stay `none` and tests that need them are skipped. The cables are
+new and have not yet passed a run on real hardware. The example file
+[machines/optiplex-plug.toml](../machines/optiplex-plug.toml) names them
+for OptiPlex 2 to 4, but no pool depends on them yet.
+
+What to buy:
+
+- A UVC HDMI capture stick that offers YUYV at the screen's size, such as
+  an MS2130 stick, on a USB 3 port of the lab PC. The HDMI cable goes from
+  the board's own video port to the stick, with no graphics card fitted.
+- A CH9329 USB-serial-to-HID cable. Its serial end goes into the lab PC
+  and its USB end into the machine, which sees a keyboard and an absolute
+  mouse.
+- An FTDI serial cable from the lab PC to the board's COM1 header or port.
+
+The lab PC needs `v4l2-ctl`, which takes the stick's pictures, and an
+account that may open the devices:
+
+```sh
+sudo apt install v4l-utils
+sudo usermod -aG video,dialout "$USER"
+```
+
+Log in again afterwards, so the groups take effect.
+
+USB devices are renumbered when cables move, and cheap cables of one model
+share one `/dev/.../by-id/` name. Find each device's `by-path` name, which
+follows the USB port it is plugged into, and put those in the machine file:
+
+```sh
+ls -l /dev/v4l/by-path/ /dev/serial/by-path/
+```
+
+The stick appears under `/dev/v4l/by-path/` (the name ending in
+`video-index0` is the picture), the two serial cables under
+`/dev/serial/by-path/`. Plug each into the same port again later, or
+update the file. `plug.serial` and `plug.hid` must name different ports.
+
+`plug.capture_size` must be the size of the machine's screen, which
+Dukovo prints in its console as `Framebuffer: WxH, ...`. The default is
+`1920x1080`. A picture of another size is refused with a message that
+names the setting to change, because a scaled picture has no pixel of the
+machine's own and no text can be read from it. The text reader allows each
+pixel to stray a little in brightness, as a capture stick's colour
+conversion rounds.
+
+Run `dukovo-lab machines check <machine>` to see each cable answer:
+`serial port` opens the serial cable, `capture` takes a picture and says
+how much of it is lit, and `keyboard and mouse` asks the CH9329 cable
+whether the machine has set it up. While the machine is off, some of
+these are notes and not faults, because the CH9329 and the stick may draw
+their power from the machine; check again with it on.
+
+### One pool with the AMT OptiPlex
+
+A pool needs identical controls. Once a hardware run passes on the
+cables, OptiPlex 1 (the `amt` driver) and OptiPlex 2 to 4 (the `plug`
+driver, with all three cables) can share the pool `optiplex`. OptiPlex 1's
+file then sets `amt = "none"` under `[controls]`, since the plug machines
+have no AMT. The test that needs AMT then runs from a second file for
+OptiPlex 1 with no pool and AMT left on, such as `optiplex-1-amt.toml`,
+named on its own and never in the same run as the pool, since both files
+drive the one machine. Until then OptiPlex 2 to 4 have no `pool` line.
 
 When something goes wrong, `logs/<machine>/plug.log` says what the driver
 did: each switch of the plug, each net boot and each request the writer

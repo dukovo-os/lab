@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# An example machine file for a real machine with no AMT: a Dell OptiPlex
+# 7040 on a Shelly smart plug, with three cables to the lab PC: a serial
+# cable for the console from power-on, an HDMI capture stick for the screen
+# and a CH9329 cable for the keyboard and mouse. The cables are new and
+# have not yet passed a run on real hardware. Copy it to
+# ~/.config/dukovo-lab/machines/optiplex-2.toml, put in the machine's MAC
+# address, its disk's serial number and the devices' names, and run
+# `dukovo-lab machines check optiplex-2`.
+# docs/real-machines.md sets the machine, the cables and the lab PC up;
+# docs/machine-files.md lists every key.
+#
+# Once a hardware run has passed on the cables, set pool = "optiplex" here,
+# and amt = "none" under [controls] in optiplex.toml, so that the pool's
+# machines have the same controls. Until then no pool line is given.
+
+about = "Dell OptiPlex 7040 SFF, Core i5-6500, no AMT"
+driver = "plug"
+
+[plug]
+# The plug's address on the home network, which the lab PC reaches through
+# its ordinary card. Give the plug a fixed address (a DHCP reservation).
+shelly = "192.168.1.4"
+# The network card's MAC address on the lab network, from the firmware
+# setup or `ip link`.
+mac = "00:00:00:00:00:00"
+# The serial number of the disk each test's image is written to, from
+# `lsblk -o NAME,SERIAL`. No other disk is ever written.
+disk = "SERIAL-OF-THE-SSD"
+# The machine's address on the lab network, which dnsmasq hands it by its
+# MAC address (dhcp-host=<mac>,10.77.0.4,optiplex-2). Each plug machine
+# needs an address of its own: OptiPlex 3 and 4 would take 10.77.0.5 and
+# 10.77.0.6.
+machine_address = "10.77.0.4"
+# Its own four net-boot ports, which machines in one run do not share:
+# OptiPlex 3 and 4 would take 7443 and 7447.
+boot_port = 7439
+# The serial cable to the board's COM1: the lab PC's end, by its
+# /dev/serial/by-path/ name (`ls -l /dev/serial/by-path/`), since cheap
+# cables of one model share their by-id names. It brings early-console
+# and linux.
+serial = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:1:1.0-port0"
+# The serial cable's speed. 115200 is the default, so this line is optional.
+# baud = 115200
+# The serial port as Linux names it, for the writer and the Linux twin.
+# ttyS0 (COM1) at 115200 is the default.
+# console = "ttyS0,115200"
+# The HDMI capture stick, by its /dev/v4l/by-path/ name, on a USB 3 port.
+# It brings screen. The HDMI cable goes in the board's own video port.
+capture = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2:1.0-video-index0"
+# The size of the machine's screen, as Dukovo's console prints it in
+# "Framebuffer: WxH, ...". A picture of another size is refused.
+capture_size = "1920x1080"
+# The CH9329 cable's serial end, by its /dev/serial/by-path/ name. It must
+# be another port than serial. It brings keys and mouse.
+hid = "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0-port0"
+# The CH9329's serial speed. A new cable speaks 9600, the default, so this
+# line is optional.
+# hid_baud = 9600
+
+[controls]
+# Cables and sticks are handled by a person at the machine.
+link = "person"
+usb = "person"

@@ -16,6 +16,8 @@ mod amt;
 mod bench;
 mod browser;
 mod bundle;
+mod capture;
+mod ch9329;
 mod clock;
 mod des;
 mod driver;

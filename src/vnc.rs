@@ -629,6 +629,18 @@ pub fn keysyms(combo: &str) -> Result<Vec<u32>, String> {
         .collect()
 }
 
+/// Every key name [`keysyms`] takes, for the tests of the other readers of
+/// QEMU's key names.
+#[cfg(test)]
+pub(crate) fn key_names() -> Vec<String> {
+    let characters = ('a'..='z').chain('0'..='9').map(String::from);
+    let printing = PRINTING.iter().map(|(name, _)| (*name).to_owned());
+    let others = OTHER_KEYS.iter().map(|(name, _)| (*name).to_owned());
+    let functions = (1..=12).map(|n| format!("f{n}"));
+    let keypad = (0..=9).map(|n| format!("kp_{n}"));
+    characters.chain(printing).chain(others).chain(functions).chain(keypad).collect()
+}
+
 /// A pretend VNC server for tests, as AMT's remote screen behaves: one
 /// screen, a password, and the keys and pointer it is sent.
 #[cfg(test)]

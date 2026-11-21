@@ -2553,7 +2553,12 @@ impl<'a> Worker<'a> {
         self.driver.screen_dump(&self.screen_file)?;
         let bytes = fs::read(&self.screen_file)
             .map_err(|err| format!("reading the screen {}: {err}", self.screen_file.display()))?;
-        screen::read_text(&screen::Image::parse_ppm(&bytes)?, geometry, fonts)
+        screen::read_text(
+            &screen::Image::parse_ppm(&bytes)?,
+            geometry,
+            fonts,
+            self.driver.screen_noise(),
+        )
     }
 
     /// Waits until the screen shows every one of `texts` (`shown`), or no

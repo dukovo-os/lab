@@ -311,8 +311,15 @@ fn unicode_table(table: &[u8], count: usize, psf2: bool) -> Vec<(char, usize)> {
 }
 
 /// Reads the console's text from a screenshot: a string a row, with blanks
-/// at the end left off.
-pub fn read_text(image: &Image, geometry: Geometry, fonts: &[Font]) -> Result<Vec<String>, String> {
+/// at the end left off. `noise` is how far, in brightness, a pixel of the
+/// screenshot may stray from what the machine drew (0: not at all, as in
+/// QEMU's screendump; above 0, `cell_bits` says how the cells are read).
+pub fn read_text(
+    image: &Image,
+    geometry: Geometry,
+    fonts: &[Font],
+    noise: u8,
+) -> Result<Vec<String>, String> {
     let (width, height) = geometry.font;
     let font = fonts
         .iter()
@@ -329,7 +336,8 @@ pub fn read_text(image: &Image, geometry: Geometry, fonts: &[Font]) -> Result<Ve
     for row in 0..geometry.rows {
         let mut text = String::with_capacity(geometry.cols);
         for col in 0..geometry.cols {
-            let bits = cell_bits(image, x0 + col * width, y0 + row * height, width, height);
+            let bits =
+                cell_bits(image, x0 + col * width, y0 + row * height, (width, height), noise);
             text.push(*font.glyphs.get(&bits).unwrap_or(&'?'));
         }
         rows.push(text.trim_end().to_string());
@@ -337,22 +345,92 @@ pub fn read_text(image: &Image, geometry: Geometry, fonts: &[Font]) -> Result<Ve
     Ok(rows)
 }
 
-/// The pixels of one cell not in its background, which is the colour most
-/// of its pixels have: a glyph lights far fewer than half.
-fn cell_bits(image: &Image, x0: usize, y0: usize, width: usize, height: usize) -> Vec<u32> {
-    let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
-    for y in y0..y0 + height {
-        for x in x0..x0 + width {
-            *counts.entry(image.pixel(x, y)).or_default() += 1;
+/// The pixels of one cell not in its background, a row of bits a row.
+///
+/// With `noise` 0 the pixels are the screen's own: the background is the
+/// colour most of the cell's pixels have (a glyph lights far fewer than
+/// half), and every other pixel is lit. With `noise` above 0 they are a
+/// picture of the screen, see [`Background::Luma`].
+fn cell_bits(
+    image: &Image,
+    x0: usize,
+    y0: usize,
+    (width, height): (usize, usize),
+    noise: u8,
+) -> Vec<u32> {
+    let pixels = (y0..y0 + height).flat_map(|y| (x0..x0 + width).map(move |x| image.pixel(x, y)));
+    let background = if noise == 0 {
+        let mut counts: HashMap<[u8; 3], usize> = HashMap::new();
+        for pixel in pixels {
+            *counts.entry(pixel).or_default() += 1;
         }
-    }
-    let background = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or_default();
+        let colour = counts.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c);
+        Background::Exact(colour.unwrap_or_default())
+    } else {
+        let mut lumas: Vec<u8> = pixels.map(luma).collect();
+        lumas.sort_unstable();
+        // A glyph lights far fewer than half the cell, so the middle
+        // luma is the background's, however its pixels scatter.
+        let level = lumas.get(lumas.len() / 2).copied().unwrap_or_default();
+        let largest = match (lumas.first(), lumas.last()) {
+            (Some(&darkest), Some(&brightest)) => {
+                level.abs_diff(darkest).max(brightest.abs_diff(level))
+            }
+            _ => 0,
+        };
+        Background::Luma { level, threshold: noise.max(largest / 2) }
+    };
     (y0..y0 + height)
         .map(|y| {
-            (0..width)
-                .fold(0u32, |bits, x| (bits << 1) | u32::from(image.pixel(x0 + x, y) != background))
+            (x0..x0 + width)
+                .fold(0u32, |bits, x| (bits << 1) | u32::from(background.lights(image.pixel(x, y))))
         })
         .collect()
+}
+
+/// A cell's background, as [`cell_bits`] tells it from its text.
+enum Background {
+    /// The one colour of the background; every other pixel is lit.
+    Exact([u8; 3]),
+    /// The background's luma: a pixel is lit when its luma is more than
+    /// `threshold` from `level`. The threshold is the noise, so that a
+    /// blank cell stays blank, or half the largest difference in the cell
+    /// when that is more, so that bright text does not light the fringe
+    /// that a picture's rounding and shared colour leave beside it.
+    Luma { level: u8, threshold: u8 },
+}
+
+impl Background {
+    /// Whether `pixel` is part of the text.
+    fn lights(&self, pixel: [u8; 3]) -> bool {
+        match *self {
+            Background::Exact(colour) => pixel != colour,
+            Background::Luma { level, threshold } => luma(pixel).abs_diff(level) > threshold,
+        }
+    }
+}
+
+/// A pixel's brightness, 0 to 255, by the weights the eye gives red, green
+/// and blue (ITU-R BT.601).
+pub fn luma(rgb: [u8; 3]) -> u8 {
+    let [red, green, blue] = rgb.map(u32::from);
+    // At most (255 * 1000 + 500) / 1000 = 255.
+    ((299 * red + 587 * green + 114 * blue + 500) / 1000) as u8
+}
+
+/// The size of the framebuffer the log last names, as Dukovo's kernel
+/// writes it: `Framebuffer: <width>x<height>, 32 bits per pixel, ...`. The
+/// kernel's other framebuffer lines (`Framebuffer: console of ...`, and
+/// `Framebuffer: 1920x1080 with 32 bits per pixel ... is not supported`)
+/// name no size in use. A line still being written is left out.
+pub fn framebuffer_size(log: &str) -> Option<(u32, u32)> {
+    let whole = log.rfind('\n').map_or("", |end| &log[..end]);
+    whole.lines().rev().find_map(|line| {
+        let (_, rest) = line.split_once("Framebuffer: ")?;
+        let (size, _) = rest.split_once(',')?;
+        let (width, height) = size.split_once('x')?;
+        Some((width.parse().ok()?, height.parse().ok()?))
+    })
 }
 
 /// Whether the screen shows every one of `texts`, each within one row.
@@ -513,7 +591,7 @@ pub(crate) mod tests {
         let ppm = draw(&font, &["Abc: $ ab", "", "√ CAB#"], (60, 40), (3, 5));
         let image = Image::parse_ppm(&ppm).unwrap();
         let geometry = Geometry { cols: 12, rows: 4, font: (4, 6), origin: (3, 5) };
-        let screen = read_text(&image, geometry, &fonts).unwrap();
+        let screen = read_text(&image, geometry, &fonts, 0).unwrap();
         assert_eq!(screen, ["Abc: $ ab", "", "√ CAB#", ""]);
         assert_eq!(as_text(&screen), "Abc: $ ab\n\n√ CAB#\n");
         assert!(shows(&screen, &["CAB".into(), "Abc:".into()]));
@@ -521,9 +599,9 @@ pub(crate) mod tests {
 
         // A font the folder lacks, and a console that does not fit, say so.
         let other = Geometry { font: (8, 16), ..geometry };
-        assert!(read_text(&image, other, &fonts).unwrap_err().contains("8x16"));
+        assert!(read_text(&image, other, &fonts, 0).unwrap_err().contains("8x16"));
         let wide = Geometry { cols: 40, ..geometry };
-        assert!(read_text(&image, wide, &fonts).unwrap_err().contains("does not fit"));
+        assert!(read_text(&image, wide, &fonts, 0).unwrap_err().contains("does not fit"));
     }
 
     #[test]
@@ -574,5 +652,92 @@ pub(crate) mod tests {
         assert_eq!(key_combos("aZ 1!\n").unwrap(), ["a", "shift-z", "spc", "1", "shift-1", "ret"]);
         assert_eq!(key_combos("a/b?").unwrap(), ["a", "slash", "b", "shift-slash"]);
         assert_eq!(key_combos("é").unwrap_err(), "a US keyboard has no key for 'é'");
+    }
+
+    /// The drawn screen with its background and text in other colours.
+    fn recoloured(ppm: &[u8], background: [u8; 3], text: [u8; 3]) -> Image {
+        let drawn = Image::parse_ppm(ppm).unwrap();
+        let pixels = drawn
+            .pixels()
+            .iter()
+            .map(|&pixel| if pixel == [20, 30, 60] { background } else { text })
+            .collect();
+        Image::new(drawn.width, drawn.height, pixels).unwrap()
+    }
+
+    /// What a capture stick makes of `image`: a YUYV picture, each pair of
+    /// pixels sharing its chroma, then a little noise of up to `spread`
+    /// levels in each channel.
+    fn through_a_stick(image: &Image, spread: u8) -> Image {
+        let bytes = crate::capture::tests::to_yuyv(image);
+        let picture = crate::capture::from_yuyv(image.width as u32, image.height as u32, &bytes);
+        let mut seed = 12345u32;
+        let mut jitter = |level: u8| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let offset = (seed >> 16) % (2 * u32::from(spread) + 1);
+            (i32::from(level) + offset as i32 - i32::from(spread)).clamp(0, 255) as u8
+        };
+        let pixels = picture.unwrap().pixels().iter().map(|p| p.map(&mut jitter)).collect();
+        Image::new(image.width, image.height, pixels).unwrap()
+    }
+
+    fn read_with(image: &Image, noise: u8) -> Vec<String> {
+        let font = test_font("ABCabc:$#?");
+        let fonts = vec![Font::parse_psf(&font).unwrap()];
+        let geometry = Geometry { cols: 12, rows: 4, font: (4, 6), origin: (3, 5) };
+        read_text(image, geometry, &fonts, noise).unwrap()
+    }
+
+    fn drawn() -> Vec<u8> {
+        draw(&test_font("ABCabc:$#?"), &["Abc: $ ab", "", "CAB#?"], (60, 40), (3, 5))
+    }
+
+    #[test]
+    fn a_screen_through_a_noisy_stick_reads_back_exactly_with_the_stick_noise() {
+        let image = through_a_stick(&recoloured(&drawn(), [20, 30, 60], [240, 230, 200]), 3);
+        assert_eq!(read_with(&image, crate::capture::NOISE), ["Abc: $ ab", "", "CAB#?", ""]);
+        // Taken as exact, the same picture is all noise.
+        assert_ne!(read_with(&image, 0), ["Abc: $ ab", "", "CAB#?", ""]);
+    }
+
+    #[test]
+    fn dim_blue_text_on_black_reads_under_noise() {
+        let image = recoloured(&drawn(), [0, 0, 0], [0, 0, 85]);
+        assert_eq!(read_with(&image, crate::capture::NOISE), ["Abc: $ ab", "", "CAB#?", ""]);
+        let image = through_a_stick(&image, 0);
+        assert_eq!(read_with(&image, crate::capture::NOISE), ["Abc: $ ab", "", "CAB#?", ""]);
+    }
+
+    #[test]
+    fn a_blank_cell_lights_nothing_under_noise() {
+        let image = through_a_stick(&recoloured(&drawn(), [20, 30, 60], [20, 30, 60]), 3);
+        assert_eq!(read_with(&image, crate::capture::NOISE), ["", "", "", ""]);
+    }
+
+    #[test]
+    fn a_text_one_level_from_its_background_still_reads_in_exact_mode() {
+        let image = recoloured(&drawn(), [20, 30, 60], [21, 30, 60]);
+        assert_eq!(read_with(&image, 0), ["Abc: $ ab", "", "CAB#?", ""]);
+    }
+
+    #[test]
+    fn luma_weighs_green_most() {
+        assert_eq!(luma([0, 0, 0]), 0);
+        assert_eq!(luma([255, 255, 255]), 255);
+        assert_eq!(luma([255, 0, 0]), 76);
+        assert_eq!(luma([0, 255, 0]), 150);
+        assert_eq!(luma([0, 0, 85]), 10);
+    }
+
+    #[test]
+    fn finds_the_framebuffer_size_in_the_log() {
+        let log = "Framebuffer: console of 160x50 cells with font 8x16 at (0, 0)\n\
+                   [0.1] Framebuffer: 1024x768, 32 bits per pixel, pitch 4096, at 0xe0000000\n\
+                   Framebuffer: 1920x1080, 32 bits per pixel, pitch 7680, at 0xe0000000\n\
+                   Framebuffer: 800x600 with 16 bits per pixel is not supported\n\
+                   Framebuffer: 640x4";
+        assert_eq!(framebuffer_size(log), Some((1920, 1080)));
+        assert_eq!(framebuffer_size("Framebuffer: console of 160x50 cells\n"), None);
+        assert_eq!(framebuffer_size("Framebuffer: 1920x1080, 32 bits per pixel"), None);
     }
 }

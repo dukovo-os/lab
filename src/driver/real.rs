@@ -258,6 +258,45 @@ impl Drop for NetBoot {
     }
 }
 
+/// A kit's kernel command line with the machine's console in place of
+/// the kit's own. Kits name `console=ttyS0`, as QEMU's machines have it,
+/// and Linux keeps the options of a console's first mention: a later
+/// `console=ttyS0,115200` would leave the port at its default 9600 baud,
+/// which the lab reads at 115200 as a run of zero bytes.
+pub fn with_console(cmdline: &str, console: &str) -> String {
+    let mut words: Vec<&str> =
+        cmdline.split_whitespace().filter(|word| !word.starts_with("console=")).collect();
+    let console = format!("console={console}");
+    words.push(&console);
+    words.join(" ")
+}
+
+/// Waits for the Linux twin booted from `kit` to print its done line on
+/// the console logged in `log`, and gives what it printed.
+///
+/// # Errors
+///
+/// Fails at `deadline`, naming the log, and when the run is stopped.
+pub fn await_twin(kit: &Kit, log: &Path, deadline: Instant, stop: &Stop) -> Result<String, String> {
+    loop {
+        let text = crate::serial::read_log(log);
+        if text.contains(&kit.done) {
+            return Ok(text);
+        }
+        if stop.requested() {
+            return Err("the run was stopped".into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Linux did not print \"{}\" before the test's time limit; its console is in {}",
+                kit.done,
+                log.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Says that a person does `what` on a real machine, which `driver`
 /// cannot.
 pub fn persons_job(driver: &str, what: &str) -> String {
