@@ -228,6 +228,14 @@ pub trait Driver: Send {
     /// Saves the screen as a binary PPM file at `to`, for reading its text.
     fn screen_dump(&mut self, to: &Path) -> Result<(), String>;
 
+    /// How far a pixel of [`Driver::screen_dump`] may stray in brightness
+    /// (0 to 255) from what the machine drew: 0 where the dump is the
+    /// machine's own pixels (QEMU's screen, AMT's remote screen), more where
+    /// it is a picture of its video output (a capture stick).
+    fn screen_noise(&self) -> u8 {
+        0
+    }
+
     /// Runs `command` on the machine as the lab account, with `input` as
     /// its standard input (none: empty), stopping it at `deadline`, or
     /// sooner when the run is stopped or `stall` says it has gone quiet

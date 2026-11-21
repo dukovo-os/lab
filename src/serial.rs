@@ -80,7 +80,7 @@ impl SerialReader {
     pub fn start(port: &Path, baud: u32, log: &Path) -> Result<SerialReader, String> {
         let log = ConsoleLog::create(log)?;
         let done = Arc::new(AtomicBool::new(false));
-        let mut device = open_port(port, baud)?;
+        let mut device = open_port(port, baud, false)?;
         let thread = {
             let (log, done, port) = (log.clone(), Arc::clone(&done), port.to_path_buf());
             std::thread::spawn(move || {
@@ -98,7 +98,7 @@ impl SerialReader {
                         Err(_) => {
                             // Gone; wait for it to come back.
                             std::thread::sleep(Duration::from_secs(1));
-                            if let Ok(again) = open_port(&port, baud) {
+                            if let Ok(again) = open_port(&port, baud, false) {
                                 device = again;
                             }
                         }
@@ -135,18 +135,22 @@ pub fn open_log(path: &Path) -> Result<File, String> {
 /// Opens the port, set up for the lab: `baud`, raw, no echo, no flow
 /// control, and no waiting for a modem's carrier. Reads never wait: with
 /// nothing to read they say so at once. A plain file (in tests) is read
-/// as it grows.
-fn open_port(port: &Path, baud: u32) -> Result<File, String> {
-    let file =
-        OpenOptions::new().read(true).custom_flags(O_NOCTTY | O_NONBLOCK).open(port).map_err(
-            |err| {
-                format!(
-                    "the serial port {}: {err} (is the cable plugged in, and is this user in the \
+/// as it grows. The port is opened for writing too only when `writing` is
+/// set: the console readers only listen, and a cable that is written to
+/// (the CH9329's) needs the write side.
+pub fn open_port(port: &Path, baud: u32, writing: bool) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(writing)
+        .custom_flags(O_NOCTTY | O_NONBLOCK)
+        .open(port)
+        .map_err(|err| {
+            format!(
+                "the serial port {}: {err} (is the cable plugged in, and is this user in the \
                  dialout group?)",
-                    port.display()
-                )
-            },
-        )?;
+                port.display()
+            )
+        })?;
     let is_port = file.metadata().is_ok_and(|meta| meta.file_type().is_char_device());
     if is_port {
         // stty sets up the port it is given as its input, which this
@@ -179,7 +183,7 @@ pub fn read_log(path: &Path) -> String {
 
 /// Whether `port` opens for reading now, for `machines check`.
 pub fn check_port(port: &Path, baud: u32) -> Result<(), String> {
-    open_port(port, baud).map(drop)
+    open_port(port, baud, false).map(drop)
 }
 
 #[cfg(test)]
@@ -214,6 +218,16 @@ mod tests {
         assert!(wait_for(&second, "Boot complete."));
         assert!(!fs::read_to_string(&first).unwrap().contains("Boot complete."));
         drop(reader);
+    }
+
+    #[test]
+    fn a_port_is_opened_for_writing_only_when_asked() {
+        let dir = TempDir::new("serial-writing");
+        let port = dir.write("port", "");
+        let mut read_only = open_port(&port, 9600, false).unwrap();
+        assert!(read_only.write_all(b"x").is_err());
+        let mut writable = open_port(&port, 9600, true).unwrap();
+        writable.write_all(b"x").unwrap();
     }
 
     #[test]

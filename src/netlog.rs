@@ -5,22 +5,26 @@
 //! (ADR 0196) sends the system's log over UDP to the lab PC, and this
 //! reads it into the current boot's log.
 //!
-//! One thread listens for the whole run, as serial.rs's reader does for a
-//! port, and appends to whichever log the driver last named, so each boot
-//! gets a log of its own. Each datagram is one record, `<N>[ secs.micros]
-//! text`, with the syslog priority in front. The priority goes and the
-//! rest is kept, one line to a record, so the log reads as a serial log
-//! does. Only the machine's own address is listened to: another machine
-//! of the lab sends to the same port.
+//! Every lab image sends its netlog to the same port of the lab PC, and a
+//! port can be bound once, so the machines of a run share one listener
+//! per address bound: a thread for the whole run that sorts each datagram
+//! by the address it comes from into that machine's log, whichever log
+//! its driver last named, so each boot gets a log of its own. A datagram
+//! from an address no machine of the run has is dropped. The listener
+//! goes, and its port is free again, when the last machine's reader does.
+//!
+//! Each datagram is one record, `<N>[ secs.micros] text`, with the syslog
+//! priority in front. The priority goes and the rest is kept, one line to
+//! a record, so the log reads as a serial log does.
 //!
 //! The lab image names the lab PC (10.77.0.1, port 6666) as netlog's
 //! target in `/system/settings/netlog`. A boot log that stays empty while
-//! the machine runs means the image's netlog has no such target, or the
+//! the machine runs means the image's netlog has no such target, the
 //! machine file's `lab_address` and `netlog_port` are not what the image
-//! sends to.
+//! sends to, or its `machine_address` is not the address the machine has.
 
-use std::fs::File;
-use std::io::{ErrorKind, Write as _};
+use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,32 +32,30 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::serial::open_log;
+use crate::serial::ConsoleLog;
 
 /// The longest a netlog datagram is: netlog cuts a record at 1400 bytes.
 const DATAGRAM_LIMIT: usize = 2048;
 
-/// How long the thread waits for a datagram before it looks whether the
-/// run has ended.
+/// How long the thread waits for a datagram before it looks whether its
+/// last reader has gone.
 const LISTEN_TIME: Duration = Duration::from_millis(100);
 
-/// Reads one machine's netlog into the current log.
-pub struct NetlogReader {
-    log: Arc<Mutex<File>>,
+/// The listeners open in this process, one per address bound.
+static LISTENERS: Mutex<Vec<Arc<Listener>>> = Mutex::new(Vec::new());
+
+/// One bound socket, and the machines it reads for.
+struct Listener {
     local: SocketAddr,
-    done: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    /// Each machine's log, by the address its datagrams come from.
+    logs: Mutex<HashMap<IpAddr, ConsoleLog>>,
+    done: AtomicBool,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl NetlogReader {
-    /// Starts listening on `bind` for the datagrams of the machine at
-    /// `from`, into `log`.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `bind` cannot be bound (the port is another run's, or
-    /// the lab card lacks the address) or `log` cannot be made.
-    pub fn start(bind: SocketAddr, from: IpAddr, log: &Path) -> Result<NetlogReader, String> {
+impl Listener {
+    /// Binds `bind` and starts the thread that reads it.
+    fn bind(bind: SocketAddr) -> Result<Arc<Listener>, String> {
         let socket = UdpSocket::bind(bind).map_err(|err| {
             format!(
                 "the netlog reader cannot listen on {bind}: {err} (is the lab card up with that \
@@ -63,54 +65,107 @@ impl NetlogReader {
         })?;
         socket.set_read_timeout(Some(LISTEN_TIME)).map_err(|err| err.to_string())?;
         let local = socket.local_addr().map_err(|err| err.to_string())?;
-        let log = Arc::new(Mutex::new(open_log(log)?));
-        let done = Arc::new(AtomicBool::new(false));
+        let listener = Arc::new(Listener {
+            local,
+            logs: Mutex::new(HashMap::new()),
+            done: AtomicBool::new(false),
+            thread: Mutex::new(None),
+        });
         let thread = {
-            let (log, done) = (Arc::clone(&log), Arc::clone(&done));
-            std::thread::spawn(move || listen(&socket, from, &log, &done))
+            let listener = Arc::clone(&listener);
+            std::thread::spawn(move || listen(&socket, &listener))
         };
-        Ok(NetlogReader { log, local, done, thread: Some(thread) })
+        *listener.thread.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread);
+        Ok(listener)
+    }
+}
+
+/// Reads one machine's netlog into its current log.
+pub struct NetlogReader {
+    listener: Arc<Listener>,
+    from: IpAddr,
+    log: ConsoleLog,
+}
+
+impl NetlogReader {
+    /// Starts reading the datagrams of the machine at `from` that reach
+    /// `bind`, into `log`: on the listener another machine of the run
+    /// bound there already, or on a new one.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `bind` cannot be bound (the port is another run's, or
+    /// the lab card lacks the address), when another reader of the run
+    /// reads `from` there already, or when `log` cannot be made.
+    pub fn start(bind: SocketAddr, from: IpAddr, log: &Path) -> Result<NetlogReader, String> {
+        let log = ConsoleLog::create(log)?;
+        let mut listeners = LISTENERS.lock().unwrap_or_else(PoisonError::into_inner);
+        let listener = match listeners.iter().find(|listener| listener.local == bind) {
+            Some(listener) => Arc::clone(listener),
+            None => {
+                let listener = Listener::bind(bind)?;
+                listeners.push(Arc::clone(&listener));
+                listener
+            }
+        };
+        let mut logs = listener.logs.lock().unwrap_or_else(PoisonError::into_inner);
+        if logs.contains_key(&from) {
+            return Err(format!(
+                "two machines of this run send their netlog from {from}: each machine file \
+                 needs a machine_address of its own"
+            ));
+        }
+        logs.insert(from, log.clone());
+        drop(logs);
+        Ok(NetlogReader { listener, from, log })
     }
 
     /// The address listened on, which is `bind` with the port the system
     /// chose when `bind` asked for port 0.
     pub fn local_addr(&self) -> SocketAddr {
-        self.local
+        self.listener.local
     }
 
-    /// Sends what is read from now on to `log`, a new file.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `log` cannot be made.
-    pub fn switch_to(&self, log: &Path) -> Result<(), String> {
-        let file = open_log(log)?;
-        *self.log.lock().unwrap_or_else(PoisonError::into_inner) = file;
-        Ok(())
+    /// The log the machine's datagrams go to.
+    pub fn log(&self) -> &ConsoleLog {
+        &self.log
     }
 }
 
 impl Drop for NetlogReader {
     fn drop(&mut self) {
-        self.done.store(true, Ordering::Relaxed);
-        if let Some(thread) = self.thread.take() {
+        // The registry stays locked until the last reader's socket is
+        // closed, so a reader started meanwhile binds the port afresh
+        // rather than finding it taken.
+        let mut listeners = LISTENERS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut logs = self.listener.logs.lock().unwrap_or_else(PoisonError::into_inner);
+        logs.remove(&self.from);
+        let last = logs.is_empty();
+        drop(logs);
+        if !last {
+            return;
+        }
+        listeners.retain(|listener| !Arc::ptr_eq(listener, &self.listener));
+        self.listener.done.store(true, Ordering::Relaxed);
+        let thread = self.listener.thread.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
 }
 
-/// Appends each datagram from `from` to the log until `done`.
-fn listen(socket: &UdpSocket, from: IpAddr, log: &Mutex<File>, done: &AtomicBool) {
+/// Appends each datagram to the log of the machine it comes from, until
+/// the listener's last reader goes.
+fn listen(socket: &UdpSocket, listener: &Listener) {
     let mut buffer = [0u8; DATAGRAM_LIMIT];
-    while !done.load(Ordering::Relaxed) {
+    while !listener.done.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buffer) {
-            Ok((read, sender)) if sender.ip() == from => {
-                let line = record_line(&buffer[..read]);
-                let mut file = log.lock().unwrap_or_else(PoisonError::into_inner);
-                // A log that cannot be written loses the line; the run goes on.
-                let _ = file.write_all(line.as_bytes());
+            Ok((read, sender)) => {
+                let logs = listener.logs.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(log) = logs.get(&sender.ip()) {
+                    log.append(record_line(&buffer[..read]).as_bytes());
+                }
             }
-            Ok(_) => {}
             Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(_) => std::thread::sleep(LISTEN_TIME),
@@ -195,10 +250,65 @@ mod tests {
         send_from("127.0.0.1", reader.local_addr(), b"<6>[    0.1] first boot");
         assert!(wait_for(&first, "first boot"));
         let second = dir.path().join("logs/serial-2.log");
-        reader.switch_to(&second).unwrap();
+        reader.log().switch_to(&second).unwrap();
         send_from("127.0.0.1", reader.local_addr(), b"<6>[    0.1] second boot");
         assert!(wait_for(&second, "second boot"));
         assert!(!fs::read_to_string(&first).unwrap().contains("second boot"));
+    }
+
+    #[test]
+    fn machines_that_send_to_one_port_each_get_their_own_lines() {
+        let dir = TempDir::new("netlog-shared");
+        let (first, second) = (dir.path().join("first.log"), dir.path().join("second.log"));
+        let one = NetlogReader::start(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            &first,
+        )
+        .unwrap();
+        let port = one.local_addr();
+        let two = NetlogReader::start(port, "127.0.0.2".parse().unwrap(), &second).unwrap();
+        assert_eq!(two.local_addr(), port);
+        send_from("127.0.0.1", port, b"<6>[    0.1] from optiplex-2");
+        send_from("127.0.0.2", port, b"<6>[    0.1] from optiplex-3");
+        assert!(wait_for(&first, "from optiplex-2"));
+        assert!(wait_for(&second, "from optiplex-3"));
+        assert!(!fs::read_to_string(&first).unwrap().contains("optiplex-3"));
+        assert!(!fs::read_to_string(&second).unwrap().contains("optiplex-2"));
+        // One machine's reader going leaves the other's listening.
+        drop(one);
+        send_from("127.0.0.2", port, b"<6>[    0.2] still here");
+        assert!(wait_for(&second, "still here"));
+    }
+
+    #[test]
+    fn two_readers_for_one_sender_are_refused() {
+        let dir = TempDir::new("netlog-twice");
+        let from: IpAddr = "127.0.0.1".parse().unwrap();
+        let reader =
+            NetlogReader::start("127.0.0.1:0".parse().unwrap(), from, &dir.path().join("a.log"))
+                .unwrap();
+        let err = NetlogReader::start(reader.local_addr(), from, &dir.path().join("b.log"))
+            .err()
+            .unwrap();
+        assert!(err.contains("machine_address of its own"), "{err}");
+        // The refusal leaves the first reader reading.
+        send_from("127.0.0.1", reader.local_addr(), b"<6>[    0.1] first");
+        assert!(wait_for(&dir.path().join("a.log"), "first"));
+    }
+
+    #[test]
+    fn the_port_is_free_once_its_last_reader_goes() {
+        let dir = TempDir::new("netlog-free");
+        let reader = NetlogReader::start(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            &dir.path().join("a.log"),
+        )
+        .unwrap();
+        let port = reader.local_addr();
+        drop(reader);
+        UdpSocket::bind(port).unwrap();
     }
 
     #[test]

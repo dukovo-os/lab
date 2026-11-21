@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use super::real::{
     self, Check, LabSide, NetBoot, Verdict, WRITE_TIME, found, persons_job, problem, ssh_target,
+    with_console,
 };
 use super::{Driver, Setup};
 use crate::amt::{self, Amt, PowerChange};
@@ -646,19 +647,6 @@ fn read_password(path: &Path) -> Result<String, String> {
     Ok(password.to_string())
 }
 
-/// A kit's kernel command line with the machine's console in place of
-/// the kit's own. Kits name `console=ttyS0`, as QEMU's machines have it,
-/// and Linux keeps the options of a console's first mention: a later
-/// `console=ttyS0,115200` would leave the port at its default 9600 baud,
-/// which the lab reads at 115200 as a run of zero bytes.
-fn with_console(cmdline: &str, console: &str) -> String {
-    let mut words: Vec<&str> =
-        cmdline.split_whitespace().filter(|word| !word.starts_with("console=")).collect();
-    let console = format!("console={console}");
-    words.push(&console);
-    words.join(" ")
-}
-
 impl Driver for AmtDriver {
     fn boot_fresh(&mut self) -> Result<(), String> {
         self.boot += 1;
@@ -874,23 +862,7 @@ impl Driver for AmtDriver {
         self.console.log().switch_to(log)?;
         let cmdline = with_console(&kit.cmdline, self.settings.console());
         let booted = self.net_boot("the Linux twin", Offer::Twin { kit: kit.clone() }, &cmdline);
-        let measured = booted.and_then(|()| loop {
-            let text = crate::serial::read_log(log);
-            if text.contains(&kit.done) {
-                break Ok(text);
-            }
-            if self.setup.stop.requested() {
-                break Err("the run was stopped".into());
-            }
-            if Instant::now() >= deadline {
-                break Err(format!(
-                    "Linux did not print \"{}\" before the test's time limit; its console is in {}",
-                    kit.done,
-                    log.display()
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        });
+        let measured = booted.and_then(|()| real::await_twin(kit, log, deadline, &self.setup.stop));
         self.netboot.finish();
         let _ = self.hard_off();
         let _ = self.console.log().switch_to(&self.setup.work.join("serial-after-twin.log"));

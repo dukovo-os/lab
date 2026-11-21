@@ -381,8 +381,9 @@ impl AmtSettings {
     }
 }
 
-/// How the lab reaches a real machine with no AMT and no serial port, and
-/// boots it.
+/// How the lab reaches a real machine with no AMT, powered through a
+/// smart plug, and boots it; and the cables that give the lab its console
+/// from power-on, its screen, and a keyboard and mouse, when it has them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlugSettings {
@@ -427,6 +428,49 @@ pub struct PlugSettings {
     /// the test starts (see [`GROW_ROOT`](crate::run::GROW_ROOT)).
     #[serde(default = "default_grow_root")]
     pub grow_root: bool,
+    /// The lab PC's serial port that the machine's console is cabled to,
+    /// if it is: the console then comes from the cable, from the
+    /// firmware's first line, rather than from netlog, and the Linux twin
+    /// can be measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<PathBuf>,
+    /// The serial cable's speed.
+    #[serde(default = "default_baud")]
+    pub baud: u32,
+    /// The serial console as Linux names it, for the writer and the Linux
+    /// twin; `ttyS0,115200` (COM1) when none is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
+    /// The lab PC's video device of the HDMI capture stick that the
+    /// machine's screen is cabled to, if it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<PathBuf>,
+    /// The size of the pictures taken from the capture stick, `WxH`: the
+    /// machine's screen mode, so that each pixel is the machine's own.
+    #[serde(default = "default_capture_size")]
+    pub capture_size: String,
+    /// The lab PC's serial port of the CH9329 cable whose other end is
+    /// plugged into the machine as its keyboard and mouse, if it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hid: Option<PathBuf>,
+    /// The CH9329's serial speed.
+    #[serde(default = "default_hid_baud")]
+    pub hid_baud: u32,
+}
+
+impl PlugSettings {
+    /// The serial console as Linux names it: the machine file's, or the
+    /// board's first port, where a serial cable goes.
+    pub fn console(&self) -> &str {
+        self.console.as_deref().unwrap_or("ttyS0,115200")
+    }
+}
+
+fn default_capture_size() -> String {
+    "1920x1080".into()
+}
+fn default_hid_baud() -> u32 {
+    9600
 }
 
 fn default_grow_root() -> bool {
@@ -489,7 +533,7 @@ impl Machine {
             file: None,
             driver: DriverKind::Qemu,
             ready: DEFAULT_READY.into(),
-            controls: driver_controls(&DriverKind::Qemu),
+            controls: driver_controls(&DriverKind::Qemu, None),
             pool: None,
             spare: false,
             qemu: Some(QemuSettings::default()),
@@ -499,8 +543,9 @@ impl Machine {
     }
 }
 
-/// The controls a driver can do by itself.
-fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
+/// The controls a driver can do by itself, given a plug machine's
+/// settings, whose cables add to them.
+fn driver_controls(driver: &DriverKind, plug: Option<&PlugSettings>) -> BTreeMap<Control, Who> {
     match driver {
         // QMP does all of them, and SSH reaches the guest through QEMU's
         // port forwarding; a QEMU machine has no AMT.
@@ -533,15 +578,40 @@ fn driver_controls(driver: &DriverKind) -> BTreeMap<Control, Who> {
         .collect(),
         // The plug does power and the power cut (a hard power loss, which
         // the system gets no warning of), netlog the console, and the lab
-        // network SSH and the lab PC's side. The machine has no screen,
-        // keyboard or mouse the lab can reach, and no Linux twin yet.
+        // network SSH and the lab PC's side. Each cable the machine file
+        // names adds what it carries.
         DriverKind::Plug => {
-            [Control::Power, Control::Cord, Control::Serial, Control::Ssh, Control::Peer]
-                .into_iter()
-                .map(|control| (control, Who::Driver))
-                .collect()
+            let mut controls =
+                vec![Control::Power, Control::Cord, Control::Serial, Control::Ssh, Control::Peer];
+            if let Some(settings) = plug {
+                controls.extend(plug_cable_controls(settings));
+            }
+            controls.into_iter().map(|control| (control, Who::Driver)).collect()
         }
     }
+}
+
+/// The key naming the plug machine's cable that carries `control`: a
+/// serial cable reads the console from power-on and the Linux twin's, a
+/// capture stick takes the screen, and a CH9329 cable is the keyboard and
+/// mouse. None for a control no cable carries.
+fn plug_cable(control: Control) -> Option<&'static str> {
+    match control {
+        Control::EarlyConsole | Control::Linux => Some("serial"),
+        Control::Screen => Some("capture"),
+        Control::Keys | Control::Mouse => Some("hid"),
+        _ => None,
+    }
+}
+
+/// The controls the cables `settings` names carry.
+fn plug_cable_controls(settings: &PlugSettings) -> impl Iterator<Item = Control> + '_ {
+    Control::ALL.into_iter().filter(|&control| match plug_cable(control) {
+        Some("serial") => settings.serial.is_some(),
+        Some("capture") => settings.capture.is_some(),
+        Some("hid") => settings.hid.is_some(),
+        _ => false,
+    })
 }
 
 /// A machine file as written.
@@ -643,11 +713,17 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
             "spare = true needs a pool: a spare is kept out of a run on its pool".into()
         ));
     }
-    let mut controls = driver_controls(&file.driver);
+    let plug_settings = file.plug.as_ref().filter(|_| file.driver == DriverKind::Plug);
+    let mut controls = driver_controls(&file.driver, plug_settings);
     for (control, who) in file.controls {
         // A file may hand a control to a person or take it away, but cannot
         // make a driver do what it cannot.
         if who == Who::Driver && controls.get(&control) != Some(&Who::Driver) {
+            if let (Some(_), Some(key)) = (plug_settings, plug_cable(control)) {
+                return Err(bad(format!(
+                    "the plug driver does {control} only through the cable plug.{key} names"
+                )));
+            }
             return Err(bad(format!("the {:?} driver cannot do {control}", file.driver)));
         }
         // A person can pull a cord but cannot hand the runner Linux's
@@ -782,7 +858,7 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
     if settings.user.is_empty() {
         return Err("amt.user must name AMT's user, admin as a rule".into());
     }
-    if ![9600, 19_200, 38_400, 57_600, 115_200].contains(&settings.baud) {
+    if !SERIAL_SPEEDS.contains(&settings.baud) {
         return Err("amt.baud must be 9600, 19200, 38400, 57600 or 115200".into());
     }
     if let Some(console) = &settings.console
@@ -825,8 +901,34 @@ fn check_plug(settings: &PlugSettings) -> Result<(), String> {
                     runs, in watts"
             .into());
     }
+    if !SERIAL_SPEEDS.contains(&settings.baud) {
+        return Err("plug.baud must be 9600, 19200, 38400, 57600 or 115200".into());
+    }
+    if let Some(console) = &settings.console
+        && (console.is_empty() || console.contains(char::is_whitespace))
+    {
+        return Err("plug.console must be one Linux console name, such as ttyS0,115200".into());
+    }
+    crate::capture::parse_size(&settings.capture_size)
+        .map_err(|err| format!("plug.capture_size: {err}"))?;
+    if !HID_SPEEDS.contains(&settings.hid_baud) {
+        return Err("plug.hid_baud must be one of the CH9329's speeds: 1200, 2400, 4800, 9600, \
+                    14400, 19200, 38400, 57600 or 115200"
+            .into());
+    }
+    if settings.serial.is_some() && settings.serial == settings.hid {
+        return Err("plug.serial and plug.hid name the same port: the console cable and the \
+                    CH9329 cable are two cables"
+            .into());
+    }
     Ok(())
 }
+
+/// The speeds a serial console is read at.
+const SERIAL_SPEEDS: [u32; 5] = [9600, 19_200, 38_400, 57_600, 115_200];
+
+/// The serial speeds a CH9329 can be set to.
+const HID_SPEEDS: [u32; 9] = [1200, 2400, 4800, 9600, 14_400, 19_200, 38_400, 57_600, 115_200];
 
 /// The settings of the lab network that every real machine's file has.
 struct LabKeys<'a> {
@@ -1106,6 +1208,31 @@ mod tests {
         assert_eq!(plug.shelly, "192.168.1.3");
         assert_eq!(plug.machine_address, "10.77.0.3");
         assert_eq!(plug.netlog_port, 6666);
+        assert_eq!(m75q.pool, None);
+        for control in [Control::Screen, Control::Keys, Control::Mouse, Control::EarlyConsole] {
+            assert_eq!(m75q.who(control), Who::None);
+        }
+    }
+
+    #[test]
+    fn the_example_plug_machine_with_cables_has_their_controls() {
+        let folder = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/machines"));
+        let machines = load(folder).unwrap();
+        let cabled = machines.iter().find(|machine| machine.name == "optiplex-plug").unwrap();
+        assert_eq!(cabled.driver, DriverKind::Plug);
+        assert_eq!(cabled.pool, None);
+        let plug = cabled.plug.as_ref().unwrap();
+        assert_eq!(plug.machine_address, "10.77.0.4");
+        assert_eq!(plug.boot_port, 7439);
+        assert_eq!(plug.capture_size, "1920x1080");
+        assert!(plug.serial.is_some() && plug.capture.is_some() && plug.hid.is_some());
+        for control in
+            [Control::Screen, Control::Keys, Control::Mouse, Control::EarlyConsole, Control::Linux]
+        {
+            assert_eq!(cabled.who(control), Who::Driver, "{control}");
+        }
+        assert_eq!(cabled.who(Control::Usb), Who::Person);
+        assert_eq!(cabled.who(Control::Amt), Who::None);
     }
 
     #[test]
@@ -1137,6 +1264,41 @@ mod tests {
         assert_eq!(plug.machine_address, "10.77.0.2");
         assert_eq!(plug.lab_address, "10.77.0.1");
         assert_eq!(plug.tftp, Path::new("/srv/dukovo-lab/tftp"));
+    }
+
+    #[test]
+    fn a_plug_machine_s_cables_add_what_they_carry() {
+        let dir = TempDir::new("machines-plug-cables");
+        let plug = |name: &str, cables: &str| {
+            dir.write(
+                &format!("{name}.toml"),
+                &format!(
+                    "about = \"x\"\ndriver = \"plug\"\n[plug]\nshelly = \"192.168.1.3\"\n\
+                     mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n{cables}"
+                ),
+            );
+        };
+        plug("bare", "");
+        plug("console", "serial = \"/dev/ttyUSB0\"\n");
+        plug("screen", "capture = \"/dev/video0\"\n");
+        plug("hid", "hid = \"/dev/ttyUSB1\"\n");
+        let machines = load(dir.path()).unwrap();
+        let carried = |name: &str| -> Vec<Control> {
+            let machine = machines.iter().find(|machine| machine.name == name).unwrap();
+            [Control::EarlyConsole, Control::Linux, Control::Screen, Control::Keys, Control::Mouse]
+                .into_iter()
+                .filter(|&control| machine.who(control) == Who::Driver)
+                .collect()
+        };
+        assert_eq!(carried("bare"), []);
+        assert_eq!(carried("console"), [Control::EarlyConsole, Control::Linux]);
+        assert_eq!(carried("screen"), [Control::Screen]);
+        assert_eq!(carried("hid"), [Control::Keys, Control::Mouse]);
+        let bare = machines.iter().find(|machine| machine.name == "bare").unwrap();
+        let settings = bare.plug.as_ref().unwrap();
+        assert_eq!(settings.console(), "ttyS0,115200");
+        assert_eq!((settings.capture_size.as_str(), settings.hid_baud), ("1920x1080", 9600));
+        assert_eq!(settings.baud, 115_200);
     }
 
     #[test]
@@ -1180,12 +1342,17 @@ mod tests {
     }
 
     #[test]
-    fn the_console_from_the_power_on_is_amt_s_and_qemu_s_alone() {
+    fn the_console_from_the_power_on_needs_qemu_amt_or_a_cable() {
         let dir = TempDir::new("machines-early-console");
         dir.write(
             "plugbox.toml",
             "about = \"x\"\ndriver = \"plug\"\n[plug]\nshelly = \"192.168.1.3\"\n\
              mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n",
+        );
+        dir.write(
+            "cabledbox.toml",
+            "about = \"x\"\ndriver = \"plug\"\n[plug]\nshelly = \"192.168.1.4\"\n\
+             mac = \"aa:bb:cc:00:11:23\"\ndisk = \"E\"\nserial = \"/dev/ttyUSB1\"\n",
         );
         dir.write(
             "amtbox.toml",
@@ -1200,6 +1367,7 @@ mod tests {
         assert_eq!(who("qemu"), Who::Driver);
         assert_eq!(who("amtbox"), Who::Driver);
         assert_eq!(who("plugbox"), Who::None);
+        assert_eq!(who("cabledbox"), Who::Driver);
         assert_eq!(Control::EarlyConsole.name(), "early-console");
         // A machine file names it with the same spelling.
         dir.write(
@@ -1241,11 +1409,26 @@ mod tests {
             (plug("shelly = \"192.168.1.3\"\nlab_address = \"lab\"\n"), "plug.lab_address"),
             (plug("shelly = \"192.168.1.3\"\nnetlog_port = 0\n"), "plug.netlog_port"),
             (plug("shelly = \"192.168.1.3\"\non_watts = 0.0\n"), "plug.on_watts"),
-            (plug("shelly = \"192.168.1.3\"\nbaud = 9600\n"), "unknown field `baud`"),
+            (plug("shelly = \"192.168.1.3\"\nbaud = 9601\n"), "plug.baud"),
+            (plug("shelly = \"192.168.1.3\"\nconsole = \"tty S0\"\n"), "plug.console"),
+            (plug("shelly = \"192.168.1.3\"\ncapture_size = \"1921x1080\"\n"), "plug.capture_size"),
+            (plug("shelly = \"192.168.1.3\"\ncapture_size = \"big\"\n"), "plug.capture_size"),
+            (plug("shelly = \"192.168.1.3\"\nhid_baud = 9601\n"), "plug.hid_baud"),
+            (
+                plug(
+                    "shelly = \"192.168.1.3\"\nserial = \"/dev/ttyUSB0\"\nhid = \"/dev/ttyUSB0\"\n",
+                ),
+                "two cables",
+            ),
             (
                 plug("shelly = \"192.168.1.3\"\n[controls]\nscreen = \"driver\"\n"),
-                "cannot do screen",
+                "does screen only through the cable plug.capture names",
             ),
+            (
+                plug("shelly = \"192.168.1.3\"\n[controls]\nlinux = \"driver\"\n"),
+                "does linux only through the cable plug.serial names",
+            ),
+            (plug("shelly = \"192.168.1.3\"\n[controls]\namt = \"driver\"\n"), "cannot do amt"),
             (
                 plug("shelly = \"192.168.1.3\"\n").replace("\"plug\"", "\"qemu\""),
                 "[plug] is for machines whose driver is plug",

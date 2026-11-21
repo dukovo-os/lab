@@ -28,14 +28,15 @@ cord = "person"    # treat pulling the cord as a person's job here
 [machines/optiplex.toml](../machines/optiplex.toml) one for a real
 machine with Intel AMT, and [machines/m75q.toml](../machines/m75q.toml)
 one for a real machine on a Shelly smart plug (see
-[Real machines](real-machines.md)).
+[Real machines](real-machines.md)). [machines/optiplex-plug.toml](../machines/optiplex-plug.toml)
+is the same with an HDMI capture stick, a CH9329 cable and a serial cable.
 
 ## Keys
 
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `about` | yes | What the machine is, in one line. |
-| `driver` | yes | How the lab controls it: `qemu`; `amt` for a real machine with Intel AMT; or `plug` for a real machine with neither AMT nor a serial port, powered through a Shelly smart plug. |
+| `driver` | yes | How the lab controls it: `qemu`; `amt` for a real machine with Intel AMT; or `plug` for a real machine without AMT, powered through a Shelly smart plug, with optional cables to the lab PC for its console, screen, keyboard and mouse. |
 | `pool` | no | The pool the machine belongs to (below). |
 | `spare` | no | `true` keeps the machine out of a run on its pool, which uses it to run failed tests again (below). Needs `pool`. |
 | `ready` | no | The serial console line that says the machine has booted. Default `Boot complete.` |
@@ -125,7 +126,7 @@ What each driver does by itself:
 | --- | --- |
 | `qemu` | All of them but `amt`. |
 | `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial` and `early-console` (AMT's Serial-over-LAN, or the serial cable the machine file names, either of which carries the firmware's and GRUB's lines too), `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
-| `plug` | `power` (the plug switches the machine on, and a reset is the plug off and on again; the power button and a graceful `off` are not available), `cord` (the plug off: a hard power loss the system gets no warning of), `serial` (the console over netlog, which starts once the network is up and stops when it goes down), `ssh` and `peer`. `early-console`, `keys`, `mouse`, `screen`, `linux` and `amt` are `none`. Cables, sticks, cards and discs can be handed to a person. |
+| `plug` | `power` (the plug switches the machine on, and a reset is the plug off and on again; the power button and a graceful `off` are not available), `cord` (the plug off: a hard power loss the system gets no warning of), `serial` (the console over netlog, which starts once the network is up and stops when it goes down, or over the serial cable the file names), `ssh` and `peer`. Each cable the file names adds controls: `plug.serial` adds `early-console` and `linux`, `plug.capture` adds `screen`, and `plug.hid` adds `keys` and `mouse`. Without its cable, each of these stays `none`, as does `amt`. Cables, sticks, cards and discs can be handed to a person. |
 
 ## QEMU hardware
 
@@ -169,9 +170,11 @@ lab network. [Real machines](real-machines.md) sets one up.
 
 ## Plug settings
 
-A machine whose driver is `plug` is a real machine with neither Intel AMT
-nor a serial port, on the lab network, powered through a Shelly smart plug
-(Gen 2 or later) on the home network. [Real machines](real-machines.md)
+A machine whose driver is `plug` is a real machine without Intel AMT, on
+the lab network, powered through a Shelly smart plug (Gen 2 or later) on
+the home network. It may have up to three cables to the lab PC: a serial
+cable, an HDMI capture stick and a CH9329 keyboard and mouse cable. Each
+one named below turns on its controls. [Real machines](real-machines.md)
 sets one up.
 
 | Key | Default | Meaning |
@@ -185,6 +188,13 @@ sets one up.
 | `boot_port` | `7431` | The first of the net-boot server's four ports, as for `amt`. |
 | `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
-| `netlog_port` | `6666` | The UDP port the lab PC listens on for the machine's netlog. The lab image sends to 6666, so change this only with the image. A run listens on one port, so only one plug machine runs at a time. |
+| `netlog_port` | `6666` | The UDP port the lab PC listens on for the machine's netlog. The lab image sends to 6666, so change this only with the image. Plug machines in one run share the port, and each one's datagrams are told apart by its `machine_address`, so two machines with the same address in one run are refused. |
 | `on_watts` | `5.0` | The least the machine draws while it runs, in watts. A plug that is on with the machine drawing less means the machine shut itself down. |
 | `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. A QEMU machine's disk is an 8 GiB overlay over the image, and its `[qemu]` section takes the same setting. |
+| `serial` | none | The lab PC's serial port that the cable to the board's COM1 is plugged into. With it, the console comes over the cable, the firmware's and GRUB's lines too (`early-console`), the writer's console is `writer-<n>.log`, and the Linux twin can run (`linux`). Without it, the console comes over netlog. Name it as `/dev/serial/by-path/...`: cheap cables of one model share their `/dev/serial/by-id/` names. |
+| `baud` | `115200` | The serial cable's speed: 9600, 19200, 38400, 57600 or 115200. |
+| `console` | `ttyS0,115200` | The serial port as Linux names it, for the writer and the Linux twin: one name with no spaces. `ttyS0` is the board's COM1. |
+| `capture` | none | The video device of the HDMI capture stick, which brings `screen`, such as `/dev/v4l/by-path/...-video-index0`. Cheap sticks of one model share their `by-id` names, so use the `by-path` name. Needs `v4l-utils` and the `video` group on the lab PC. |
+| `capture_size` | `1920x1080` | The size of the pictures taken from the stick, `WIDTHxHEIGHT`, with an even width of 2 to 7680 and a height of 1 to 4320. It must be the size of the machine's screen, which Dukovo prints in its console as `Framebuffer: WxH, ...`; a picture of another size is refused with a message naming the setting. |
+| `hid` | none | The lab PC's serial port of the CH9329 cable, which brings `keys` and `mouse`. Name it as `/dev/serial/by-path/...`, for the reason given for `serial`. It must be a different port from `serial`. |
+| `hid_baud` | `9600` | The CH9329's serial speed: 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600 or 115200. A new cable speaks 9600. |
