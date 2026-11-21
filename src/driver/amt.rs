@@ -12,8 +12,13 @@
 //!   net-boot server hands it writes the image and checks it, and the
 //!   machine restarts into its disk (see netboot.rs). Only the disk with
 //!   the machine file's serial number is ever written.
-//! - **The serial console** comes over a serial cable into a port of the
-//!   lab PC's, one log per boot (see serial.rs).
+//! - **The serial console** comes from AMT's Serial-over-LAN (see
+//!   sol.rs), which AMT shows the system as a serial port of its own, or
+//!   over a serial cable into a port of the lab PC's when the machine
+//!   file names one (see serial.rs): one log per boot either way. The
+//!   driver turns Serial-over-LAN on as it starts, and keeps its session
+//!   open across boots: AMT drops what the system writes while no
+//!   session is open.
 //! - **SSH** and the lab PC's side of a test reach the machine on the lab
 //!   network, where it has an address of its own, so the machine's ports
 //!   are reached as they are.
@@ -33,7 +38,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::real::{
@@ -44,7 +48,8 @@ use crate::amt::{self, Amt, PowerChange};
 use crate::bench::Kit;
 use crate::machines::AmtSettings;
 use crate::netboot::{self, Offer};
-use crate::serial::SerialReader;
+use crate::serial::{ConsoleLog, SerialReader};
+use crate::sol::{self, Sign, SolReader};
 use crate::ssh;
 use crate::suite::{Button, PowerAction, Stick};
 use crate::vnc::{self, Vnc};
@@ -108,13 +113,30 @@ fn prime(vnc: &mut Vnc) -> Result<(), String> {
     Ok(())
 }
 
+/// What reads the machine's serial console, until the driver is
+/// dropped.
+enum ConsoleReader {
+    Cable(SerialReader),
+    Sol(SolReader),
+}
+
+impl ConsoleReader {
+    /// The log the console goes to.
+    fn log(&self) -> &ConsoleLog {
+        match self {
+            ConsoleReader::Cable(reader) => reader.log(),
+            ConsoleReader::Sol(reader) => reader.log(),
+        }
+    }
+}
+
 /// A real machine driven through AMT.
 pub struct AmtDriver {
     settings: AmtSettings,
     setup: Setup,
     amt: Amt,
     netboot: NetBoot,
-    serial: Arc<SerialReader>,
+    console: ConsoleReader,
     /// The current boot's serial log.
     serial_log: PathBuf,
     boot: u32,
@@ -138,26 +160,47 @@ pub struct AmtDriver {
 
 impl AmtDriver {
     /// Gets ready to drive the machine: reads AMT's password and the
-    /// writer's kit, and starts the net-boot server and the serial
-    /// reader. Leaves the machine's power as it is.
+    /// writer's kit, and starts the net-boot server and the console's
+    /// reader, turning Serial-over-LAN on if the console is read from it.
+    /// Leaves the machine's power as it is.
     pub fn new(settings: AmtSettings, setup: Setup) -> Result<AmtDriver, String> {
+        let console_address = format!("{}:{}", amt_host(&settings), sol::PORT);
+        AmtDriver::start(settings, setup, console_address)
+    }
+
+    /// As [`AmtDriver::new`], with AMT's Serial-over-LAN at
+    /// `console_address`.
+    fn start(
+        settings: AmtSettings,
+        setup: Setup,
+        console_address: String,
+    ) -> Result<AmtDriver, String> {
         let password = read_password(&settings.password_file)?;
         fs::create_dir_all(&setup.logs)
             .and_then(|()| fs::create_dir_all(&setup.work))
             .map_err(|err| format!("making the machine's folders: {err}"))?;
-        let netboot = NetBoot::start(&lab_side(&settings), &setup.logs.join("amt.log"))?;
-        // Until the first boot, what the port says goes to a scratch log.
-        let before = setup.work.join("serial-before.log");
-        let serial = Arc::new(SerialReader::start(&settings.serial, settings.baud, &before)?);
+        let mut netboot = NetBoot::start(&lab_side(&settings), &setup.logs.join("amt.log"))?;
         let amt = Amt::new(&settings.address, &settings.user, &password);
-        let host = settings.address.split(':').next().unwrap_or_default();
-        let screen_address = format!("{host}:{}", vnc::PORT);
+        // Until the first boot, what the console says goes to a scratch log.
+        let before = setup.work.join("serial-before.log");
+        let console = match &settings.serial {
+            Some(port) => {
+                netboot.note(&format!("console: serial port {}", port.display()));
+                ConsoleReader::Cable(SerialReader::start(port, settings.baud, &before)?)
+            }
+            None => {
+                amt.turn_on_serial_over_lan().inspect_err(|err| netboot.note(err))?;
+                let sign = Sign { address: console_address, user: settings.user.clone(), password };
+                ConsoleReader::Sol(SolReader::start(sign, &before, netboot.log())?)
+            }
+        };
+        let screen_address = format!("{}:{}", amt_host(&settings), vnc::PORT);
         let mut driver = AmtDriver {
             settings,
             setup,
             amt,
             netboot,
-            serial,
+            console,
             serial_log: before,
             boot: 0,
             power: None,
@@ -170,11 +213,10 @@ impl AmtDriver {
             pointer: (0, 0),
         };
         driver.note(&format!(
-            "AMT at {}; net-boot server at {}, ports {}; serial port {}",
+            "AMT at {}; net-boot server at {}, ports {}",
             driver.settings.address,
             driver.settings.lab_address,
-            driver.netboot.ports(),
-            driver.settings.serial.display()
+            driver.netboot.ports()
         ));
         Ok(driver)
     }
@@ -183,7 +225,9 @@ impl AmtDriver {
     /// changes down while a remote screen session is open (AMT 11.8 on an
     /// OptiPlex 7040 answers ReturnValue 2), so the session is closed
     /// first, and the change tried again while AMT sees it close; the next
-    /// look at the screen opens another.
+    /// look at the screen opens another. A Serial-over-LAN session stays
+    /// open, so the console from the power on is read, unless AMT turns
+    /// the change down: then it is closed until the change is made.
     fn change(&mut self, change: PowerChange) -> Result<(), String> {
         let screen_was_open = self.screen.take().is_some();
         if screen_was_open {
@@ -203,13 +247,26 @@ impl AmtDriver {
         }
         self.note(&format!("power: {change:?}"));
         let deadline = Instant::now() + SCREEN_CLOSE_TIME;
+        let mut console_held = None;
         let changed = loop {
             let changed = self.amt.change_power(change);
-            if changed.is_ok() || !screen_was_open || Instant::now() >= deadline {
+            let Err(err) = &changed else { break changed };
+            if Instant::now() >= deadline {
+                break changed;
+            }
+            if console_held.is_none()
+                && let ConsoleReader::Sol(reader) = &self.console
+            {
+                console_held = Some(reader.hold());
+                self.note(&format!(
+                    "power: {err}; asking again with the Serial-over-LAN session closed"
+                ));
+            } else if !screen_was_open && console_held.is_none() {
                 break changed;
             }
             std::thread::sleep(Duration::from_millis(500));
         };
+        drop(console_held);
         match &changed {
             Ok(()) if matches!(change, PowerChange::On | PowerChange::Reset) => {
                 self.last_start = Some(Instant::now());
@@ -298,10 +355,10 @@ impl AmtDriver {
     fn write_image(&mut self) -> Result<(), String> {
         let image = self.netboot.image(&self.setup.image)?;
         let writer_log = self.setup.logs.join(format!("writer-{}.log", self.boot));
-        self.serial.switch_to(&writer_log)?;
+        self.console.log().switch_to(&writer_log)?;
         let written = {
-            let (serial, next, script) = (
-                Arc::clone(&self.serial),
+            let (console, next, script) = (
+                self.console.log().clone(),
                 self.serial_log.clone(),
                 self.netboot.script().to_path_buf(),
             );
@@ -309,7 +366,7 @@ impl AmtDriver {
             // find the script, and its console goes to the boot's log.
             Box::new(move || {
                 netboot::remove_script(&script);
-                let _ = serial.switch_to(&next);
+                let _ = console.switch_to(&next);
             })
         };
         let offer = Offer::Writer {
@@ -322,7 +379,7 @@ impl AmtDriver {
         // file's MAC gets the machine's address on the lab's /24.
         let cmdline = format!(
             "{} dukovo.lab={{base}} dukovo.lab.ip={}/24 dukovo.lab.mac={}",
-            with_console(&self.netboot.writer.cmdline, &self.settings.console),
+            with_console(&self.netboot.writer.cmdline, self.settings.console()),
             self.settings.machine_address,
             self.settings.mac.to_ascii_lowercase()
         );
@@ -337,7 +394,7 @@ impl AmtDriver {
             Err(why) => {
                 // A writer that failed must not be left running.
                 let _ = self.hard_off();
-                let _ = self.serial.switch_to(&self.serial_log);
+                let _ = self.console.log().switch_to(&self.serial_log);
                 self.note(&format!("net boot: {why}"));
                 Err(format!(
                     "{why}; the writer's console is in {}, and what the driver did in amt.log",
@@ -432,9 +489,20 @@ impl AmtDriver {
 
 /// Checks what a run on the machine needs, without changing anything:
 /// AMT's password, address and mode, its remote screen when the driver
-/// does the machine's `screen`, the serial port, the lab network, the TFTP
-/// folder and network GRUB, the writer's kit and the lab key.
+/// does the machine's `screen`, the console (Serial-over-LAN, or the
+/// serial port), the lab network, the TFTP folder and network GRUB, the
+/// writer's kit and the lab key.
 pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Check> {
+    check_with(settings, key, screen, &format!("{}:{}", amt_host(settings), sol::PORT))
+}
+
+/// As [`check`], with AMT's Serial-over-LAN at `console_address`.
+fn check_with(
+    settings: &AmtSettings,
+    key: Option<&Path>,
+    screen: bool,
+    console_address: &str,
+) -> Vec<Check> {
     let mut checks = Vec::new();
     let mut add = |check: &'static str, result: Result<String, (Verdict, String)>| {
         checks.push(found(check, result));
@@ -491,6 +559,14 @@ pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Ch
                         },
                     );
                 }
+                if settings.serial.is_none() {
+                    let sign = Sign {
+                        address: console_address.to_string(),
+                        user: settings.user.clone(),
+                        password: password.clone(),
+                    };
+                    add("serial over lan", check_serial_over_lan(&amt, &sign));
+                }
                 add(
                     "power button",
                     match amt.power_changes() {
@@ -509,14 +585,34 @@ pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Ch
             }
         }
     }
-    add(
-        "serial port",
-        crate::serial::check_port(&settings.serial, settings.baud)
-            .map(|()| format!("{} opens, at {} baud", settings.serial.display(), settings.baud))
-            .map_err(problem),
-    );
+    if let Some(port) = &settings.serial {
+        add(
+            "serial port",
+            crate::serial::check_port(port, settings.baud)
+                .map(|()| format!("{} opens, at {} baud", port.display(), settings.baud))
+                .map_err(problem),
+        );
+    }
     checks.extend(real::check_lab_side(&lab_side(settings), key));
     checks
+}
+
+/// Whether the console can be read from AMT's Serial-over-LAN: a session
+/// opens, and closes, when it is on; when it is off, the driver turns it
+/// on as a run starts, which a check leaves undone.
+fn check_serial_over_lan(amt: &Amt, sign: &Sign) -> Result<String, (Verdict, String)> {
+    let found = amt.serial_over_lan().map_err(problem)?;
+    if !found.on || !found.listener {
+        return Ok("off for now: the driver turns it on as a run starts (if AMT will not, turn \
+                   SOL on in MEBx)"
+            .into());
+    }
+    sol::try_session(sign).map(|()| format!("a session opens at {}", sign.address)).map_err(problem)
+}
+
+/// AMT's host, without the port.
+fn amt_host(settings: &AmtSettings) -> &str {
+    settings.address.split(':').next().unwrap_or_default()
 }
 
 /// What the machine file says about the lab network.
@@ -775,8 +871,8 @@ impl Driver for AmtDriver {
     fn linux_twin(&mut self, kit: &Kit, log: &Path, deadline: Instant) -> Result<String, String> {
         self.note("Linux twin: booting");
         self.hard_off()?;
-        self.serial.switch_to(log)?;
-        let cmdline = with_console(&kit.cmdline, &self.settings.console);
+        self.console.log().switch_to(log)?;
+        let cmdline = with_console(&kit.cmdline, self.settings.console());
         let booted = self.net_boot("the Linux twin", Offer::Twin { kit: kit.clone() }, &cmdline);
         let measured = booted.and_then(|()| loop {
             let text = crate::serial::read_log(log);
@@ -797,7 +893,7 @@ impl Driver for AmtDriver {
         });
         self.netboot.finish();
         let _ = self.hard_off();
-        let _ = self.serial.switch_to(&self.setup.work.join("serial-after-twin.log"));
+        let _ = self.console.log().switch_to(&self.setup.work.join("serial-after-twin.log"));
         self.note(&format!("Linux twin: {}", if measured.is_ok() { "measured" } else { "failed" }));
         measured
     }
@@ -820,28 +916,38 @@ mod tests {
     use super::*;
     use crate::amt::fake::{FakeAmt, PASSWORD, USER};
     use crate::netboot::tests::{make_image, pretend_writer};
+    use crate::sol::fake::FakeSol;
     use crate::stop::Stop;
     use crate::testing::TempDir;
     use crate::vnc::fake::{Event, FakeVnc, pattern};
     use std::fs::OpenOptions;
     use std::io::Write as _;
+    use std::sync::Arc;
 
     const MAC: &str = "aa:bb:cc:00:11:22";
 
     /// A machine behind a pretend AMT: a net boot runs the pretend writer
     /// (or prints what a Linux twin would), and the disk boots to its
-    /// ready line, on a plain file standing in for the serial port.
+    /// ready line, on AMT's pretend Serial-over-LAN, or with `cable` on a
+    /// plain file standing in for the serial port.
     struct Bench {
         dir: TempDir,
         fake: FakeAmt,
+        /// AMT's Serial-over-LAN, when the console is read from it.
+        sol: Option<Arc<FakeSol>>,
         /// AMT's remote screen, open once the pretend AMT turns it on.
         screen: FakeVnc,
         driver: AmtDriver,
     }
 
     fn bench(label: &str, tamper: bool) -> Bench {
+        bench_with(label, tamper, false)
+    }
+
+    fn bench_with(label: &str, tamper: bool, cable: bool) -> Bench {
         let dir = TempDir::new(label);
         let port = dir.write("ttyUSB0", "");
+        let sol = (!cable).then(|| Arc::new(FakeSol::start()));
         dir.write("writer/kernel", "KERNEL");
         dir.write("writer/initrd", "INITRD");
         dir.write(
@@ -855,14 +961,18 @@ mod tests {
         let tftp = dir.path().join("tftp");
         let disk = dir.path().join("disk");
         {
-            let (tftp, port, disk) = (tftp.clone(), port.clone(), disk.clone());
+            let (tftp, port, disk, sol) = (tftp.clone(), port.clone(), disk.clone(), sol.clone());
             fake.state.lock().unwrap().on_boot = Some(Box::new(move |network| {
-                let (tftp, port, disk) = (tftp.clone(), port.clone(), disk.clone());
+                let (tftp, port, disk, sol) =
+                    (tftp.clone(), port.clone(), disk.clone(), sol.clone());
                 // As the machine would: the firmware, then what it boots.
                 std::thread::spawn(move || {
-                    let say_bytes = |bytes: &[u8]| {
-                        let mut port = OpenOptions::new().append(true).open(&port).unwrap();
-                        port.write_all(bytes).unwrap();
+                    let say_bytes = |bytes: &[u8]| match &sol {
+                        Some(sol) => sol.say(bytes),
+                        None => {
+                            let mut port = OpenOptions::new().append(true).open(&port).unwrap();
+                            port.write_all(bytes).unwrap();
+                        }
                     };
                     let say = |text: &str| say_bytes(text.as_bytes());
                     let script = fs::read_to_string(netboot::script_path(&tftp, MAC));
@@ -895,14 +1005,14 @@ mod tests {
             password_file: password,
             mac: MAC.into(),
             disk: "TESTDISK".into(),
-            serial: port,
+            serial: cable.then_some(port),
             baud: 115_200,
             machine_address: "127.0.0.1".into(),
             lab_address: "127.0.0.1".into(),
             boot_port: 0,
             tftp,
             writer: dir.path().join("writer"),
-            console: "ttyS4,115200".into(),
+            console: None,
             grow_root: true,
         };
         let setup = Setup {
@@ -915,7 +1025,9 @@ mod tests {
             ob: None,
             stop: Stop::default(),
         };
-        let mut driver = AmtDriver::new(settings, setup).unwrap();
+        let console_address =
+            sol.as_ref().map_or_else(|| "unused".into(), |sol| sol.address.to_string());
+        let mut driver = AmtDriver::start(settings, setup, console_address).unwrap();
         // Tests of the wait after a start set their own.
         driver.start_settle = Duration::ZERO;
         let screen = {
@@ -926,7 +1038,7 @@ mod tests {
         fake.state.lock().unwrap().screen_busy =
             Some(Box::new(move || live.lock().unwrap().live > 0));
         driver.screen_address = screen.address.to_string();
-        Bench { dir, fake, screen, driver }
+        Bench { dir, fake, sol, screen, driver }
     }
 
     fn wait_for(path: &Path, text: &str) -> bool {
@@ -977,10 +1089,19 @@ mod tests {
         assert_eq!(script.matches("console=").count(), 1, "{script}");
         assert!(script.contains("console=ttyS4,115200"), "{script}");
         assert!(bench.driver.is_on());
+        // Serial-over-LAN was turned on as the driver started, and its
+        // one session carried the writer's console and the disk's.
         assert_eq!(
             bench.fake.calls(),
-            ["ChangeBootOrder", "SetBootConfigRole", "RequestPowerStateChange 2"]
+            [
+                "Put AMT_RedirectionService",
+                "RequestStateChange 32771",
+                "ChangeBootOrder",
+                "SetBootConfigRole",
+                "RequestPowerStateChange 2"
+            ]
         );
+        assert_eq!(bench.sol.as_ref().unwrap().state.lock().unwrap().sessions, 1);
 
         // A power cut is AMT's hard off; on boots the disk again.
         let soon = Instant::now() + Duration::from_secs(5);
@@ -1005,9 +1126,51 @@ mod tests {
         ]));
         let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
         assert!(log.contains("net boot: GET plan"), "{log}");
+        assert!(log.contains("console: Serial-over-LAN session open at"), "{log}");
         assert!(!log.contains(PASSWORD));
         assert_eq!(bench.driver.peer_address().as_deref(), Some("127.0.0.1"));
         assert_eq!(bench.driver.reach(445, false), Ok(445));
+    }
+
+    #[test]
+    fn a_serial_cable_is_read_when_the_machine_file_names_one() {
+        let mut bench = bench_with("amt-cable", false, true);
+        bench.driver.boot_fresh().unwrap();
+        assert!(wait_for(bench.driver.serial_log(), "Boot complete."));
+        let writer_log = bench.dir.path().join("logs/writer-1.log");
+        assert!(fs::read_to_string(writer_log).unwrap().contains("writer: writing"));
+        // COM1's name for Linux, and Serial-over-LAN left as it was.
+        let script = fs::read_to_string(bench.dir.path().join("writer-script")).unwrap();
+        assert!(script.contains("console=ttyS0,115200"), "{script}");
+        assert!(bench.fake.calls().iter().all(|call| !call.contains("Redirection")));
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        assert!(log.contains("console: serial port "), "{log}");
+        let checks = check(&bench.driver.settings, None, false);
+        let verdict =
+            |name: &str| checks.iter().find(|check| check.check == name).map(|check| check.verdict);
+        assert_eq!(verdict("serial port"), Some(Verdict::Ok));
+        assert_eq!(verdict("serial over lan"), None);
+    }
+
+    #[test]
+    fn a_power_change_amt_turns_down_is_made_with_the_console_closed() {
+        let mut bench = bench("amt-sol-busy", false);
+        let sol = Arc::clone(bench.sol.as_ref().unwrap());
+        // This AMT turns power changes down while Serial-over-LAN is open.
+        let live = Arc::clone(&sol.state);
+        bench.fake.state.lock().unwrap().screen_busy =
+            Some(Box::new(move || live.lock().unwrap().live > 0));
+        let soon = Instant::now() + Duration::from_secs(10);
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        assert!(bench.driver.is_on());
+        // The session opens again once the change is made.
+        assert!(sol.wait(|state| state.sessions == 2 && state.live == 1));
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        assert!(
+            log.contains("returned 2; asking again with the Serial-over-LAN session closed"),
+            "{log}"
+        );
+        assert!(log.contains("closed while the driver holds it"), "{log}");
     }
 
     #[test]
@@ -1211,7 +1374,16 @@ mod tests {
     #[test]
     fn checks_what_a_run_needs() {
         let bench = bench("amt-check", false);
-        let checks = check(&bench.driver.settings, None, true);
+        let console = bench.sol.as_ref().unwrap();
+        // A check opens a session of its own, which needs the driver's
+        // closed: one at a time.
+        let held = match &bench.driver.console {
+            ConsoleReader::Sol(reader) => reader.hold(),
+            ConsoleReader::Cable(_) => panic!("the bench reads Serial-over-LAN"),
+        };
+        assert!(console.wait(|state| state.live == 0));
+        let checks = check_with(&bench.driver.settings, None, true, &console.address.to_string());
+        drop(held);
         let verdict =
             |name: &str| checks.iter().find(|check| check.check == name).map(|check| check.verdict);
         assert_eq!(verdict("password"), Some(Verdict::Ok));
@@ -1220,7 +1392,8 @@ mod tests {
         assert_eq!(verdict("power"), Some(Verdict::Ok));
         assert_eq!(verdict("remote screen"), Some(Verdict::Ok));
         assert_eq!(verdict("power button"), Some(Verdict::Note));
-        assert_eq!(verdict("serial port"), Some(Verdict::Ok));
+        assert_eq!(verdict("serial over lan"), Some(Verdict::Ok));
+        assert_eq!(verdict("serial port"), None);
         assert_eq!(verdict("lab network"), Some(Verdict::Ok));
         assert_eq!(verdict("tftp"), Some(Verdict::Ok));
         // No network GRUB in this pretend TFTP folder, and no lab key.
@@ -1229,6 +1402,15 @@ mod tests {
         assert_eq!(verdict("lab key"), Some(Verdict::Problem));
         let amt = checks.iter().find(|check| check.check == "amt").unwrap();
         assert!(amt.detail.contains("AMT 11.8.50"), "{}", amt.detail);
+        let found = checks.iter().find(|check| check.check == "serial over lan").unwrap();
+        assert!(found.detail.starts_with("a session opens at 127.0.0.1:"), "{}", found.detail);
+        // Off, it is the driver's to turn on, and the check leaves it off.
+        bench.fake.state.lock().unwrap().redirection = 32768;
+        let checks = check_with(&bench.driver.settings, None, false, "unused");
+        let found = checks.iter().find(|check| check.check == "serial over lan").unwrap();
+        assert_eq!(found.verdict, Verdict::Ok);
+        assert!(found.detail.starts_with("off for now"), "{}", found.detail);
+        assert_eq!(bench.fake.state.lock().unwrap().redirection, 32768);
         // Checking leaves nothing behind in the TFTP folder.
         let boot = bench.driver.settings.tftp.join("dukovo-lab/boot");
         assert_eq!(fs::read_dir(boot).unwrap().count(), 0);

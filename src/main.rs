@@ -42,6 +42,7 @@ mod screen;
 mod send;
 mod serial;
 mod shelly;
+mod sol;
 mod ssh;
 mod status;
 mod stop;
