@@ -166,6 +166,55 @@ pub fn compare(
         .collect())
 }
 
+/// The clocks the two systems ran the CPUs at, in GHz, from their
+/// `cpu_cycle` rows: nanoseconds per clock cycle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clocks {
+    pub dukovo: f64,
+    pub linux: f64,
+}
+
+/// How far apart the two clocks may be, as Dukovo's clock over Linux's,
+/// before their times are not comparable: a turbo bin or a clock that was
+/// not held shows as several percent, noise in one run as one or two.
+const CLOCK_AGREEMENT: std::ops::RangeInclusive<f64> = 0.97..=1.03;
+
+/// The two systems' clocks, or none when either lacks a `cpu_cycle` row
+/// (a kit that predates the row).
+pub fn clocks(dukovo: &BTreeMap<String, f64>, linux: &BTreeMap<String, f64>) -> Option<Clocks> {
+    Some(Clocks { dukovo: 1.0 / dukovo.get("cpu_cycle")?, linux: 1.0 / linux.get("cpu_cycle")? })
+}
+
+impl Clocks {
+    /// Whether the two ran the CPUs at the same clock, within a few percent.
+    pub fn agree(&self) -> bool {
+        CLOCK_AGREEMENT.contains(&(self.dukovo / self.linux))
+    }
+
+    /// The line that goes above the table.
+    pub fn line(&self) -> String {
+        format!("clock: Dukovo {:.2} GHz, Linux {:.2} GHz", self.dukovo, self.linux)
+    }
+
+    /// Why the step's times are not held to each other.
+    pub fn disagreement(&self) -> String {
+        format!(
+            "the two systems ran the CPUs at different clocks, Dukovo at {:.2} GHz and Linux at \
+             {:.2} GHz, so their times are not held to each other (Dukovo's ADR 0557)",
+            self.dukovo, self.linux
+        )
+    }
+}
+
+/// The `BENCH` and `BENCHCOUNT` lines of a benchmark program's output,
+/// under a heading, for a step's note: the bundle keeps every row the
+/// program printed, the clock rows among them.
+pub fn printed(text: &str) -> String {
+    let lines: Vec<&str> =
+        text.lines().map(str::trim).filter(|line| line.starts_with("BENCH")).collect();
+    format!("Dukovo printed:\n{}", lines.join("\n"))
+}
+
 /// The rows as a table for the log, a finding and the runner page.
 pub fn table(rows: &[Row]) -> String {
     let width = rows.iter().map(|row| row.name.len()).max().unwrap_or(0).max(3);
@@ -238,6 +287,41 @@ mod tests {
         );
         let more = parse("BENCH name=c ns=1 iterations=1\n");
         assert_eq!(compare(&names, 1.0, &more, &linux), Err("Dukovo's output has no row a".into()));
+    }
+
+    #[test]
+    fn the_clock_check_allows_three_percent_and_needs_both_rows() {
+        let at = |dukovo: f64, linux: f64| {
+            clocks(
+                &parse(&format!("BENCH name=cpu_cycle ns={dukovo} iterations=1\n")),
+                &parse(&format!("BENCH name=cpu_cycle ns={linux} iterations=1\n")),
+            )
+        };
+        let equal = at(0.3135, 0.3135).unwrap();
+        assert!(equal.agree());
+        assert_eq!(equal.line(), "clock: Dukovo 3.19 GHz, Linux 3.19 GHz");
+        // 2% apart in clock passes, 4% apart does not.
+        assert!(at(1.0 / 1.02, 1.0).unwrap().agree());
+        let apart = at(1.0 / 1.04, 1.0).unwrap();
+        assert!(!apart.agree());
+        assert_eq!(
+            apart.disagreement(),
+            "the two systems ran the CPUs at different clocks, Dukovo at 1.04 GHz and Linux at \
+             1.00 GHz, so their times are not held to each other (Dukovo's ADR 0557)"
+        );
+        let other = parse("BENCH name=pipe ns=100 iterations=1\n");
+        let cycle = parse("BENCH name=cpu_cycle ns=1 iterations=1\n");
+        assert_eq!(clocks(&other, &cycle), None);
+        assert_eq!(clocks(&cycle, &other), None);
+    }
+
+    #[test]
+    fn a_note_keeps_the_bench_lines_the_program_printed() {
+        let text = "starting\nBENCH name=a ns=1 iterations=2\n  BENCHCOUNT group=a rounds=2\nbye\n";
+        assert_eq!(
+            printed(text),
+            "Dukovo printed:\nBENCH name=a ns=1 iterations=2\nBENCHCOUNT group=a rounds=2"
+        );
     }
 
     #[test]

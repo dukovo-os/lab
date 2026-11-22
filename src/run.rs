@@ -1089,50 +1089,69 @@ impl<'a> Worker<'a> {
         let own_boot =
             attacks || cards || discs || floppies || test.cf.is_some() || !test.hardware.is_empty();
         let installs = matches!(test.boot, Boot::Stick { .. } | Boot::Dvd { .. });
-        let fresh = !installs && (test.fresh || own_boot || !self.reusable || !self.driver.is_on());
-        // A real machine's disk is written before each fresh boot, and a
-        // bench step there boots Linux on the machine itself and then
-        // boots afresh: that time is the machine's, not the test's.
+        // A machine that is its own twin boots Linux before the test's boot,
+        // so the steps before the bench step (a profile they set) run on
+        // the boot the bench uses, and the bench step has no boot to end.
+        let twin_kit = self.shared.linux.filter(|_| {
+            self.driver.twin_ends_boot()
+                && self.linux.is_none()
+                && test.steps.iter().any(|step| matches!(step, Step::Bench(_)))
+        });
+        let twin_first = twin_kit.is_some();
+        let fresh = !installs
+            && (test.fresh || own_boot || twin_first || !self.reusable || !self.driver.is_on());
+        // A real machine's disk is written before each fresh boot, and
+        // Linux's boot on the machine itself takes the same time: that time
+        // is the machine's, not the test's.
         if fresh {
             deadline += self.driver.boot_time();
         }
-        if self.driver.twin_ends_boot()
-            && self.linux.is_none()
-            && test.steps.iter().any(|step| matches!(step, Step::Bench(_)))
-        {
-            deadline += self.driver.boot_time() * 2;
+        if twin_first {
+            deadline += self.driver.boot_time();
         }
 
         let mut failure = None;
         // Whether the test was skipped at its first step, a check that the
         // machine fits it, which leaves the boot as it found it.
         let mut unfit = false;
-        if let Boot::Stick { disk } = test.boot {
-            let (record, outcome) = self.timed(
-                test,
-                "boot from the install stick, with a blank disk",
-                false,
-                |worker| worker.boot_stick(disk),
-            );
-            steps.push(record);
-            failure = outcome.err();
-        } else if let Boot::Dvd { disk } = test.boot {
+        if let Some(kit) = twin_kit {
             let (record, outcome) =
-                self.timed(test, "boot from the install DVD, with a blank disk", false, |worker| {
-                    worker.boot_dvd(disk)
+                self.timed(test, "boot Linux on the machine and measure it", true, |worker| {
+                    worker.measure_twin_first(kit, deadline)
                 });
             steps.push(record);
             failure = outcome.err();
-        } else if fresh {
-            let (record, outcome) =
-                self.timed(test, "boot afresh and wait until booted", false, |worker| {
-                    worker.boot_fresh(deadline)
-                });
-            steps.push(record);
-            failure = outcome.err();
-        } else {
-            self.log.push(format!("Sharing boot {} with the test before.", self.boot));
-            self.serial.skip_to_end();
+        }
+        if failure.is_none() {
+            if let Boot::Stick { disk } = test.boot {
+                let (record, outcome) = self.timed(
+                    test,
+                    "boot from the install stick, with a blank disk",
+                    false,
+                    |worker| worker.boot_stick(disk),
+                );
+                steps.push(record);
+                failure = outcome.err();
+            } else if let Boot::Dvd { disk } = test.boot {
+                let (record, outcome) = self.timed(
+                    test,
+                    "boot from the install DVD, with a blank disk",
+                    false,
+                    |worker| worker.boot_dvd(disk),
+                );
+                steps.push(record);
+                failure = outcome.err();
+            } else if fresh {
+                let (record, outcome) =
+                    self.timed(test, "boot afresh and wait until booted", false, |worker| {
+                        worker.boot_fresh(deadline)
+                    });
+                steps.push(record);
+                failure = outcome.err();
+            } else {
+                self.log.push(format!("Sharing boot {} with the test before.", self.boot));
+                self.serial.skip_to_end();
+            }
         }
         for (index, step) in test.steps.iter().enumerate() {
             if failure.is_some() {
@@ -2324,26 +2343,42 @@ impl<'a> Worker<'a> {
         let _measuring = self.shared.measuring.lock().unwrap_or_else(PoisonError::into_inner);
         let linux = match self.linux.take() {
             Some(linux) => linux,
-            None => {
-                let log = self
-                    .shared
-                    .bundle
-                    .logs(&self.folder)
-                    .join(format!("linux-boot-{}.log", self.boot));
-                let text =
-                    self.driver.linux_twin(kit, &log, deadline).map_err(StepFailure::Error)?;
-                // Linux ran on the machine itself, so the test's boot is
-                // over: it goes on in a fresh one.
-                if self.driver.twin_ends_boot() {
-                    self.log.push("Linux ran on the machine itself; booting afresh.".into());
-                    self.boot_fresh(deadline)?;
-                }
-                bench::parse(&text)
-            }
+            None => self.measure_twin(kit, self.boot, deadline)?,
         };
         let outcome = self.hold_to_linux(bench, &linux, deadline);
         self.linux = Some(linux);
         outcome
+    }
+
+    /// Boots the machine's Linux twin and gives its rows, keeping its
+    /// console as `linux-boot-N.log` for Dukovo's boot `boot`, the one it
+    /// ran beside or before. The bench step gets here only on a machine
+    /// that sets its boot aside for the twin (QEMU), as a machine that is
+    /// its own twin measures before the test's boot, in
+    /// [`Worker::measure_twin_first`].
+    fn measure_twin(
+        &mut self,
+        kit: &Kit,
+        boot: u32,
+        deadline: Instant,
+    ) -> Result<BTreeMap<String, f64>, StepFailure> {
+        let log = self.shared.bundle.logs(&self.folder).join(format!("linux-boot-{boot}.log"));
+        let text = self.driver.linux_twin(kit, &log, deadline).map_err(StepFailure::Error)?;
+        Ok(bench::parse(&text))
+    }
+
+    /// Measures the twin of a machine that is its own twin, before the
+    /// test's boot, which Linux's boot on the machine ends.
+    fn measure_twin_first(
+        &mut self,
+        kit: &Kit,
+        deadline: Instant,
+    ) -> Result<Option<String>, StepFailure> {
+        // One machine measures at a time; the others wait here.
+        let _measuring = self.shared.measuring.lock().unwrap_or_else(PoisonError::into_inner);
+        self.linux = Some(self.measure_twin(kit, self.boot + 1, deadline)?);
+        self.log.push("Linux ran on the machine itself; the test boots afresh.".into());
+        Ok(None)
     }
 
     fn hold_to_linux(
@@ -2380,22 +2415,32 @@ impl<'a> Worker<'a> {
                 return fail(format!("the benchmark program exited with status {status}: {said}"));
             }
         }
-        let rows =
-            match bench::compare(&bench.rows, bench.limit, &bench::parse(&output.text), linux) {
-                Ok(rows) => rows,
-                Err(why) => return fail(why),
-            };
-        let table = bench::table(&rows);
+        let dukovo = bench::parse(&output.text);
+        let rows = match bench::compare(&bench.rows, bench.limit, &dukovo, linux) {
+            Ok(rows) => rows,
+            Err(why) => return fail(why),
+        };
+        let clocks = bench::clocks(&dukovo, linux);
+        let table = match &clocks {
+            Some(clocks) => format!("{}\n{}", clocks.line(), bench::table(&rows)),
+            None => bench::table(&rows),
+        };
         if self.driver.emulated() {
             return Err(StepFailure::Skip(format!("{EMULATED}\n{table}")));
         }
+        let printed = bench::printed(&output.text);
+        // Times taken at different clocks say nothing about the systems, so
+        // the step is neither a pass nor a finding.
+        if let Some(clocks) = clocks.filter(|clocks| !clocks.agree()) {
+            return Err(StepFailure::Error(format!("{}\n{table}{printed}", clocks.disagreement())));
+        }
         if rows.iter().all(Row::passes) {
-            Ok(Some(table))
+            Ok(Some(format!("{table}{printed}")))
         } else {
             // The first line names no number, so a row that comes back over
             // the limit joins the same finding, whatever it measured.
             Err(StepFailure::Fail(format!(
-                "slower than Linux: the rows marked over take more than their share of Linux's time\n{table}"
+                "slower than Linux: the rows marked over take more than their share of Linux's time\n{table}{printed}"
             )))
         }
     }
