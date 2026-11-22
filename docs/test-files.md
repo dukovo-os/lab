@@ -303,9 +303,20 @@ rows = ["posix_fork_wait", "posix_fork_exec_wait"]
 - The twin boots once a run on each machine, the first time a bench step
   runs there, and its numbers serve every bench step after. On QEMU the
   machine under test is paused while the twin runs, so the two never
-  share the host. A real machine is its own twin: it boots Linux from
-  the lab network, then boots afresh to go on with the test, so steps
-  before the first bench step of a run see their boot end there.
+  share the host. A real machine is its own twin: when a test with a
+  bench step runs there before the twin is measured, the machine boots
+  Linux from the lab network first and then boots afresh for the test,
+  so the steps before the bench step run on the boot the bench uses.
+- Both systems print a `cpu_cycle` row, the nanoseconds per clock cycle
+  once the clock has settled, so a step's table has a line above it with
+  the clock each ran at: `clock: Dukovo 3.19 GHz, Linux 3.19 GHz`. When
+  the two clocks differ by more than 3% the step is an error, not a
+  finding, as times taken at different clocks say nothing about the
+  systems (Dukovo's ADR 0557). A kit or program that prints no
+  `cpu_cycle` row has no line and no check.
+- A step's note, whether it passed, failed or found differing clocks,
+  ends with the `BENCH` and `BENCHCOUNT` lines the program printed, under
+  "Dukovo printed:", so the bundle keeps every clock row.
 - One machine measures at a time, so machines running side by side do
   not slow each other's numbers.
 - A failing step names the rows over their limit and shows the table of

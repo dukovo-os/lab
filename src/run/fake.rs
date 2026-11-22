@@ -393,6 +393,24 @@ impl Driver for FakeMachine {
                 "BENCH name=fork ns=90 iterations=10\nBENCH name=pipe ns=130 iterations=10\n"
                     .into(),
             ),
+            // The same, with the clock at which each system ran: equal to the
+            // fake Linux's, 2% below it, 6% below it, and not printed.
+            "bench-clock" => (
+                Some(0),
+                "BENCH name=cpu_cycle ns=0.31 iterations=10\nBENCHCOUNT group=cpu rounds=10\n\
+                 BENCH name=fork ns=90 iterations=10\n"
+                    .into(),
+            ),
+            "bench-clock-2" => (
+                Some(0),
+                "BENCH name=cpu_cycle ns=0.316 iterations=10\nBENCH name=fork ns=90 iterations=10\n"
+                    .into(),
+            ),
+            "bench-clock-6" => (
+                Some(0),
+                "BENCH name=cpu_cycle ns=0.33 iterations=10\nBENCH name=fork ns=90 iterations=10\n"
+                    .into(),
+            ),
             "bench-broken" => (
                 Some(1),
                 "BENCH name=fork ns=90 iterations=10\nbench: listen failed: Permission denied\n"
@@ -569,7 +587,7 @@ impl Driver for FakeMachine {
         _deadline: Instant,
     ) -> Result<String, String> {
         let text = format!(
-            "Linux booting\nBENCH name=fork ns=100 iterations=10\nBENCH name=pipe ns=100 iterations=10\n{}\n",
+            "Linux booting\nBENCH name=cpu_cycle ns=0.31 iterations=10\nBENCH name=fork ns=100 iterations=10\nBENCH name=pipe ns=100 iterations=10\n{}\n",
             kit.done
         );
         fs::write(log, &text).map_err(|err| err.to_string())?;
@@ -598,6 +616,8 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
     if machine.name == "broken" {
         return Err("no such machine".into());
     }
+    // A real driver makes its logs folder as it starts.
+    fs::create_dir_all(&setup.logs).map_err(|err| err.to_string())?;
     Ok(Box::new(FakeMachine {
         logs: setup.logs,
         serial: PathBuf::new(),
@@ -900,11 +920,16 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
     let ended = run(&on_itself, &Reporter::silent(), &start_fake).unwrap();
     assert_eq!(ended.summary, Summary { passed: 2, failed: 2, skipped: 0, errors: 1 });
     let real_bundle = crate::store::bundle_dir(&on_itself.store, on_itself.id.as_deref().unwrap());
-    // The first test to measure (they run in order of id) booted Linux.
+    // The first test to measure (they run in order of id) booted Linux
+    // before its own boot, and the bench step found the twin measured.
     let first = fs::read_to_string(real_bundle.join("logs/real/performance-broken.log"))
         .unwrap_or_default();
-    assert!(first.contains("Linux ran on the machine itself"), "{first}");
-    assert!(first.contains("Boot 2: serial log logs/real/serial-2.log"), "{first}");
+    let ran = first.find("Linux ran on the machine itself").expect(&first);
+    assert!(
+        ran < first.find("Boot 1: serial log logs/real/serial-1.log").expect(&first),
+        "{first}"
+    );
+    assert!(!first.contains("Boot 2"), "{first}");
     // The finding of a slow row names no number, so it comes back as one.
     assert_eq!(
         crate::findings::signature(&reason),
@@ -919,6 +944,110 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
     let under_emulator = request(Some(kit), vec![&emulated]);
     let ended = run(&under_emulator, &Reporter::silent(), &start_fake).unwrap();
     assert_eq!(ended.summary, Summary { passed: 0, failed: 1, skipped: 3, errors: 1 });
+}
+
+/// A kit folder and a request to run `tests` with it on `machines`.
+fn bench_run(setting: &Setting, machines: Vec<&Machine>) -> (Done, Vec<ResultRecord>) {
+    setting.dir.write("kit/vmlinuz", "kernel");
+    setting.dir.write("kit/initramfs.img", "initrd");
+    setting.dir.write(
+        "kit/kit.toml",
+        "kernel = \"vmlinuz\"\ninitrd = \"initramfs.img\"\ncmdline = \"console=ttyS0\"\n\
+         done = \"linux-bench: done\"\n",
+    );
+    let request = Request {
+        tests: setting.tests.iter().collect(),
+        machines,
+        image: "dukovo.img".into(),
+        build: None,
+        store: setting.dir.path().join("store"),
+        key: Some(setting.dir.path().join("lab_ed25519")),
+        linux: Some(crate::bench::Kit::read(&setting.dir.path().join("kit")).unwrap()),
+        id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+        ..Request::default()
+    };
+    let ended = run(&request, &Reporter::silent(), &start_fake).unwrap();
+    let bundle = crate::store::bundle_dir(&request.store, request.id.as_deref().unwrap());
+    let results: crate::bundle::ResultsFile =
+        serde_json::from_str(&fs::read_to_string(bundle.join("results.json")).unwrap()).unwrap();
+    (Done { summary: ended.summary, bundle }, results.results)
+}
+
+#[test]
+fn a_bench_step_shows_the_clocks_and_refuses_times_taken_at_different_ones() {
+    let bench = |command: &str| {
+        format!(
+            "about = \"clock\"\ntime = \"1m\"\n[[step]]\nbench = \"{command}\"\nrows = [\"fork\"]\n"
+        )
+    };
+    let setting = setting_with(&[
+        ("performance/equal.toml", &bench("bench-clock")),
+        ("performance/near.toml", &bench("bench-clock-2")),
+        ("performance/apart.toml", &bench("bench-clock-6")),
+        ("performance/old.toml", &bench("bench")),
+    ]);
+    let (_, results) = bench_run(&setting, vec![&setting.qemu]);
+    let by_test = |test: &str| results.iter().find(|r| r.test == test).unwrap();
+    assert_eq!(by_test("performance/equal").result, Outcome::Pass);
+    assert_eq!(by_test("performance/near").result, Outcome::Pass);
+    let apart = by_test("performance/apart");
+    assert_eq!(apart.result, Outcome::Error);
+    let why = apart.reason.as_deref().unwrap();
+    assert!(
+        why.starts_with(
+            "step 1: the two systems ran the CPUs at different clocks, Dukovo at 3.03 GHz and \
+             Linux at 3.23 GHz, so their times are not held to each other (Dukovo's ADR 0557)\n\
+             clock: Dukovo 3.03 GHz, Linux 3.23 GHz\nrow"
+        ),
+        "{why}"
+    );
+    // A program that prints no clock row has no clock line and no check.
+    let old = by_test("performance/old");
+    assert_eq!(old.result, Outcome::Pass);
+    assert_eq!(old.reason, None);
+}
+
+#[test]
+fn a_bench_step_notes_the_clock_and_what_the_program_printed() {
+    let setting = setting_with(&[(
+        "performance/clock.toml",
+        "about = \"clock\"\ntime = \"1m\"\n[[step]]\nbench = \"bench-clock\"\nrows = [\"fork\"]\n",
+    )]);
+    let (done, _) = bench_run(&setting, vec![&setting.qemu]);
+    let results = fs::read_to_string(done.bundle.join("results.json")).unwrap();
+    assert!(results.contains("clock: Dukovo 3.23 GHz, Linux 3.23 GHz\\nrow"), "{results}");
+    assert!(
+        results.contains(
+            "Dukovo printed:\\nBENCH name=cpu_cycle ns=0.31 iterations=10\\n\
+             BENCHCOUNT group=cpu rounds=10\\nBENCH name=fork ns=90 iterations=10"
+        ),
+        "{results}"
+    );
+}
+
+#[test]
+fn a_machine_that_is_its_own_twin_measures_linux_before_the_test_boots() {
+    let setting = setting_with(&[(
+        "performance/after.toml",
+        "about = \"a step, then a bench\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n\
+         [[step]]\nbench = \"bench\"\nrows = [\"fork\"]\n",
+    )]);
+    let mut real = setting.qemu.clone();
+    real.name = "real".into();
+    let (done, results) = bench_run(&setting, vec![&real]);
+    assert_eq!(results[0].result, Outcome::Pass, "{:?}", results[0].reason);
+    let log = fs::read_to_string(done.bundle.join("logs/real/performance-after.log")).unwrap();
+    let positions: Vec<usize> = [
+        "boot Linux on the machine and measure it: passed",
+        "boot afresh and wait until booted: passed",
+        "run `true`, exit status 0: passed",
+        "measure `bench` against Linux: fork at most 1.00 of Linux's time: passed",
+    ]
+    .iter()
+    .map(|line| log.find(line).unwrap_or_else(|| panic!("no {line}\n{log}")))
+    .collect();
+    assert!(positions.is_sorted(), "{log}");
+    assert!(!log.contains("Boot 2"), "{log}");
 }
 
 #[test]
