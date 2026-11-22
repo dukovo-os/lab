@@ -66,7 +66,9 @@ struct FakeMachine {
     /// The machine's name, which says how its health check answers: the
     /// machines named `checked...` have one. `checked` is healthy,
     /// `checked-once` has a full root on its first boot only, and
-    /// `checked-bad` has a clock 41 seconds ahead of the lab PC's.
+    /// `checked-bad` has a clock 41 seconds ahead of the lab PC's. The
+    /// machines named `twin-slow` and `real-twin-slow` have a Linux twin
+    /// that takes 5 minutes, and fail it when its deadline is nearer.
     name: String,
 }
 
@@ -443,6 +445,22 @@ impl Driver for FakeMachine {
                 (Some(0), format!("reached {}\n", cmd.trim_start_matches("reach ")))
             }
             "uname" => (Some(0), "Dukovo\n".into()),
+            // The test logs written so far, which the lab keeps beside the
+            // machine's own logs.
+            "test-logs" => {
+                let mut text = String::new();
+                for entry in fs::read_dir(&self.logs).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|extension| extension == "log")
+                        && !path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with("serial-")
+                        })
+                    {
+                        text.push_str(&fs::read_to_string(&path).unwrap_or_default());
+                    }
+                }
+                (Some(0), text)
+            }
             "false" => (Some(1), String::new()),
             // Giving the machine its address on the private network, as
             // root, when an attack test sets the attacker up.
@@ -584,8 +602,13 @@ impl Driver for FakeMachine {
         &mut self,
         kit: &crate::bench::Kit,
         log: &Path,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<String, String> {
+        if self.name.ends_with("twin-slow")
+            && deadline < Instant::now() + std::time::Duration::from_secs(5 * 60)
+        {
+            return Err("Linux was still booting at the deadline".into());
+        }
         let text = format!(
             "Linux booting\nBENCH name=cpu_cycle ns=0.31 iterations=10\nBENCH name=fork ns=100 iterations=10\nBENCH name=pipe ns=100 iterations=10\n{}\n",
             kit.done
@@ -638,7 +661,7 @@ fn start_fake(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String
         sticks: 0,
         stick: None,
         jammed: machine.name == "jammed",
-        real: machine.name == "real",
+        real: machine.name == "real" || machine.name == "real-twin-slow",
         grows_root: machine.name.starts_with("grows") || machine.name.starts_with("checked"),
         grow_fails: machine.name == "grows-badly",
         sets_clock: machine.name == "clocked",
@@ -2941,4 +2964,108 @@ fn a_browser_falls_back_to_the_machine_s_address_when_its_forward_will_not_start
         assert!(log.contains("The browser opens the machine by its address"), "{machine}: {log}");
         assert!(log.contains(why), "{machine}: {log}");
     }
+}
+
+#[test]
+fn a_kit_s_own_time_is_added_to_the_limit_of_a_test_that_measures_the_twin() {
+    let setting = setting_with(&[(
+        "performance/fork.toml",
+        "about = \"fork\"\ntime = \"1m\"\n[[step]]\nbench = \"bench\"\nrows = [\"fork\"]\n",
+    )]);
+    let machines: Vec<Machine> = ["twin-slow", "real-twin-slow"]
+        .iter()
+        .map(|name| Machine { name: (*name).into(), ..setting.qemu.clone() })
+        .collect();
+    let run_with_kit = |time: &str| {
+        let time = if time.is_empty() { String::new() } else { format!("time = \"{time}\"\n") };
+        setting.dir.write("kit/vmlinuz", "kernel");
+        setting.dir.write("kit/initramfs.img", "initrd");
+        setting.dir.write(
+            "kit/kit.toml",
+            &format!(
+                "kernel = \"vmlinuz\"\ninitrd = \"initramfs.img\"\ncmdline = \"console=ttyS0\"\n\
+                 done = \"linux-bench: done\"\n{time}"
+            ),
+        );
+        let request = Request {
+            tests: setting.tests.iter().collect(),
+            machines: machines.iter().collect(),
+            image: "dukovo.img".into(),
+            store: setting.dir.path().join("store"),
+            key: Some(setting.dir.path().join("lab_ed25519")),
+            linux: Some(crate::bench::Kit::read(&setting.dir.path().join("kit")).unwrap()),
+            id: Some(crate::bundle::new_run_id(crate::clock::Utc::now())),
+            ..Request::default()
+        };
+        run(&request, &Reporter::silent(), &start_fake).unwrap().summary
+    };
+    // The twin takes 5 minutes and the test has 1, so the kit's 15 minutes
+    // are what let it finish, on a machine that sets its boot aside and on
+    // one that is its own twin.
+    assert_eq!(run_with_kit("15m"), Summary { passed: 2, failed: 0, skipped: 0, errors: 0 });
+    assert_eq!(run_with_kit(""), Summary { passed: 0, failed: 0, skipped: 0, errors: 2 });
+}
+
+#[test]
+fn an_optional_step_is_left_out_on_a_machine_without_its_control() {
+    let setting = setting_with(&[
+        (
+            "drivers/optional.toml",
+            "about = \"link\"\ntime = \"1m\"\n[[step]]\nlink = \"down\"\noptional = true\n\
+             [[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+        ),
+        (
+            "drivers/required.toml",
+            "about = \"link\"\ntime = \"1m\"\n[[step]]\nlink = \"down\"\n\
+             [[step]]\nrun = \"uname\"\nexpect = \"Dukovo\"\n",
+        ),
+    ]);
+    let mut no_link = setting.qemu.clone();
+    no_link.name = "no-link".into();
+    no_link.controls.insert(Control::Link, Who::None);
+    let (ended, results) = run_on(&setting, vec![&setting.qemu, &no_link]);
+    let result = |machine: &str, test: &str| {
+        results.iter().find(|r| r.machine == machine && r.test == test).unwrap()
+    };
+    assert_eq!(result("qemu", "drivers/optional").result, Outcome::Pass);
+    assert_eq!(result("qemu", "drivers/optional").steps[1].note, None, "it ran");
+    let left_out = result("no-link", "drivers/optional");
+    assert_eq!(left_out.result, Outcome::Pass, "{:?}", left_out.reason);
+    // The boot is the first step.
+    assert_eq!(left_out.steps.len(), 3);
+    assert_eq!(left_out.steps[1].result, Outcome::Pass);
+    assert_eq!(left_out.steps[1].note.as_deref(), Some("left out: no-link has no link"));
+    // A step that is not optional still skips the test.
+    let skipped = result("no-link", "drivers/required");
+    assert_eq!(skipped.result, Outcome::Skip);
+    assert_eq!(skipped.reason.as_deref(), Some("the machine has no link"));
+    let log = log_of(&ended, left_out);
+    assert!(log.contains("left out: no-link has no link"), "{log}");
+
+    // A person's control is left out too when the run has no person.
+    let mut person = setting.qemu.clone();
+    person.name = "person".into();
+    person.controls.insert(Control::Link, Who::Person);
+    let (_, results) = run_with(&setting, vec![&person], false, Some("20261107-153012-0005"));
+    let step = &results.iter().find(|r| r.test == "drivers/optional").unwrap().steps[1];
+    assert_eq!(
+        step.note.as_deref(),
+        Some("left out: person needs a person for link, and the run has no --with-person")
+    );
+}
+
+#[test]
+fn the_log_is_written_after_each_step_and_the_last_write_ends_it() {
+    let setting = setting_with(&[(
+        "drivers/two.toml",
+        "about = \"two steps\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\n\
+         [[step]]\nrun = \"test-logs\"\nexpect = \"Still running: step 1 of 2 done at 20\"\n",
+    )]);
+    let (ended, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(results[0].result, Outcome::Pass, "{:?}", results[0].reason);
+    let log = log_of(&ended, &results[0]);
+    // The first step's write is what the second step read; the final one
+    // leaves no such line of its own.
+    assert!(!log.lines().any(|line| line.starts_with("Still running")), "{log}");
+    assert!(log.ends_with("Result: Pass\n"), "{log}");
 }

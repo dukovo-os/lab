@@ -119,8 +119,9 @@ pub fn load_categories(dir: &Path) -> Result<Vec<Category>, Error> {
     Ok(categories)
 }
 
-/// The longest a test may take: a soak test runs overnight, not longer.
-const LONGEST_TEST: Duration = Duration::from_secs(24 * 3600);
+/// The longest a test may take: a server's week-long soak, with its faults
+/// and boots.
+const LONGEST_TEST: Duration = Duration::from_secs(8 * 24 * 3600);
 
 /// How long a wait for console text may be silent before it ends as
 /// stalled, unless the test says otherwise: text that has not come while
@@ -173,6 +174,14 @@ pub struct Test {
     pub stall: Option<Stall>,
     /// Which machine its `attack` steps run on.
     pub attacker: AttackerKind,
+    /// Whether a run includes it only when it names the test by id: `all`
+    /// and a category leave it out, as a test that takes days or changes
+    /// the lab's setup is not one to run by accident.
+    pub only_by_name: bool,
+    /// The positions in `steps` of the steps marked `optional`: a machine
+    /// without the control such a step needs leaves it out and the test
+    /// goes on.
+    pub optional_steps: BTreeSet<usize>,
 }
 
 /// The machine a test's `attack` steps run on.
@@ -613,6 +622,24 @@ impl Step {
         }
     }
 
+    /// Whether the step may say `optional = true`: it needs a control of
+    /// the machine itself, a cable or a drive, which a machine may lack.
+    /// The rest run commands or wait, over channels every machine that runs
+    /// the test has.
+    fn may_be_optional(&self) -> bool {
+        self.control().is_some()
+            && !matches!(
+                self,
+                Step::Run(_)
+                    | Step::Serial { .. }
+                    | Step::Attack(_)
+                    | Step::Host(_)
+                    | Step::Serve(_)
+                    | Step::Browser(_)
+                    | Step::Bench(_)
+            )
+    }
+
     /// How long this step may be silent before it ends as stalled, in
     /// `test`, or none when it never stalls. Only a `run` step and a wait
     /// for console text can: the rest are quiet by design (a wait, a
@@ -785,7 +812,26 @@ impl Test {
     /// Every control the test needs: its steps', and power and serial for
     /// the boot every test starts with.
     pub fn controls(&self) -> BTreeSet<Control> {
-        let mut controls: BTreeSet<Control> = self.steps.iter().filter_map(Step::control).collect();
+        self.controls_of(false)
+    }
+
+    /// The controls a machine must have, or a person must do, for the test
+    /// to run on it: [`Test::controls`] without those only an optional
+    /// step needs.
+    pub fn required_controls(&self) -> BTreeSet<Control> {
+        self.controls_of(true)
+    }
+
+    /// The controls of the test, leaving out its optional steps' when
+    /// `required_only`.
+    fn controls_of(&self, required_only: bool) -> BTreeSet<Control> {
+        let mut controls: BTreeSet<Control> = self
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !(required_only && self.optional_steps.contains(index)))
+            .filter_map(|(_, step)| step.control())
+            .collect();
         // A bench step runs its program over SSH as well as booting Linux.
         if self.steps.iter().any(|step| matches!(step, Step::Bench(_))) {
             controls.insert(Control::Ssh);
@@ -856,7 +902,7 @@ impl Test {
 
     /// Whether, and how, the test runs on `machine`.
     pub fn fit(&self, machine: &Machine) -> Fit {
-        let controls = self.controls();
+        let controls = self.required_controls();
         let lacking: Vec<Control> =
             controls.iter().copied().filter(|&c| machine.who(c) == Who::None).collect();
         if !lacking.is_empty() {
@@ -914,6 +960,8 @@ struct TestFile {
     hardware: Vec<String>,
     stall: Option<String>,
     attacker: Option<String>,
+    #[serde(default)]
+    only_by_name: bool,
     #[serde(rename = "step", default)]
     steps: Vec<StepFile>,
 }
@@ -986,6 +1034,7 @@ struct StepFile {
     browser: Option<String>,
     engines: Option<Vec<String>>,
     port: Option<i64>,
+    optional: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -1095,7 +1144,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
     }
     let time = parse_duration(&file.time).map_err(|err| bad(format!("time: {err}")))?;
     if time.is_zero() || time > LONGEST_TEST {
-        return Err(bad("time must be more than 0s and at most 24h".into()));
+        return Err(bad("time must be more than 0s and at most 192h".into()));
     }
     if file.steps.is_empty() {
         return Err(bad("a test needs at least one [[step]]".into()));
@@ -1161,9 +1210,20 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
     };
     let folder = path.parent().unwrap_or(Path::new("."));
     let mut steps = Vec::new();
+    let mut optional_steps = BTreeSet::new();
     for (index, step) in file.steps.into_iter().enumerate() {
+        let optional = step.optional.unwrap_or(false);
         let step =
             parse_step(step, folder).map_err(|err| bad(format!("step {}: {err}", index + 1)))?;
+        if optional && !step.may_be_optional() {
+            return Err(bad(format!(
+                "step {}: optional is only for a step that needs a control",
+                index + 1
+            )));
+        }
+        if optional {
+            optional_steps.insert(index);
+        }
         steps.push(step);
     }
     check_saved(&steps).map_err(bad)?;
@@ -1255,6 +1315,8 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         hardware,
         stall,
         attacker,
+        only_by_name: file.only_by_name,
+        optional_steps,
     })
 }
 
@@ -1838,8 +1900,14 @@ fn is_key_combo(combo: &str) -> bool {
     })
 }
 
+/// The tests `--all` runs: every one but those that run only by name.
+pub fn all(tests: &[Test]) -> Vec<&Test> {
+    tests.iter().filter(|test| !test.only_by_name).collect()
+}
+
 /// Picks tests by id or by category (`drivers` or `drivers/`), in the
-/// order given, each once.
+/// order given, each once. A category leaves out the tests that run only
+/// by name.
 pub fn select<'a>(tests: &'a [Test], names: &[String]) -> Result<Vec<&'a Test>, Error> {
     let mut picked: Vec<&Test> = Vec::new();
     for name in names {
@@ -1847,7 +1915,17 @@ pub fn select<'a>(tests: &'a [Test], names: &[String]) -> Result<Vec<&'a Test>, 
         // A category is a folder the tests are in: `load` let in only
         // the suite's own.
         let matching: Vec<&Test> = if tests.iter().any(|test| test.category == category) {
-            tests.iter().filter(|test| test.category == category).collect()
+            let in_category: Vec<&Test> = tests
+                .iter()
+                .filter(|test| test.category == category && !test.only_by_name)
+                .collect();
+            if in_category.is_empty() {
+                return Err(Error::Usage(format!(
+                    "every test in \"{name}\" runs only by name: give the test's id, such as {}",
+                    tests.iter().find(|test| test.category == category).map_or("", |test| &test.id)
+                )));
+            }
+            in_category
         } else {
             tests.iter().filter(|test| test.id == *name).collect()
         };
@@ -1939,6 +2017,93 @@ pub fn load_presets(dir: &Path, tests: &[Test]) -> Result<Vec<Preset>, Error> {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[test]
+    fn a_test_that_runs_only_by_name_is_left_out_of_all_and_of_its_category() {
+        let dir = TempDir::new("suite-only-by-name");
+        let tiny = "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n";
+        dir.write("stress/a.toml", tiny);
+        dir.write("stress/week.toml", &format!("only_by_name = true\n{tiny}"));
+        dir.write("boot/only.toml", &format!("only_by_name = true\n{tiny}"));
+        let tests = load(dir.path()).unwrap();
+        let ids = |picked: Vec<&Test>| -> Vec<String> {
+            picked.into_iter().map(|test| test.id.clone()).collect()
+        };
+        assert!(tests.iter().find(|test| test.id == "stress/week").unwrap().only_by_name);
+        assert!(!tests.iter().find(|test| test.id == "stress/a").unwrap().only_by_name);
+        assert_eq!(ids(all(&tests)), ["stress/a"]);
+        assert_eq!(ids(select(&tests, &["stress".into()]).unwrap()), ["stress/a"]);
+        assert_eq!(ids(select(&tests, &["stress/week".into()]).unwrap()), ["stress/week"]);
+        assert_eq!(
+            ids(select(&tests, &["stress".into(), "stress/week".into()]).unwrap()),
+            ["stress/a", "stress/week"]
+        );
+        // A category of such tests alone says to name one.
+        let Err(Error::Usage(why)) = select(&tests, &["boot".into()]) else { panic!("picked") };
+        assert!(why.contains("runs only by name") && why.contains("boot/only"), "{why}");
+        // A preset that names the category leaves it out; one that names
+        // the id has it.
+        dir.write(
+            "presets.toml",
+            "[[preset]]\nname = \"by-category\"\ntitle = \"C\"\ntests = [\"stress\"]\n\
+             [[preset]]\nname = \"by-id\"\ntitle = \"I\"\ntests = [\"stress/week\"]\n",
+        );
+        let presets = load_presets(dir.path(), &tests).unwrap();
+        assert_eq!(presets[0].tests, ["stress/a"]);
+        assert_eq!(presets[1].tests, ["stress/week"]);
+    }
+
+    #[test]
+    fn a_step_is_optional_only_when_it_needs_a_control_of_the_machine() {
+        let dir = TempDir::new("suite-optional");
+        let test = "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"true\"\n\
+                    [[step]]\nlink = \"down\"\noptional = true\n";
+        dir.write("drivers/link.toml", test);
+        let test = &load(dir.path()).unwrap()[0];
+        assert!(test.optional_steps.contains(&1) && test.optional_steps.len() == 1);
+        assert!(test.controls().contains(&Control::Link));
+        assert!(!test.required_controls().contains(&Control::Link));
+        assert!(test.required_controls().contains(&Control::Ssh));
+        // A machine without a cable to pull or a person to pull it fits.
+        let mut machine = crate::machines::load(&dir.path().join("none")).unwrap().remove(0);
+        machine.controls.insert(Control::Link, crate::machines::Who::None);
+        assert_eq!(test.fit(&machine), Fit::Runs);
+        machine.controls.insert(Control::Link, crate::machines::Who::Person);
+        assert_eq!(test.fit(&machine), Fit::Runs);
+
+        for step in [
+            "run = \"true\"",
+            "wait = \"ready\"",
+            "serial = \"x\"",
+            "bench = \"b\"\nrows = [\"fork\"]",
+        ] {
+            let dir = TempDir::new("suite-optional-bad");
+            dir.write(
+                "drivers/bad.toml",
+                &format!("about = \"x\"\ntime = \"1m\"\n[[step]]\n{step}\noptional = true\n"),
+            );
+            let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded {step}") };
+            assert!(
+                why.contains("step 1: optional is only for a step that needs a control"),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_test_may_take_up_to_eight_days() {
+        let time = |time: &str| {
+            let dir = TempDir::new("suite-longest");
+            dir.write(
+                "stress/week.toml",
+                &format!("about = \"x\"\ntime = \"{time}\"\n[[step]]\nwait = \"ready\"\n"),
+            );
+            load(dir.path())
+        };
+        assert_eq!(time("192h").unwrap()[0].time, Duration::from_secs(8 * 24 * 3600));
+        let Err(Error::Usage(why)) = time("193h") else { panic!("loaded") };
+        assert!(why.contains("at most 192h"), "{why}");
+    }
 
     #[test]
     fn presets_name_tests_and_categories() {

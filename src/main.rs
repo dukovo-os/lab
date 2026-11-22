@@ -483,6 +483,7 @@ fn test_json(test: &Test, machines: &[&Machine]) -> Value {
         "about": test.about,
         "time": units::format_duration(test.time),
         "fresh": test.fresh,
+        "only_by_name": test.only_by_name,
         "boot": match test.boot {
             suite::Boot::Image => "image",
             suite::Boot::Stick { .. } => "stick",
@@ -643,7 +644,13 @@ fn list(arguments: &Arguments) -> Result<u8, Error> {
         }
         println!("{}", category.title);
         for test in in_category {
-            println!("  {:<32} {:>4}  {}", test.id, units::format_duration(test.time), test.about);
+            let by_name = if test.only_by_name { " (only by name)" } else { "" };
+            println!(
+                "  {:<32} {:>4}  {}{by_name}",
+                test.id,
+                units::format_duration(test.time),
+                test.about
+            );
             for machine in &machines {
                 if let Some(reason) = test.fit(machine).skip_reason() {
                     println!("  {:<32}       on {}: {reason}", "", machine.name);
@@ -989,7 +996,7 @@ fn pick_requested<'a>(
 ) -> Result<Picked<'a>, Error> {
     let presets = arguments.load_presets(tests)?;
     let picked = match (arguments.all, arguments.names.is_empty(), &arguments.preset) {
-        (true, true, None) => tests.iter().collect(),
+        (true, true, None) => suite::all(tests),
         (false, false, None) => suite::select(tests, &arguments.names)?,
         (false, true, Some(name)) => {
             let preset = presets.iter().find(|preset| preset.name == *name).ok_or_else(|| {
