@@ -840,7 +840,7 @@ function testsView() {
     render();
   } }, el("option", { value: "" }, "All " + state.categories.length), state.categories.map((c) => el("option", { value: c.id, selected: c.id === state.testsCategory }, c.title)));
   const rows = shown.map((test) => el("tr", { class: test.id === selected ? "sel" : "" },
-    el("th", { scope: "row" }, el("a", { class: "plain", href: testHash(test.id), "aria-current": test.id === selected ? "true" : null }, test.id)),
+    el("th", { scope: "row" }, el("a", { class: "plain", href: testHash(test.id), "aria-current": test.id === selected ? "true" : null }, test.id), test.only_by_name ? el("span", { class: "small muted", style: "display:block" }, "(only by name)") : null),
     el("td", { class: "muted" }, test.time),
     cols.map((c) => el("td", {}, fitChip(test, c.name)))));
   const table = card(plural(shown.length, "test") + (shown.length === state.tests.length ? "" : " of " + state.tests.length), [
@@ -1711,7 +1711,8 @@ function startView() {
 
 /** One category of tests, or the Needs you group, as a group to tick. */
 function startCategory(title, tests, all, needs) {
-  const ids = all.map((t) => t.id);
+  // A test that runs only by name is not part of a group's run.
+  const ids = all.filter((t) => !t.only_by_name).map((t) => t.id);
   const picked = ids.filter((id) => state.chosen.has(id)).length;
   const can = state.page && state.page.can_run && state.picked.size;
   const box = el("input", { type: "checkbox", checked: ids.length > 0 && picked === ids.length, disabled: !ids.length, "aria-label": "All " + title + " tests",
@@ -1739,7 +1740,7 @@ function startCategory(title, tests, all, needs) {
         state.preset = "";
         render();
       } }),
-      el("label", { for: "t-" + test.id }, el("a", { href: testHash(test.id), class: "mono" }, test.id), el("span", { class: "small muted", style: "display:block" }, test.about)),
+      el("label", { for: "t-" + test.id }, el("a", { href: testHash(test.id), class: "mono" }, test.id), el("span", { class: "small muted", style: "display:block" }, test.about + (test.only_by_name ? " (only by name)" : ""))),
       el("button", { class: "btn mini", type: "button", disabled: !can, onclick: () => startRun([test.id], null) }, "Run")))));
   if (needs) group.append(el("p", { class: "pad small", style: "margin:0" }, "These ask you to do a step, such as pulling a cable, and wait until you press Done. They run only when ticked."));
   return group;

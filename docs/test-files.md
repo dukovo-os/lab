@@ -33,7 +33,7 @@ expect_not = "NO-CARRIER"
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `about` | yes | What the test checks, in one line. |
-| `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `24h`. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. On a real machine, the time to write its disk before a fresh boot is added. |
+| `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `192h` (eight days), for a server's week-long soak. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. On a real machine, the time to write its disk before a fresh boot is added. |
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
 | `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk, and `"dvd"` the install DVD in the optical drive: see [Installer tests](#installer-tests). |
 | `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
@@ -41,6 +41,7 @@ expect_not = "NO-CARRIER"
 | `cf` | no | A CompactFlash card in an IDE adapter for the test to format, of this size, from `1M` to `128G`: see [CompactFlash tests](#compactflash-tests). |
 | `hardware` | no | A virtual machine's devices the test needs, which its boot gives the machine: `guest-agent` (a QEMU guest agent channel, whose host end a host step reaches as `{guest-agent}`) and `virtio-scsi` (a blank 1 GiB disk on a virtio SCSI adapter). The test boots afresh with them and its boot is not shared. A machine that cannot give them, as a real one, skips the test. |
 | `attacker` | no | Which machine `attack` steps run on: `"image"`, a second Dukovo guest (the default), or `"linux"`, Linux from the run's red-team kit. Without `--redteam` a `"linux"` test is skipped. See [The red-team kit](#the-red-team-kit). |
+| `only_by_name` | no | `true` runs the test only when a run names its id, on the command line, in a preset or in a schedule. `--all` and a category leave it out, and a preset that names its category does not include it. `list` and the runner page show it as "(only by name)". For a test that takes days. |
 | `stall` | no | How long a `run` step or a wait for console text may be silent before it ends as stalled: a length of time as `time` is written, or `"off"`. Three minutes by default. See [Steps that go silent](#steps-that-go-silent). |
 | `[[step]]` | at least one | The steps, in order. |
 
@@ -106,6 +107,28 @@ Each step has exactly one action key, and only the options that go with it.
 | `wait = "<time>"` | | Waits that long. | |
 
 Every test also needs `power` and `serial`, for the boot it starts with.
+
+## Steps a machine may lack
+
+A step that needs a control of the machine itself (`power`, `link`,
+`usb`, `card`, `sd`, `disc`, `floppy`, `keys`, `type`, `point`, `click`,
+`screen`, `screen_gone`, `screenshot`) may say `optional = true`. The
+other steps run over channels every machine that runs the test has, and
+the suite refuses `optional` on them: "optional is only for a step that
+needs a control".
+
+Without `optional`, a machine that lacks the control skips the whole
+test. With it, the control does not count when the lab decides whether
+the machine fits the test, and the step is left out where the machine
+lacks it: its record says "left out: qemu has no link", or, for a control
+a person does, "left out: optiplex needs a person for link, and the run
+has no --with-person". Its result is a pass, and the test goes on.
+
+```toml
+[[step]]
+link = "down"
+optional = true    # a machine with no cable to pull still runs the rest
+```
 
 ## Keeping a step's output
 
@@ -332,6 +355,11 @@ rows = ["posix_fork_wait", "posix_fork_exec_wait"]
 - Numbers from an emulator mean little, so on QEMU without KVM a bench
   step still runs and keeps both tables, then is skipped rather than
   passed or failed.
+- The kit's benchmarks take time of their own, which the kit's `kit.toml`
+  gives as `time`, such as `time = "15m"`. A test that measures the twin
+  adds it, once, to its time limit: the benchmarks run on the test's
+  clock but are the kit's time, not the test's. Without `time` nothing is
+  added.
 - A run without a kit (no `--linux`) skips tests with bench steps and
   says why. Machines with no Linux twin (`linux = "none"`) skip them too.
 
@@ -880,6 +908,11 @@ Floppy drive tests live under `lab/tests/storage/` too.
    `<category>-<test>-at-failure.png`. A `run` or `serial` step that goes
    silent fails as stalled instead of waiting out the time limit.
 3. The test passes when every step passed within its time limit.
+
+The test's log is written after each step, with a last line that says
+`Still running: step 2 of 9 done at <time>`, so a test that takes days
+keeps what it did if the lab PC restarts. The log the test ends with
+replaces it and has no such line.
 
 A test that needs a control the machine does not have is skipped there.
 A test whose controls include one a person does on that machine is a

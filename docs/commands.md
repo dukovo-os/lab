@@ -143,7 +143,9 @@ Runs the tests on each machine (default `qemu`), the machines side by
 side, and writes a results bundle (below). Tests are named by id
 (`network/link-pull`) or by category (`network`); each runs once, in the
 order given. `--preset` runs a preset's tests instead. Tests a machine
-cannot run are skipped there with the reason.
+cannot run are skipped there with the reason. A test with `only_by_name =
+true` (see [test files](test-files.md#keys)) runs only when named by id:
+`--all`, a category and a preset's category leave it out.
 
 `--machine` takes machine names and pools, separated by commas. A machine
 named on its own runs every test. A pool is written `pool:` and its name,
@@ -232,6 +234,7 @@ kernel = "vmlinuz"            # beside kit.toml
 initrd = "linux-bench.cpio"   # beside kit.toml; its first program runs the benchmarks
 cmdline = "console=ttyS0 panic=-1 quiet mitigations=off"
 done = "linux-bench: done"    # what the serial console says once every benchmark has run
+time = "15m"                  # optional: how long the benchmarks take; a test that measures the twin adds it to its time limit
 ```
 
 `--redteam` names the folder of a red-team kit: the Linux that the

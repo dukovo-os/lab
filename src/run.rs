@@ -1092,11 +1092,9 @@ impl<'a> Worker<'a> {
         // A machine that is its own twin boots Linux before the test's boot,
         // so the steps before the bench step (a profile they set) run on
         // the boot the bench uses, and the bench step has no boot to end.
-        let twin_kit = self.shared.linux.filter(|_| {
-            self.driver.twin_ends_boot()
-                && self.linux.is_none()
-                && test.steps.iter().any(|step| matches!(step, Step::Bench(_)))
-        });
+        let measures_twin =
+            self.linux.is_none() && test.steps.iter().any(|step| matches!(step, Step::Bench(_)));
+        let twin_kit = self.shared.linux.filter(|_| measures_twin && self.driver.twin_ends_boot());
         let twin_first = twin_kit.is_some();
         let fresh = !installs
             && (test.fresh || own_boot || twin_first || !self.reusable || !self.driver.is_on());
@@ -1108,6 +1106,11 @@ impl<'a> Worker<'a> {
         }
         if twin_first {
             deadline += self.driver.boot_time();
+        }
+        // The kit's benchmarks run on the test's clock, but their time is
+        // the kit's, not the test's.
+        if let Some(kit) = self.shared.linux.filter(|_| measures_twin) {
+            deadline += kit.time * self.driver.slowdown();
         }
 
         let mut failure = None;
@@ -1164,10 +1167,15 @@ impl<'a> Worker<'a> {
             // The lab PC does its side of these, so they are slow when it
             // is busy.
             let times_matter = matches!(step, Step::Bench(_) | Step::Browser(_));
+            let left_out = test.optional_steps.contains(&index).then(|| self.left_out(step));
             let (record, outcome) = self.timed(test, &step.describe(), times_matter, |worker| {
-                worker.run_step(test, step, deadline)
+                match left_out.flatten() {
+                    Some(note) => Ok(Some(note)),
+                    None => worker.run_step(test, step, deadline),
+                }
             });
             steps.push(record);
+            self.write_progress(test, index + 1);
             unfit = index == 0
                 && matches!(step, Step::Run(command) if command.or_skip.is_some())
                 && matches!(outcome, Err(StepFailure::Skip(_)));
@@ -2687,12 +2695,52 @@ impl<'a> Worker<'a> {
             Some(reason) => format!("Result: {result:?}: {reason}"),
             None => format!("Result: {result:?}"),
         });
+        let path = self.save_log(test);
+        self.log.clear();
+        path
+    }
+
+    /// Writes the log so far after step number `done`, with a last line
+    /// that says the test is still running: a week-long test that the lab
+    /// loses (a restart of the lab PC) keeps what it did. The final
+    /// [`Worker::write_log`] replaces the file.
+    fn write_progress(&mut self, test: &Test, done: usize) {
+        self.log.push(format!(
+            "Still running: step {done} of {} done at {}",
+            test.steps.len(),
+            Utc::now().rfc3339()
+        ));
+        // A log that cannot be written here is tried again after the next
+        // step, and the final write reports it.
+        let _ = self.save_log(test);
+        self.log.pop();
+    }
+
+    /// Writes the log to `<logs>/<test id with / as ->.log`; returns its
+    /// path in the bundle.
+    fn save_log(&self, test: &Test) -> Option<String> {
         let folder = self.shared.bundle.logs(&self.folder);
         let path = folder.join(format!("{}.log", test.id.replace('/', "-")));
-        let mut text = std::mem::take(&mut self.log).join("\n");
+        let mut text = self.log.join("\n");
         text.push('\n');
         fs::create_dir_all(&folder).and_then(|()| fs::write(&path, text)).ok()?;
         Some(self.shared.bundle.relative(&path))
+    }
+
+    /// Why an optional `step` is left out on this machine, if it is: the
+    /// machine has no control for it, or a person would have to do it and
+    /// the run has none.
+    fn left_out(&self, step: &Step) -> Option<String> {
+        let control = step.control()?;
+        let machine = &self.machine.name;
+        match self.machine.who(control) {
+            Who::None => Some(format!("left out: {machine} has no {}", control.name())),
+            Who::Person if !self.shared.with_person => Some(format!(
+                "left out: {machine} needs a person for {}, and the run has no --with-person",
+                control.name()
+            )),
+            _ => None,
+        }
     }
 }
 

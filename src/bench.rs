@@ -26,8 +26,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
+
+use crate::units::parse_duration;
 
 /// The file in a kit's folder that describes it.
 pub const KIT_FILE: &str = "kit.toml";
@@ -44,6 +47,11 @@ pub struct Kit {
     pub cmdline: String,
     /// What the serial console says once every benchmark has run.
     pub done: String,
+    /// How long the kit's benchmarks take on the machine, which a test
+    /// that measures the twin adds to its time limit: the benchmarks run
+    /// on the test's clock but are the kit's time, not the test's. Zero
+    /// when the kit says nothing.
+    pub time: Duration,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +61,7 @@ struct KitFile {
     initrd: String,
     cmdline: String,
     done: String,
+    time: Option<String>,
 }
 
 impl Kit {
@@ -73,11 +82,22 @@ impl Kit {
             }
             Ok(file)
         };
+        let time = match file.time.as_deref().map(parse_duration) {
+            None => Duration::ZERO,
+            Some(Ok(time)) if !time.is_zero() => time,
+            Some(_) => {
+                return Err(format!(
+                    "{}: time is a length of time more than 0s, such as \"15m\"",
+                    path.display()
+                ));
+            }
+        };
         let kit = Kit {
             kernel: in_dir(&file.kernel, "kernel")?,
             initrd: in_dir(&file.initrd, "initrd")?,
             cmdline: file.cmdline,
             done: file.done,
+            time,
         };
         if !kit.cmdline.contains("console=ttyS0") {
             return Err(format!(
@@ -251,6 +271,28 @@ pub fn show(ns: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kit_says_how_long_its_benchmarks_take() {
+        let dir = crate::testing::TempDir::new("bench-kit-time");
+        dir.write("kit/kernel", "KERNEL");
+        dir.write("kit/initrd", "INITRD");
+        let kit = |time: &str| {
+            dir.write(
+                "kit/kit.toml",
+                &format!(
+                    "kernel = \"kernel\"\ninitrd = \"initrd\"\ncmdline = \"console=ttyS0\"\n\
+                     done = \"done\"\n{time}"
+                ),
+            );
+            Kit::read(&dir.path().join("kit"))
+        };
+        assert_eq!(kit("").unwrap().time, Duration::ZERO);
+        assert_eq!(kit("time = \"15m\"\n").unwrap().time, Duration::from_secs(900));
+        let why = kit("time = \"soon\"\n").unwrap_err();
+        assert!(why.contains("time is a length of time more than 0s"), "{why}");
+        assert!(kit("time = \"0s\"\n").is_err());
+    }
 
     #[test]
     fn reads_bench_lines_and_keeps_the_fastest() {
