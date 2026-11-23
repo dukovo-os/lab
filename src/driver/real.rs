@@ -7,15 +7,17 @@
 //! the SSH target, and the checks of `dukovo-lab machines check` that
 //! concern the lab PC alone.
 //!
-//! A driver's log (`logs/<machine>/amt.log`, `plug.log`) is made here: it
+//! A driver's log (`logs/<machine>/amt.log`, `plug.log`, `redfish.log`) is made here: it
 //! holds the driver's own lines and each request the net-boot server
 //! saw. When a fresh boot fails with no request for the kernel, the log
 //! says so, and docs/real-machines.md lists what to look at.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -217,14 +219,15 @@ impl NetBoot {
     }
 
     /// Waits until the writer says it wrote the image and the hash was
-    /// right, for up to [`WRITE_TIME`].
+    /// right, for up to `limit`: [`WRITE_TIME`] on a machine that starts
+    /// quickly.
     ///
     /// # Errors
     ///
     /// Fails with the writer's own reason when it failed, and when the run
     /// is stopped or the time is up.
-    pub fn await_writer(&mut self, stop: &Stop) -> Result<(), String> {
-        let deadline = Instant::now() + WRITE_TIME;
+    pub fn await_writer(&mut self, stop: &Stop, limit: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
         loop {
             self.note_server();
             match self.server.outcome() {
@@ -236,7 +239,7 @@ impl NetBoot {
                 return Err("the run was stopped".into());
             }
             if Instant::now() >= deadline {
-                let minutes = WRITE_TIME.as_secs() / 60;
+                let minutes = limit.as_secs() / 60;
                 return Err(if self.server.loaded() {
                     format!("the writer did not finish within {minutes} minutes")
                 } else {
@@ -324,6 +327,71 @@ pub fn ssh_target(setup: &Setup, address: &str, boot: u32) -> Result<ssh::Target
         known_hosts: setup.work.join(format!("known_hosts-{boot}")),
         scratch: setup.work.join("ssh-output"),
     })
+}
+
+/// Reads a management controller's password from its file, which only
+/// this user may read. `owner` names the controller in messages, and `key`
+/// the machine file's key that names the file.
+///
+/// # Errors
+///
+/// Fails when the file cannot be read, other users can read it, or it
+/// holds anything but one line.
+pub fn read_password(path: &Path, owner: &str, key: &str) -> Result<String, String> {
+    let meta = fs::metadata(path)
+        .map_err(|err| format!("{owner}'s password file {}: {err} ({key})", path.display()))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "{owner}'s password file {} can be read by other users: `chmod 600 {}`",
+            path.display(),
+            path.display()
+        ));
+    }
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let password = text.trim_end_matches(['\n', '\r']);
+    if password.is_empty() || password.contains('\n') {
+        return Err(format!("{} must hold {owner}'s password alone, on one line", path.display()));
+    }
+    Ok(password.to_string())
+}
+
+/// Runs `command` with `input` on its standard input and gives what it
+/// printed, killing it after `limit`.
+///
+/// # Errors
+///
+/// Fails when the program is not there, cannot start, or does not end
+/// within `limit`.
+pub fn run_bounded(command: &mut Command, input: &[u8], limit: Duration) -> Result<Output, String> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| match err.kind() {
+            ErrorKind::NotFound => format!("{program} is not installed on the lab PC"),
+            _ => format!("starting {program}: {err}"),
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A program that ends without reading its input is judged by its status.
+        let _ = stdin.write_all(input);
+    }
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                // Killed and reaped below, so the wait cannot block.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{program} did not end within {} s", limit.as_secs()));
+            }
+            Err(err) => return Err(format!("waiting for {program}: {err}")),
+        }
+    }
+    child.wait_with_output().map_err(|err| format!("reading {program}'s output: {err}"))
 }
 
 /// How one of `machines check`'s checks came out.

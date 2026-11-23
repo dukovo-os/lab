@@ -107,7 +107,8 @@ one (`pool: optiplex`, with `a spare a run on the pool leaves out` for a
 spare; see [Machine files](machine-files.md#pools)). With `--json`:
 `{"machines": [{"name", "about", "file", "driver", "ready", "pool", "spare",
 "controls": {"power": "driver", ...}, "qemu": {...}, "amt": {...},
-"plug": {...}}]}`; `pool` and `spare` are left out when there is none.
+"plug": {...}, "redfish": {...}}]}`; `pool` and `spare` are left out when there is
+none.
 
 ## machines check
 
@@ -123,7 +124,17 @@ the net-boot server's port, the TFTP folder, the network GRUB, the
 writer's kit and the lab key. For a plug machine: the plug (that it
 answers, its switch and the machine's draw), the lab network, the
 net-boot server's port, the TFTP folder, the network GRUB, the writer's
-kit, the lab key and the netlog port. QEMU machines have nothing to check. Each
+kit, the lab key and the netlog port. For a server with a BMC: the BMC's
+password file, Redfish reachable with the machine file's pin (when the
+pin is missing or wrong, the BMC's own pin is printed, to copy into the
+file), the vendor, model and firmware, the machine's power, that the BMC
+takes a one-time PXE boot, for a Dell the BIOS's boot mode, serial
+redirection to COM2 and PXE device (each a note saying what to set), IPMI
+over LAN and `ipmitool`'s `sol info` when the console is Serial-over-LAN
+(or the serial port when it is a cable), the VNC server's licence when
+the driver does the screen, then the lab network, the net-boot server's
+port, the TFTP folder, the network GRUB, the writer's kit and the lab
+key. QEMU machines have nothing to check. Each
 check is `ok`, a `note`, or a `problem`; the command exits 3 while any
 check is a problem. With `--json`:
 `{"machines": [{"name", "checks": [{"check", "verdict", "detail"}]}]}`.

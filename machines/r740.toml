@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: 2026 The Dukovo contributors
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+# An example machine file for a real server with a BMC: a Dell PowerEdge
+# R740 with an iDRAC9 Enterprise on the lab network. Copy it to
+# ~/.config/dukovo-lab/machines/, put in the iDRAC's address, the pin that
+# `dukovo-lab machines check r740` prints, the MAC address of the card
+# cabled to the lab switch and the serial number of the lab disk, and run
+# the check again. docs/real-machines.md ("A server with a BMC") sets the
+# server and the lab PC up; docs/machine-files.md lists every key.
+#
+# The machine is in no pool and no schedule: name it on its own
+# (`run --machine r740`) until a hardware run has passed end to end.
+
+about = "Dell PowerEdge R740, iDRAC9 Enterprise"
+driver = "redfish"
+
+[redfish]
+# The iDRAC's address, set in its network settings.
+address = "10.77.0.11"
+# The iDRAC user the lab signs in as: one with the Administrator role.
+user = "root"
+# That user's password alone, in a file beside this one: chmod 600.
+password_file = "r740-bmc-password"
+# The iDRAC's certificate is its own, so the lab holds it to its public
+# key. `dukovo-lab machines check r740` prints this line when it is
+# missing or wrong.
+# pin = "sha256//..."
+# The MAC address of the network card cabled to the lab switch, which the
+# firmware boots from the network with.
+mac = "00:00:00:00:00:00"
+# The serial number of the disk each test's image is written to, from
+# `lsblk -o NAME,SERIAL`. No other disk is ever written.
+disk = "SERIAL-OF-THE-LAB-DISK"
+# The console is read through IPMI Serial-over-LAN, the BIOS's COM2
+# (ttyS1). With a serial cable instead, name the lab PC's end of it:
+# serial = "/dev/serial/by-path/..."
+# console = "ttyS0,115200"
+#
+# A two-socket server spends minutes in its firmware at each start: how
+# many minutes a fresh boot may take to load the writer and write the
+# image.
+write_minutes = 12
+
+[controls]
+# Cables and sticks are handled by a person at the machine.
+link = "person"
+usb = "person"
+# A BMC that is not a Dell iDRAC has no screen the lab can use:
+# keys = "none"
+# mouse = "none"
+# screen = "none"
