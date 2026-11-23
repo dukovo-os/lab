@@ -27,6 +27,7 @@ mod grid;
 mod hash;
 mod health;
 mod http;
+mod ipmi_sol;
 mod load;
 mod machines;
 mod netboot;
@@ -36,6 +37,7 @@ mod output;
 mod peer;
 mod png;
 mod qmp;
+mod redfish;
 mod redteam;
 mod resume;
 mod run;
@@ -778,15 +780,14 @@ fn check_machines(arguments: &Arguments, names: &[String]) -> Result<u8, Error> 
     let key = ssh::key_path(&arguments.config_dir()?);
     let mut results = Vec::new();
     for machine in &machines {
-        let checks = match (&machine.amt, &machine.plug) {
-            (Some(settings), _) => {
-                let screen = [Control::Keys, Control::Mouse, Control::Screen]
-                    .into_iter()
-                    .any(|control| machine.who(control) == Who::Driver);
-                driver::amt::check(settings, Some(&key), screen)
-            }
-            (None, Some(settings)) => driver::plug::check(settings, Some(&key)),
-            (None, None) => Vec::new(),
+        let screen = [Control::Keys, Control::Mouse, Control::Screen]
+            .into_iter()
+            .any(|control| machine.who(control) == Who::Driver);
+        let checks = match (&machine.amt, &machine.plug, &machine.redfish) {
+            (Some(settings), _, _) => driver::amt::check(settings, Some(&key), screen),
+            (None, Some(settings), _) => driver::plug::check(settings, Some(&key)),
+            (None, None, Some(settings)) => driver::redfish::check(settings, Some(&key), screen),
+            (None, None, None) => Vec::new(),
         };
         results.push((machine, checks));
     }

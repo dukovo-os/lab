@@ -5,9 +5,10 @@
 //!
 //! The runner drives every machine through [`Driver`], so a test written
 //! against QEMU runs unchanged on a real machine: QEMU's driver is in
-//! qemu.rs, real machines with Intel AMT have theirs in amt.rs, and real
-//! machines on a smart plug theirs in plug.rs (real.rs holds what those
-//! two share). Each method is one [`Control`] of a machine file; the
+//! qemu.rs, real machines with Intel AMT have theirs in amt.rs, real
+//! machines on a smart plug theirs in plug.rs, and servers with a BMC that
+//! speaks Redfish theirs in redfish.rs (real.rs holds what those share,
+//! and remote_screen.rs the VNC screen of AMT and a Dell iDRAC). Each method is one [`Control`] of a machine file; the
 //! runner calls only those the machine file says the driver does.
 //!
 //! [`Control`]: crate::machines::Control
@@ -16,6 +17,8 @@ pub mod amt;
 pub mod plug;
 pub mod qemu;
 pub mod real;
+pub mod redfish;
+pub mod remote_screen;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -400,6 +403,11 @@ pub fn start(machine: &Machine, setup: Setup) -> Result<Box<dyn Driver>, String>
         DriverKind::Plug => {
             let settings = machine.plug.clone().ok_or("a plug machine has no [plug] settings")?;
             Ok(Box::new(plug::PlugDriver::new(settings, setup)?))
+        }
+        DriverKind::Redfish => {
+            let settings =
+                machine.redfish.clone().ok_or("a redfish machine has no [redfish] settings")?;
+            Ok(Box::new(redfish::RedfishDriver::new(settings, setup)?))
         }
     }
 }

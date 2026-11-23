@@ -190,6 +190,11 @@ pub enum DriverKind {
     /// test through net boot (its firmware boots from the network first),
     /// its console through Dukovo's netlog over UDP.
     Plug,
+    /// A server with a BMC that speaks Redfish and IPMI, on the lab
+    /// network: power and the next boot through Redfish, a fresh disk for
+    /// each test through net boot, its console through IPMI
+    /// Serial-over-LAN or a serial cable, and a Dell iDRAC's VNC screen.
+    Redfish,
 }
 
 /// Firmware a QEMU machine boots through.
@@ -381,6 +386,98 @@ impl AmtSettings {
     }
 }
 
+/// How the lab reaches a server through its BMC (a Dell iDRAC, as a rule)
+/// over Redfish and IPMI, and boots it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedfishSettings {
+    /// The BMC's address on the lab network.
+    pub address: String,
+    /// The BMC's user.
+    #[serde(default = "default_redfish_user")]
+    pub user: String,
+    /// A file holding the BMC user's password, and nothing else, readable
+    /// by this user alone. A relative path is from the machine file's
+    /// folder.
+    pub password_file: PathBuf,
+    /// The BMC's public key as curl names it, `sha256//` and the base64
+    /// of the key's SHA-256 hash. A BMC's certificate is its own, so the
+    /// pin is what shows the lab is talking to its BMC; `machines check`
+    /// prints it when it is missing or wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// The MAC address of the machine's network card on the lab network,
+    /// which it boots from the network with.
+    pub mac: String,
+    /// The serial number of the disk the image is written to, the only
+    /// disk the writer may write.
+    pub disk: String,
+    /// The lab PC's serial port that the machine's console is cabled to,
+    /// if it is: with none, the console is read from the BMC's IPMI
+    /// Serial-over-LAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<PathBuf>,
+    /// The serial cable's speed.
+    #[serde(default = "default_baud")]
+    pub baud: u32,
+    /// The machine's address on the lab network, for SSH and the lab
+    /// PC's clients (`{machine}`).
+    #[serde(default = "default_machine_address")]
+    pub machine_address: String,
+    /// The lab PC's address on the lab network: the net-boot server
+    /// listens on it, and tests reach the lab PC there (`{peer}`).
+    #[serde(default = "default_lab_address")]
+    pub lab_address: String,
+    /// The net-boot server's port.
+    #[serde(default = "default_boot_port")]
+    pub boot_port: u16,
+    /// dnsmasq's TFTP folder, which boot scripts are written into.
+    #[serde(default = "default_tftp")]
+    pub tftp: PathBuf,
+    /// The writer's kit.
+    #[serde(default = "default_writer")]
+    pub writer: PathBuf,
+    /// The serial console as Linux names it, for the writer and the Linux
+    /// twin. See [`RedfishSettings::console`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<String>,
+    /// Whether a fresh boot's root is grown to the end of the disk before
+    /// the test starts (see [`GROW_ROOT`](crate::run::GROW_ROOT)).
+    #[serde(default = "default_grow_root")]
+    pub grow_root: bool,
+    /// The `ipmitool` program that reads Serial-over-LAN.
+    #[serde(default = "default_ipmitool")]
+    pub ipmitool: PathBuf,
+    /// How many minutes a fresh boot may take to load the writer and
+    /// write the image: a two-socket server spends minutes in its
+    /// firmware at each start.
+    #[serde(default = "default_write_minutes")]
+    pub write_minutes: u32,
+}
+
+fn default_redfish_user() -> String {
+    "root".into()
+}
+fn default_ipmitool() -> PathBuf {
+    "ipmitool".into()
+}
+fn default_write_minutes() -> u32 {
+    12
+}
+
+impl RedfishSettings {
+    /// The serial console as Linux names it: the machine file's, or the
+    /// port the lab reads. A cable is on COM1 as a rule, `ttyS0`; an
+    /// iDRAC's Serial-over-LAN is the board's COM2, `ttyS1`.
+    pub fn console(&self) -> &str {
+        match (&self.console, &self.serial) {
+            (Some(console), _) => console,
+            (None, Some(_)) => "ttyS0,115200",
+            (None, None) => "ttyS1,115200",
+        }
+    }
+}
+
 /// How the lab reaches a real machine with no AMT, powered through a
 /// smart plug, and boots it; and the cables that give the lab its console
 /// from power-on, its screen, and a keyboard and mouse, when it has them.
@@ -517,6 +614,9 @@ pub struct Machine {
     /// For a real machine on a smart plug.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plug: Option<PlugSettings>,
+    /// For a server with a BMC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redfish: Option<RedfishSettings>,
 }
 
 impl Machine {
@@ -539,6 +639,7 @@ impl Machine {
             qemu: Some(QemuSettings::default()),
             amt: None,
             plug: None,
+            redfish: None,
         }
     }
 }
@@ -572,6 +673,27 @@ fn driver_controls(driver: &DriverKind, plug: Option<&PlugSettings>) -> BTreeMap
             Control::Linux,
             Control::Peer,
             Control::Amt,
+        ]
+        .into_iter()
+        .map(|control| (control, Who::Driver))
+        .collect(),
+        // The BMC does power and the power cut (its force off, which the
+        // system gets no warning of), and a Dell iDRAC's VNC server the
+        // keys, mouse and screen (a file for another BMC takes them
+        // away); IPMI Serial-over-LAN or a serial cable the console, from
+        // the firmware's first line to the system's last; the lab network
+        // SSH and the lab PC's side, and net boot the Linux twin.
+        DriverKind::Redfish => [
+            Control::Power,
+            Control::Cord,
+            Control::Serial,
+            Control::EarlyConsole,
+            Control::Keys,
+            Control::Mouse,
+            Control::Screen,
+            Control::Ssh,
+            Control::Linux,
+            Control::Peer,
         ]
         .into_iter()
         .map(|control| (control, Who::Driver))
@@ -629,6 +751,7 @@ struct MachineFile {
     qemu: Option<QemuSettings>,
     amt: Option<AmtSettings>,
     plug: Option<PlugSettings>,
+    redfish: Option<RedfishSettings>,
 }
 
 /// Reads every machine file in `dir`, and adds the built-in `qemu` unless
@@ -772,6 +895,7 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         (file.qemu.is_some(), "qemu", DriverKind::Qemu),
         (file.amt.is_some(), "amt", DriverKind::Amt),
         (file.plug.is_some(), "plug", DriverKind::Plug),
+        (file.redfish.is_some(), "redfish", DriverKind::Redfish),
     ] {
         if present && file.driver != driver {
             return Err(bad(format!("[{section}] is for machines whose driver is {section}")));
@@ -784,14 +908,25 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         DriverKind::Qemu => Some(file.qemu.unwrap_or_default()),
         _ => None,
     };
+    let from_here = |file: &mut PathBuf| {
+        if file.is_relative()
+            && let Some(folder) = path.parent()
+        {
+            *file = folder.join(&*file);
+        }
+    };
     let amt = match file.driver {
         DriverKind::Amt => {
             let mut settings = file.amt.ok_or_else(|| needs("an", "amt"))?;
-            if settings.password_file.is_relative()
-                && let Some(folder) = path.parent()
-            {
-                settings.password_file = folder.join(&settings.password_file);
-            }
+            from_here(&mut settings.password_file);
+            Some(settings)
+        }
+        _ => None,
+    };
+    let redfish = match file.driver {
+        DriverKind::Redfish => {
+            let mut settings = file.redfish.ok_or_else(|| needs("a", "redfish"))?;
+            from_here(&mut settings.password_file);
             Some(settings)
         }
         _ => None,
@@ -809,6 +944,9 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
     if let Some(settings) = &plug {
         check_plug(settings).map_err(bad)?;
     }
+    if let Some(settings) = &redfish {
+        check_redfish(settings).map_err(bad)?;
+    }
     Ok(Machine {
         name,
         about: file.about,
@@ -821,6 +959,7 @@ fn load_file(path: &Path) -> Result<Machine, Error> {
         qemu,
         amt,
         plug,
+        redfish,
     })
 }
 
@@ -865,6 +1004,43 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
         && (console.is_empty() || console.contains(char::is_whitespace))
     {
         return Err("amt.console must be one Linux console name, such as ttyS4,115200".into());
+    }
+    Ok(())
+}
+
+/// Catches Redfish settings that could only fail on the machine.
+fn check_redfish(settings: &RedfishSettings) -> Result<(), String> {
+    check_address("redfish.address", &settings.address)?;
+    check_lab_keys(
+        "redfish",
+        &LabKeys {
+            machine_address: &settings.machine_address,
+            lab_address: &settings.lab_address,
+            mac: &settings.mac,
+            disk: &settings.disk,
+            boot_port: settings.boot_port,
+        },
+    )?;
+    if settings.user.is_empty() {
+        return Err("redfish.user must name the BMC's user, root as a rule".into());
+    }
+    if let Some(pin) = &settings.pin
+        && !crate::redfish::is_pin(pin)
+    {
+        return Err("redfish.pin must be sha256// and the base64 of the BMC's public key's \
+                    SHA-256 hash: `dukovo-lab machines check` prints it"
+            .into());
+    }
+    if !SERIAL_SPEEDS.contains(&settings.baud) {
+        return Err("redfish.baud must be 9600, 19200, 38400, 57600 or 115200".into());
+    }
+    if let Some(console) = &settings.console
+        && (console.is_empty() || console.contains(char::is_whitespace))
+    {
+        return Err("redfish.console must be one Linux console name, such as ttyS1,115200".into());
+    }
+    if !(1..=240).contains(&settings.write_minutes) {
+        return Err("redfish.write_minutes must be 1 to 240".into());
     }
     Ok(())
 }
@@ -1199,6 +1375,21 @@ mod tests {
     }
 
     #[test]
+    fn the_example_server_has_the_bmc_s_controls_and_is_in_no_pool() {
+        let folder = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/machines"));
+        let machines = load(folder).unwrap();
+        let r740 = machines.iter().find(|machine| machine.name == "r740").unwrap();
+        assert_eq!(r740.driver, DriverKind::Redfish);
+        assert_eq!(r740.pool, None);
+        let redfish = r740.redfish.as_ref().unwrap();
+        assert_eq!(redfish.password_file, folder.join("r740-bmc-password"));
+        assert_eq!(redfish.address, "10.77.0.11");
+        assert_eq!(redfish.pin, None);
+        assert_eq!(r740.who(Control::Screen), Who::Driver);
+        assert_eq!(r740.who(Control::Usb), Who::Person);
+    }
+
+    #[test]
     fn the_example_plug_machine_has_the_plug_s_controls() {
         let folder = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/machines"));
         let machines = load(folder).unwrap();
@@ -1390,6 +1581,116 @@ mod tests {
             panic!("a person cannot do early-console");
         };
         assert!(message.contains("early-console is \"driver\" or \"none\""), "{message}");
+    }
+
+    const BMC_FILE: &str = "about = \"x\"\ndriver = \"redfish\"\n[redfish]\n\
+        address = \"10.77.0.11\"\npassword_file = \"bmc-password\"\n\
+        mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n";
+
+    /// Why loading the machine files in `dir` fails.
+    fn load_error(dir: &TempDir) -> String {
+        let Err(Error::Usage(message)) = load(dir.path()) else {
+            panic!("the machine files should not load");
+        };
+        message
+    }
+
+    #[test]
+    fn a_redfish_machine_has_the_bmc_s_controls_and_defaults() {
+        let dir = TempDir::new("machines-redfish");
+        dir.write("server.toml", BMC_FILE);
+        let machines = load(dir.path()).unwrap();
+        let server = machines.iter().find(|machine| machine.name == "server").unwrap();
+        assert_eq!(server.driver, DriverKind::Redfish);
+        assert!(server.qemu.is_none() && server.amt.is_none() && server.plug.is_none());
+        let driver_does: Vec<Control> = Control::ALL
+            .into_iter()
+            .filter(|&control| server.who(control) == Who::Driver)
+            .collect();
+        assert_eq!(
+            driver_does,
+            [
+                Control::Power,
+                Control::Cord,
+                Control::Serial,
+                Control::EarlyConsole,
+                Control::Keys,
+                Control::Mouse,
+                Control::Screen,
+                Control::Ssh,
+                Control::Linux,
+                Control::Peer,
+            ]
+        );
+        assert_eq!(server.who(Control::Amt), Who::None);
+        let redfish = server.redfish.as_ref().unwrap();
+        // A relative password file is from the machine file's folder.
+        assert_eq!(redfish.password_file, dir.path().join("bmc-password"));
+        assert_eq!(redfish.user, "root");
+        assert_eq!(redfish.pin, None);
+        assert_eq!(redfish.ipmitool, Path::new("ipmitool"));
+        assert_eq!(redfish.write_minutes, 12);
+        assert_eq!((redfish.boot_port, redfish.baud), (7431, 115_200));
+        assert_eq!(redfish.console(), "ttyS1,115200");
+        assert!(redfish.grow_root);
+    }
+
+    #[test]
+    fn a_redfish_file_names_its_pin_cable_console_and_write_time() {
+        let dir = TempDir::new("machines-redfish-keys");
+        let pin = format!("sha256//{}=", "A".repeat(43));
+        dir.write(
+            "server.toml",
+            &format!(
+                "{BMC_FILE}pin = \"{pin}\"\nserial = \"/dev/ttyUSB0\"\nwrite_minutes = 20\n\
+                 ipmitool = \"/opt/ipmitool\"\n[controls]\nscreen = \"none\"\n"
+            ),
+        );
+        let machines = load(dir.path()).unwrap();
+        let server = machines.iter().find(|machine| machine.name == "server").unwrap();
+        let redfish = server.redfish.as_ref().unwrap();
+        assert_eq!(redfish.pin.as_deref(), Some(pin.as_str()));
+        assert_eq!(redfish.write_minutes, 20);
+        assert_eq!(redfish.ipmitool, Path::new("/opt/ipmitool"));
+        // A cable is on COM1.
+        assert_eq!(redfish.console(), "ttyS0,115200");
+        assert_eq!(server.who(Control::Screen), Who::None);
+        assert_eq!(server.who(Control::Keys), Who::Driver);
+    }
+
+    #[test]
+    fn a_redfish_section_belongs_to_the_redfish_driver_and_the_driver_needs_it() {
+        let dir = TempDir::new("machines-redfish-section");
+        dir.write("lonely.toml", "about = \"x\"\ndriver = \"redfish\"\n");
+        let err = load_error(&dir);
+        assert!(err.contains("needs a [redfish] section"), "{err}");
+        fs::remove_file(dir.path().join("lonely.toml")).unwrap();
+        let stray = BMC_FILE.replace("driver = \"redfish\"", "driver = \"qemu\"");
+        dir.write("stray.toml", &stray);
+        let err = load_error(&dir);
+        assert!(err.contains("[redfish] is for machines whose driver is redfish"), "{err}");
+    }
+
+    #[test]
+    fn bad_redfish_settings_say_what_is_wrong() {
+        let dir = TempDir::new("machines-redfish-bad");
+        for (extra, message) in [
+            ("pin = \"sha256//short\"\n", "redfish.pin"),
+            ("pin = \"md5//AAAA\"\n", "redfish.pin"),
+            ("write_minutes = 0\n", "redfish.write_minutes"),
+            ("write_minutes = 241\n", "redfish.write_minutes"),
+            ("user = \"\"\n", "redfish.user"),
+            ("baud = 12\n", "redfish.baud"),
+            ("console = \"ttyS1 115200\"\n", "redfish.console"),
+            ("unknown_key = 1\n", "unknown field"),
+        ] {
+            dir.write("server.toml", &format!("{BMC_FILE}{extra}"));
+            let err = load_error(&dir);
+            assert!(err.contains(message), "{extra}: {err}");
+        }
+        let hostname = BMC_FILE.replace("10.77.0.11", "idrac.lan");
+        dir.write("server.toml", &hostname);
+        assert!(load_error(&dir).contains("redfish.address"));
     }
 
     #[test]

@@ -26,9 +26,10 @@ cord = "person"    # treat pulling the cord as a person's job here
 
 [machines/qemu-bios.toml](../machines/qemu-bios.toml) is an example to copy,
 [machines/optiplex.toml](../machines/optiplex.toml) one for a real
-machine with Intel AMT, and [machines/m75q.toml](../machines/m75q.toml)
-one for a real machine on a Shelly smart plug (see
-[Real machines](real-machines.md)). [machines/optiplex-plug.toml](../machines/optiplex-plug.toml)
+machine with Intel AMT, [machines/m75q.toml](../machines/m75q.toml)
+one for a real machine on a Shelly smart plug, and
+[machines/r740.toml](../machines/r740.toml) one for a server with a BMC
+(see [Real machines](real-machines.md)). [machines/optiplex-plug.toml](../machines/optiplex-plug.toml)
 is the same with an HDMI capture stick, a CH9329 cable and a serial cable.
 
 ## Keys
@@ -36,7 +37,7 @@ is the same with an HDMI capture stick, a CH9329 cable and a serial cable.
 | Key | Required | Meaning |
 | --- | --- | --- |
 | `about` | yes | What the machine is, in one line. |
-| `driver` | yes | How the lab controls it: `qemu`; `amt` for a real machine with Intel AMT; or `plug` for a real machine without AMT, powered through a Shelly smart plug, with optional cables to the lab PC for its console, screen, keyboard and mouse. |
+| `driver` | yes | How the lab controls it: `qemu`; `amt` for a real machine with Intel AMT; `plug` for a real machine without AMT, powered through a Shelly smart plug, with optional cables to the lab PC for its console, screen, keyboard and mouse; or `redfish` for a server with a BMC (a Dell iDRAC9, as a rule) driven over Redfish and IPMI. |
 | `pool` | no | The pool the machine belongs to (below). |
 | `spare` | no | `true` keeps the machine out of a run on its pool, which uses it to run failed tests again (below). Needs `pool`. |
 | `ready` | no | The serial console line that says the machine has booted. Default `Boot complete.` |
@@ -44,6 +45,7 @@ is the same with an HDMI capture stick, a CH9329 cable and a serial cable.
 | `[qemu]` | no | A QEMU machine's hardware (below). |
 | `[amt]` | for `amt` | How the lab reaches a real machine and boots it (below). |
 | `[plug]` | for `plug` | How the lab powers a real machine through a plug and boots it (below). |
+| `[redfish]` | for `redfish` | How the lab reaches a server through its BMC and boots it (below). |
 
 ## Pools
 
@@ -126,6 +128,7 @@ What each driver does by itself:
 | --- | --- |
 | `qemu` | All of them but `amt`. |
 | `amt` | `power`, `cord` (AMT's hard off, which the system gets no warning of), `serial` and `early-console` (AMT's Serial-over-LAN, or the serial cable the machine file names, either of which carries the firmware's and GRUB's lines too), `keys`, `mouse` and `screen` (AMT's remote screen), `ssh`, `linux`, `peer` and `amt`. Cables, sticks, cards and discs (`link`, `usb`, `card`, `sd`, `disc`, `burner`, `floppy`, `cf`) can be handed to a person; `attack` is not done on real machines yet. |
+| `redfish` | `power`, `cord` (the BMC's force off, which the system gets no warning of), `serial` and `early-console` (IPMI Serial-over-LAN, or the serial cable the machine file names, either of which carries the firmware's and GRUB's lines too), `keys`, `mouse` and `screen` (a Dell iDRAC's VNC server; a file for another BMC sets them to `none`), `ssh`, `linux` and `peer`. Cables, sticks, cards and discs can be handed to a person; `amt` and `attack` are not done on a server. |
 | `plug` | `power` (the plug switches the machine on, and a reset is the plug off and on again; the power button and a graceful `off` are not available), `cord` (the plug off: a hard power loss the system gets no warning of), `serial` (the console over netlog, which starts once the network is up and stops when it goes down, or over the serial cable the file names), `ssh` and `peer`. Each cable the file names adds controls: `plug.serial` adds `early-console` and `linux`, `plug.capture` adds `screen`, and `plug.hid` adds `keys` and `mouse`. Without its cable, each of these stays `none`, as does `amt`. Cables, sticks, cards and discs can be handed to a person. |
 
 ## QEMU hardware
@@ -167,6 +170,33 @@ lab network. [Real machines](real-machines.md) sets one up.
 | `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
 | `console` | `ttyS4,115200`, or `ttyS0,115200` with a `serial` cable | The machine's serial port as Linux names it, for the writer and the Linux twin. A board's own ports are `ttyS0` to `ttyS3`; PCI ports come after, from `ttyS4`, and with Serial-over-LAN on, AMT's own port is the first of them, so a serial card's first port is then `ttyS5`. |
 | `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts (see [Real machines](real-machines.md#the-root-grows-to-the-disks-end)). `false` leaves the image's 512 MiB root, which a PHP, PostgreSQL or website bundle fills. A QEMU machine's disk is an 8 GiB overlay over the image, and its `[qemu]` section takes the same setting. |
+
+## Redfish settings
+
+A machine whose driver is `redfish` is a server with a BMC on the lab
+network, driven through Redfish (power, the next boot, a Dell iDRAC's
+VNC screen) and IPMI (the console). [Real machines](real-machines.md#a-server-with-a-bmc)
+sets one up.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `address` | (required) | The BMC's address on the lab network. |
+| `user` | `root` | The BMC's user, one with the Administrator role. |
+| `password_file` | (required) | A file holding the BMC user's password alone, readable by this user alone (`chmod 600`). A relative path is from the machine file's folder. |
+| `pin` | (none) | The BMC's public key as curl names it: `sha256//` and the base64 of the SHA-256 hash of the key. A BMC's certificate is its own, so the lab talks to it only when its key is this one. `dukovo-lab machines check` prints the line to put here when the pin is missing or wrong. A run needs it. |
+| `mac` | (required) | The MAC address of the network card cabled to the lab network, written `aa:bb:cc:dd:ee:ff`. |
+| `disk` | (required) | The serial number of the disk each fresh boot writes the image to, as `lsblk -o NAME,SERIAL` shows it. No other disk is ever written. |
+| `serial` | (none) | The lab PC's serial port the machine's console is cabled to, such as `/dev/ttyUSB0`. With none, the console is read through the BMC's IPMI Serial-over-LAN. |
+| `baud` | `115200` | The serial cable's speed. |
+| `machine_address` | `10.77.0.2` | The machine's address on the lab network, for SSH and `{machine}`. |
+| `lab_address` | `10.77.0.1` | The lab PC's address on the lab network: the net-boot server listens there, and tests reach the lab PC there as `{peer}`. |
+| `boot_port` | `7431` | The first of the net-boot server's four ports, as for `amt`. |
+| `tftp` | `/srv/dukovo-lab/tftp` | dnsmasq's TFTP folder, where boot scripts are written. |
+| `writer` | `/srv/dukovo-lab/writer` | The writer's kit, which `ob lab` installs. |
+| `console` | `ttyS1,115200`, or `ttyS0,115200` with a `serial` cable | The machine's serial port as Linux names it, for the writer and the Linux twin. An iDRAC's Serial-over-LAN is the board's COM2, `ttyS1`. |
+| `grow_root` | `true` | Whether each fresh boot grows the root to the end of the disk before the test starts, as for `amt`. |
+| `ipmitool` | `ipmitool` | The `ipmitool` program that reads Serial-over-LAN. |
+| `write_minutes` | `12` | How many minutes a fresh boot may take to load the writer and write the image, 1 to 240. A two-socket server spends 2 to 4 minutes in its firmware at each start, and a fresh boot starts it twice. The runner adds this to each test's time limit. |
 
 ## Plug settings
 

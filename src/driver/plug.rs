@@ -376,7 +376,7 @@ impl PlugDriver {
             self.settings.mac.to_ascii_lowercase()
         );
         let booted = self.netboot.begin("the writer", offer, &cmdline).and_then(|()| self.cycle());
-        let outcome = booted.and_then(|()| self.netboot.await_writer(&self.setup.stop));
+        let outcome = booted.and_then(|()| self.netboot.await_writer(&self.setup.stop, WRITE_TIME));
         self.netboot.finish();
         self.netboot.copy_events_to(None);
         match outcome {

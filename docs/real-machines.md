@@ -16,8 +16,13 @@ A machine without AMT runs through the `plug` driver instead: a Shelly
 smart plug turns it on and off, and its console comes over the network.
 Cables to the lab PC can add its screen, keyboard and mouse, and a console
 from power-on. [A machine on a smart plug](#a-machine-on-a-smart-plug)
-below sets one up; the rest of this page is about AMT machines, and what
-it says of net boot, the lab network and the lab PC holds for both.
+below sets one up. A server with a BMC, such as a Dell PowerEdge with an
+iDRAC, runs through the `redfish` driver: the BMC turns it on and off and
+picks its next boot over Redfish, its console comes over IPMI
+Serial-over-LAN, and an iDRAC's VNC server shows its screen. [A server
+with a BMC](#a-server-with-a-bmc) below sets one up. The rest of this
+page is about AMT machines, and what it says of net boot, the lab network
+and the lab PC holds for all three.
 
 ## What a machine needs
 
@@ -531,3 +536,84 @@ Wi-Fi drops a call now and then, so each call is tried three times.
 `serial-<n>.log` stays empty while the machine runs when its network does
 not come up or the image does not send its log to the lab PC; `plug.log`
 and `writer-<n>.log` still show the fresh boot.
+
+## A server with a BMC
+
+A server with a baseboard management controller (BMC) that speaks Redfish
+and IPMI, such as a Dell PowerEdge R740 with an iDRAC9 Enterprise, runs
+through the `redfish` driver. It does what the `amt` driver does, with the
+BMC's means:
+
+| Control | How |
+| --- | --- |
+| A fresh boot | The BMC turns the machine off, the next boot is set to the network once (PXE, UEFI), the machine is turned on, and the writer the net-boot server hands it writes the image and reads it back; then the machine restarts into its disk. A two-socket server spends 2 to 4 minutes in its firmware at each start, so the time allowed is the machine file's `write_minutes` (12 by default), and the same time is added to the test's time limit. |
+| `power` | Redfish's `ComputerSystem.Reset`: `on` is `On`, `reset` is `ForceRestart`, `cut` (`cord`) is `ForceOff`, and `off` and `button` are `GracefulShutdown`, which the system must answer. The power state is the system's `PowerState`; `PoweringOff` counts as on. |
+| `serial`, `early-console` | IPMI Serial-over-LAN through `ipmitool` (`sudo apt install ipmitool`), or a serial cable (`serial = "/dev/ttyUSB0"`). The driver keeps the session open for the run and starts it again when it ends: `logs/<machine>/serial-<n>.log` is each boot's console. |
+| `screen`, `keys`, `mouse` | A Dell iDRAC's VNC server. The first test that uses one turns it on through Redfish, with a password made for the run, and the lab reads the port the iDRAC names. It needs the iDRAC's virtual console licence, which the Enterprise edition has. For another BMC the machine file sets these to `none`. |
+| `ssh`, `peer`, `linux` | As for `amt`: the machine's own address on the lab network, and the machine net booted into the Linux kit. |
+
+The BMC's event logs are read when the run starts and when it ends, and
+the entries made in between are written to `logs/<machine>/bmc-events.log`,
+one line each: when, how severe, the message's id and its text.
+
+Cables, sticks, cards and discs are a person's to handle, and installing
+from a stick or a disc is not done on a server yet.
+
+### Setting the server up
+
+Once, at the server:
+
+1. In the iDRAC's network settings: a fixed address on the lab network
+   (`10.77.0.11/24`), with no gateway. The iDRAC's own port or a shared
+   LOM port on the lab switch both work.
+2. Turn on IPMI over LAN (iDRAC Settings, Connectivity, IPMI Settings) and
+   leave Redfish on (it is by default). Make a user for the lab, with the
+   Administrator role and the privilege to use IPMI over LAN, and keep its
+   password alone in a file beside the machine file: `chmod 600`.
+3. In the BIOS: boot mode UEFI, serial communication on with console
+   redirection to COM2 (which the iDRAC's Serial-over-LAN carries; the
+   baud rate 115200), and PXE device 1 enabled on the network card cabled
+   to the lab switch (the rNDC port, say). Secure Boot off.
+4. The lab disk is a drive the writer sees by its serial number
+   (`lsblk -o NAME,SERIAL` in a Linux that runs on the server). Until the
+   writer has the PERC's driver, that is a USB stick in the internal port;
+   after, a drive in HBA mode or the BOSS card. Only that disk is written.
+
+Once, at the lab PC: copy [machines/r740.toml](../machines/r740.toml) to
+`~/.config/dukovo-lab/machines/`, put in the iDRAC's address, the card's
+MAC address, the disk's serial number and the name of the password file,
+and run `dukovo-lab machines check r740`.
+
+### The pin
+
+An iDRAC's certificate is its own, so the lab cannot check it against an
+authority. It checks the BMC's public key against the `pin` in the machine
+file instead, and talks to no BMC without one. The first
+`dukovo-lab machines check` with no pin (or a wrong one) prints the
+BMC's, such as `sha256//47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=`:
+copy it into the `[redfish]` section as `pin = "..."`, on the lab network,
+where it is the BMC you mean. The check reads it with `openssl`. A new
+certificate made from the same key keeps the pin; a new key needs a new one.
+
+The password is never in a command line: each request goes to `curl` on
+its standard input, `ipmitool` reads the password from the file, and the
+driver's log (`logs/<machine>/redfish.log`) never has it.
+
+### When something goes wrong
+
+- `logs/<machine>/redfish.log` says what the driver did: each power
+  change, each net boot, each request the writer made, each remote screen
+  session, and each time `ipmitool` ended and was started again.
+- A fresh boot that fails with "did not load the writer" within the
+  allowed time means the firmware went on to the disk or took longer than
+  `write_minutes`: the serial log of the writer, `writer-<n>.log`, shows
+  how far it got. A server that stops in the PERC's or the network cards'
+  option ROMs needs them turned off or the time raised.
+- `serial-<n>.log` stays empty while the machine runs when the BIOS does
+  not redirect its console to COM2, when another Serial-over-LAN session
+  (an iDRAC web console, a person's `ipmitool`) holds the BMC's one
+  session, or when the machine file's `console` is not the port the
+  system writes to.
+- `machines check` says which of these it can see: a BIOS set otherwise
+  is a note with what to set, and a BMC the lab cannot sign in to or
+  reach is a problem that names the setting.
