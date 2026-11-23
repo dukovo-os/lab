@@ -223,6 +223,13 @@ test's lab PC processes: it ends with the test, and the test's log says
 so. The machine's `sshd` must allow TCP forwarding, as the lab image's
 does.
 
+A machine that restarts during the test ends the forward's `ssh`, so the
+runner starts it again, on the same local port, whenever it ends while
+the test runs: every two seconds, until the machine's SSH answers or the
+test's time is up. A page that stayed open reconnects once it is back.
+Each start is a line in the forward's own log (`the forward ended (status
+255); starting it again`).
+
 Only what a browser opens changes. `host`, `run` and `attack` steps, and
 `{machine}` and `{machine-port:N}` in them, keep the machine's address.
 When the forward does not start (the key is refused, the machine is
@@ -230,6 +237,11 @@ off, the port is taken), the browser is given the machine's address as
 before, the test's log says why, and the test's script decides whether
 it can go on: a script that needs a name skips itself. The forward's
 own output is `logs/<machine>/<test>-forward-<port>.log` in the bundle.
+
+The machine sees every browser come from 127.0.0.1 through the forward,
+so a test about where a browser connects from sets `by_address = true`
+on its `browser` step: that step opens the machine at its address on the
+lab network, with no forward (test-files.md, "Browser tests").
 
 ## The health check
 

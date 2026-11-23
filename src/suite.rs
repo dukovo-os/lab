@@ -403,6 +403,11 @@ pub struct Browser {
     /// The machine's port that serves the page, which the lab PC reaches
     /// as `{machine-port:N}` does.
     pub port: u16,
+    /// Whether the browser opens the machine at its address on the lab
+    /// network, as the other steps name it, and not through a forward to
+    /// its loopback (`by_address = true`). The console then sees the
+    /// browser's own address, not 127.0.0.1.
+    pub by_address: bool,
 }
 
 /// The port a `browser` step opens unless it names one: the admin
@@ -1034,6 +1039,7 @@ struct StepFile {
     browser: Option<String>,
     engines: Option<Vec<String>>,
     port: Option<i64>,
+    by_address: Option<bool>,
     optional: Option<bool>,
 }
 
@@ -1463,6 +1469,7 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
     }
     only_with("engines", step.engines.is_some(), "browser")?;
     only_with("port", step.port.is_some(), "browser")?;
+    only_with("by_address", step.by_address.is_some(), "browser")?;
     only_with("rows", step.rows.is_some(), "bench")?;
     only_with("limit", step.limit.is_some(), "bench")?;
     // A stick's, a card's, a disc's or a floppy disk's: what it holds. A
@@ -1525,7 +1532,8 @@ fn parse_step(step: StepFile, folder: &Path) -> Result<Step, String> {
         return Ok(Step::Host(command));
     }
     if let Some(script) = step.browser {
-        return parse_browser(script, step.engines, step.port, folder).map(Step::Browser);
+        return parse_browser(script, step.engines, step.port, step.by_address, folder)
+            .map(Step::Browser);
     }
     if let Some(command) = step.bench {
         return parse_bench(command, step.root, step.rows, step.limit);
@@ -1718,6 +1726,7 @@ fn parse_browser(
     script: String,
     engines: Option<Vec<String>>,
     port: Option<i64>,
+    by_address: Option<bool>,
     folder: &Path,
 ) -> Result<Browser, String> {
     // Only files beside the test, as for an image.
@@ -1755,7 +1764,7 @@ fn parse_browser(
             .filter(|&port| port > 0)
             .ok_or_else(|| format!("port: {number} is not a port, 1 to 65535"))?,
     };
-    Ok(Browser { script, engines, port })
+    Ok(Browser { script, engines, port, by_address: by_address.unwrap_or(false) })
 }
 
 /// The range a `limit` may take: a bar below a tenth of Linux's time, or
@@ -2861,7 +2870,8 @@ expect = "1 received"
         dir.write(
             "features/pages.toml",
             "about = \"x\"\ntime = \"1m\"\n[[step]]\nbrowser = \"overview.mjs\"\n\
-             [[step]]\nbrowser = \"overview.mjs\"\nengines = [\"webkit\", \"chromium\"]\nport = 443\n",
+             [[step]]\nbrowser = \"overview.mjs\"\nengines = [\"webkit\", \"chromium\"]\nport = 443\n\
+             by_address = true\n",
         );
         let test = &load(dir.path()).unwrap()[0];
         assert_eq!(
@@ -2870,6 +2880,7 @@ expect = "1 received"
                 script: "overview.mjs".into(),
                 engines: Engine::ALL.to_vec(),
                 port: 9090,
+                by_address: false,
             })
         );
         assert_eq!(
@@ -2882,6 +2893,7 @@ expect = "1 received"
                 script: "overview.mjs".into(),
                 engines: vec![Engine::Webkit, Engine::Chromium],
                 port: 443,
+                by_address: true,
             })
         );
         assert_eq!(
@@ -2939,6 +2951,10 @@ expect = "1 received"
                 "engines goes only with browser".into(),
             ),
             ("run = \"true\"\nport = 443".into(), "port goes only with browser".into()),
+            (
+                "run = \"true\"\nby_address = true".into(),
+                "by_address goes only with browser".into(),
+            ),
             (with_script("host = \"true\""), "one action per step".into()),
             (with_script("root = true"), "root goes only with run".into()),
         ] {

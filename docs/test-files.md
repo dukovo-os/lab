@@ -538,6 +538,7 @@ time = "5m"
 browser = "overview.mjs"              # a script beside the test file
 engines = ["chromium", "firefox"]     # optional; all three by default
 port = 9090                           # optional; the machine's port; 9090 by default
+by_address = false                    # optional; true opens the machine at its address, not `localhost`
 ```
 
 `overview.mjs` is an ES module whose default export is a function. It is
@@ -565,6 +566,17 @@ real-machines.md, "Browsers open the machine by `localhost`"). Only the
 browser's page changes: `{machine}` and `{machine-port:N}` in `host` and
 `run` steps stay the machine's address. When the forward does not start,
 the browser is given the machine's address and the test's log says why.
+`by_address = true` asks for that address on purpose: the step's page is
+`https://{machine}:{machine-port:PORT}` on a real machine too, and the
+machine sees the browser's own address on the lab network, not
+127.0.0.1. A test about where a browser connects from (a firewall rule
+for the browser's address, the card the console is reached through, the
+address a session shows) sets it, and gives up the name `localhost`: a
+passkey made through the forward is not the machine's by this address.
+The machine must accept the lab PC's address on that port, and a console
+that listens on loopback only, or whose firewall or reach setting turns
+the lab network away, needs an earlier `run` step that opens it. Under
+QEMU the page is the forwarded port as before, whatever the key says.
 The script finds the machine as the other steps name it, `host:port`
 from `{machine}` and `{machine-port:PORT}`, in the environment variable
 `DUKOVO_LAB_MACHINE`: a file a `host` step names after the machine is

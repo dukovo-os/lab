@@ -573,7 +573,8 @@ impl Driver for FakeMachine {
 
     /// An addressed machine forwards, as the real drivers do, with a
     /// `sleep` that writes its pid and what it forwards. `addressed-refused`
-    /// cannot start one and `addressed-ends` has one that ends at once.
+    /// cannot start one, `addressed-ends` has one that ends at once and
+    /// `addressed-restarts` one that ends once, after it was up.
     fn loopback_forward(&mut self, local_port: u16, port: u16) -> Result<Option<String>, String> {
         if !self.addressed() {
             return Ok(None);
@@ -588,6 +589,17 @@ impl Driver for FakeMachine {
             .map_err(|err| err.to_string())?;
         self.listeners.push(listener);
         let pid = self.logs.join("forward.pid");
+        if self.name == "addressed-restarts" {
+            // As a machine that restarts: the first `ssh` ends, and the one
+            // started again stays.
+            let first = self.logs.join("forward.first");
+            return Ok(Some(format!(
+                "echo forward 127.0.0.1:{local_port} to {port}; if [ -e {first} ]; then echo $$ > \
+                 {pid}; exec sleep 300; fi; touch {first}; exit 255",
+                first = first.display(),
+                pid = pid.display()
+            )));
+        }
         Ok(Some(format!(
             "echo forward 127.0.0.1:{local_port} to {port}; echo $$ > {}; exec sleep 300",
             pid.display()
@@ -3068,4 +3080,37 @@ fn the_log_is_written_after_each_step_and_the_last_write_ends_it() {
     // leaves no such line of its own.
     assert!(!log.lines().any(|line| line.starts_with("Still running")), "{log}");
     assert!(log.ends_with("Result: Pass\n"), "{log}");
+}
+
+#[test]
+fn a_forward_that_ends_while_the_test_runs_is_started_again_on_its_port() {
+    let test = "about = \"opens the console\"\ntime = \"1m\"\n\
+                [[step]]\nbrowser = \"console.mjs\"\n\
+                [[step]]\nhost = \"sleep 4\"\n";
+    let script = "export default async function check(t) {}\n";
+    let setting = setting_with(&[("web/console.toml", test), ("web/console.mjs", script)]);
+    let (bundle, results) = run_browsers(&setting, &named(&setting, "addressed-restarts"));
+    let result = &results[0];
+    assert_eq!(result.result, Outcome::Pass, "{:?}", result.reason);
+    let forward =
+        fs::read_to_string(bundle.join("logs/addressed-restarts/web-console-forward-9090.log"))
+            .unwrap();
+    assert!(forward.contains("the forward ended (status 255); starting it again"), "{forward}");
+    // The forward that was started again is the one that ended with the test.
+    let log = fs::read_to_string(bundle.join(result.log.as_ref().unwrap())).unwrap();
+    assert!(log.contains("ended at the test's end"), "{log}");
+    let pid = fs::read_to_string(bundle.join("logs/addressed-restarts/forward.pid")).unwrap();
+    assert!(!Path::new("/proc").join(pid.trim()).exists(), "the forward's process {pid} lives");
+}
+
+#[test]
+fn a_browser_step_that_asks_for_the_address_opens_the_machine_there_with_no_forward() {
+    let test = "about = \"opens the console\"\ntime = \"1m\"\n\
+                [[step]]\nbrowser = \"console.mjs\"\nby_address = true\n";
+    let script = "export default async function check(t) {\n\
+                  if (t.url !== \"https://10.77.0.2:9090\") throw new Error(`url ${t.url}`);\n}\n";
+    let setting = setting_with(&[("web/console.toml", test), ("web/console.mjs", script)]);
+    let (bundle, results) = run_browsers(&setting, &named(&setting, "addressed"));
+    assert_eq!(results[0].result, Outcome::Pass, "{:?}", results[0].reason);
+    assert!(!bundle.join("logs/addressed/web-console-forward-9090.log").exists());
 }

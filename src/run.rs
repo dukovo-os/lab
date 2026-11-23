@@ -53,7 +53,7 @@ use crate::health;
 use crate::load;
 use crate::machines::{Control, Machine, Pool, Who};
 use crate::output::{Event, Reporter, short_note};
-use crate::peer::{self, Job, Ports, Readiness, SKIP_STATUS, Token};
+use crate::peer::{self, Forward, Job, Ports, Readiness, SKIP_STATUS, Token};
 use crate::redteam::RedteamKit;
 use crate::resume::Resume;
 use crate::screen::{self, Font};
@@ -1003,8 +1003,8 @@ struct PeerSide {
     /// steps open pages through.
     jobs: Vec<Job>,
     /// The lab PC's loopback port forwarded to each machine port a browser
-    /// step opened.
-    forwards: BTreeMap<u16, u16>,
+    /// step opened, and the forward, which is started again when it ends.
+    forwards: BTreeMap<u16, (u16, Forward)>,
     /// Whether a host step ran as root, and so may have left root's files
     /// in the test's folder.
     rooted: bool,
@@ -1837,7 +1837,7 @@ impl<'a> Worker<'a> {
             fs::create_dir_all(folder)
                 .map_err(|err| StepFailure::Error(format!("making {}: {err}", folder.display())))?;
         }
-        let url = self.browser_url(test, browser.port, deadline)?;
+        let url = self.browser_url(test, browser, deadline)?;
         let machine = self.fill(&format!("{{machine}}:{{machine-port:{}}}", browser.port))?;
         let (kit, script) = (absolute(kit), self.peer.here.join(&browser.script));
         let (absolute_shots, absolute_logs) = (absolute(&shots), absolute(&logs));
@@ -1876,16 +1876,24 @@ impl<'a> Worker<'a> {
     /// The page address a browser opens for the machine's `port`. A machine
     /// the lab PC reaches by an address is opened through a forward on the
     /// lab PC's loopback, so that the machine's own name for itself,
-    /// `localhost`, is the page's. Without the forward the browser is given
-    /// the machine's address, and the test's log says why.
+    /// `localhost`, is the page's. Without the forward, or when the step
+    /// asks for `by_address`, the browser is given the machine's address,
+    /// and the log says why when a forward failed.
     fn browser_url(
         &mut self,
         test: &Test,
-        port: u16,
+        browser: &Browser,
         deadline: Instant,
     ) -> Result<String, StepFailure> {
+        let port = browser.port;
         let folder = self.peer_work()?;
-        match self.forward_for_browser(test, port, &folder, deadline) {
+        // A step that asks for the machine's address is not forwarded.
+        let forwarded = if browser.by_address {
+            Ok(None)
+        } else {
+            self.forward_for_browser(test, port, &folder, deadline)
+        };
+        match forwarded {
             Ok(Some(local)) => return Ok(format!("https://127.0.0.1:{local}")),
             Ok(None) => {}
             Err(why) => self.log.push(format!(
@@ -1906,7 +1914,7 @@ impl<'a> Worker<'a> {
         folder: &Path,
         deadline: Instant,
     ) -> Result<Option<u16>, String> {
-        if let Some(&local) = self.peer.forwards.get(&port) {
+        if let Some(&(local, _)) = self.peer.forwards.get(&port) {
             return Ok(Some(local));
         }
         let local = peer::free_port()?;
@@ -1922,7 +1930,9 @@ impl<'a> Worker<'a> {
         let shown = self.shared.bundle.relative(&log);
         let why = match readiness {
             Readiness::Ready => {
-                self.peer.forwards.insert(port, local);
+                let job = self.peer.jobs.pop().expect("pushed above");
+                let forward = Forward::keep(job, deadline, self.shared.stop);
+                self.peer.forwards.insert(port, (local, forward));
                 return Ok(Some(local));
             }
             Readiness::Exited(status) => {
@@ -2140,14 +2150,17 @@ impl<'a> Worker<'a> {
     /// Ends the test's servers on the lab PC, noting in its log how each
     /// ended, and clears its ports and folder for the next test.
     fn end_peer_side(&mut self) {
-        for mut job in std::mem::take(&mut self.peer.jobs) {
+        let kept = std::mem::take(&mut self.peer.forwards);
+        let forwards = kept.into_values().filter_map(|(_, forward)| forward.finish());
+        let jobs: Vec<Job> =
+            std::mem::take(&mut self.peer.jobs).into_iter().chain(forwards).collect();
+        for mut job in jobs {
             let ended = job.end();
             let log = self.shared.bundle.relative(&job.log);
             self.log
                 .push(format!("Lab PC server `{}`: {ended}; its output is in {log}", job.command));
         }
         self.peer.ports = Ports::default();
-        self.peer.forwards.clear();
         if let Some(work) = self.peer.work.take()
             && fs::remove_dir_all(&work).is_err()
             && self.peer.rooted

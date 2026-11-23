@@ -42,6 +42,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::driver::real::{Check, Verdict};
@@ -373,6 +376,8 @@ pub struct Job {
     pub log: PathBuf,
     /// How it ended, once it has.
     ended: Option<String>,
+    /// The folder it runs in.
+    folder: PathBuf,
 }
 
 /// How waiting for a server to be ready went.
@@ -398,7 +403,13 @@ impl Job {
             .stderr(errors_file)
             .spawn()
             .map_err(|err| format!("starting `{command}` on the lab PC: {err}"))?;
-        Ok(Job { child, command: command.into(), log: log.into(), ended: None })
+        Ok(Job {
+            child,
+            command: command.into(),
+            log: log.into(),
+            ended: None,
+            folder: folder.into(),
+        })
     }
 
     /// Waits until its output holds `text`.
@@ -441,6 +452,29 @@ impl Job {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    /// Whether it has ended, and with what status (none: a signal).
+    fn exited(&mut self) -> Option<Option<i32>> {
+        self.child.try_wait().ok().flatten().map(|status| status.code())
+    }
+
+    /// Starts its command again, after it ended, with a line in its log
+    /// that says so: the log is kept, not made again.
+    fn respawn(&mut self, note: &str) -> Result<(), String> {
+        let mut log = fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log)
+            .map_err(|err| format!("opening {}: {err}", self.log.display()))?;
+        writeln!(log, "{note}").map_err(|err| err.to_string())?;
+        let errors = log.try_clone().map_err(|err| err.to_string())?;
+        self.child = shell(&self.command, &[], &self.folder)
+            .stdin(Stdio::null())
+            .stdout(log)
+            .stderr(errors)
+            .spawn()
+            .map_err(|err| format!("starting `{}` on the lab PC: {err}", self.command))?;
+        Ok(())
     }
 
     /// The last lines of its output, for a message.
@@ -488,6 +522,77 @@ impl Job {
     }
 }
 
+/// How long a forward that ended waits before it is started again, so a
+/// machine that is down is not asked in a loop.
+const FORWARD_PAUSE: Duration = Duration::from_secs(2);
+
+/// Whether a forward that has `ended` is started again: while the test is
+/// still running and its time is not up. A machine that restarts ends the
+/// forward (its `ssh` exits with 255), and the test's page, which stayed
+/// open, reconnects to the same local port once the forward is back.
+fn should_respawn(ended: bool, test_over: bool, now: Instant, deadline: Instant) -> bool {
+    ended && !test_over && now < deadline
+}
+
+/// A forward kept up for the test: a thread starts its `ssh` again, on the
+/// same local port, whenever it ends, until the test's time runs out or
+/// the test ends. Each start is a line in the forward's log.
+pub struct Forward {
+    over: Arc<AtomicBool>,
+    thread: Option<JoinHandle<Job>>,
+}
+
+impl Forward {
+    /// Keeps `job`, a forward that is up, up until `deadline`.
+    pub fn keep(mut job: Job, deadline: Instant, stop: &Stop) -> Forward {
+        let over = Arc::new(AtomicBool::new(false));
+        let (flag, stop) = (Arc::clone(&over), stop.clone());
+        let thread = std::thread::spawn(move || {
+            let mut starts = 0;
+            let ended = || flag.load(Ordering::Relaxed) || stop.requested();
+            while !ended() {
+                std::thread::sleep(Duration::from_millis(100));
+                // It ends when the machine restarts, or while its SSH is
+                // not up yet; `ssh` then ends again at once, and this waits
+                // a little between starts.
+                let Some(status) = job.exited() else { continue };
+                if !should_respawn(true, ended(), Instant::now(), deadline) {
+                    break;
+                }
+                let until = Instant::now() + FORWARD_PAUSE;
+                while Instant::now() < until && !ended() {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                if ended() {
+                    break;
+                }
+                starts += 1;
+                let after = status.map_or("a signal".to_string(), |code| format!("status {code}"));
+                let note = format!(
+                    "lab: the forward ended ({after}); starting it again, start number {starts}"
+                );
+                if job.respawn(&note).is_err() {
+                    break;
+                }
+            }
+            job
+        });
+        Forward { over, thread: Some(thread) }
+    }
+
+    /// Stops keeping it up and gives the forward, to end.
+    pub fn finish(mut self) -> Option<Job> {
+        self.over.store(true, Ordering::Relaxed);
+        self.thread.take()?.join().ok()
+    }
+}
+
+impl Drop for Forward {
+    fn drop(&mut self) {
+        self.over.store(true, Ordering::Relaxed);
+    }
+}
+
 impl Drop for Job {
     fn drop(&mut self) {
         self.end();
@@ -521,6 +626,21 @@ impl Ports {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[test]
+    fn a_forward_is_started_again_only_while_the_test_runs_and_has_time() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(60);
+        // (ended, test over, deadline, whether it starts again)
+        for (ended, over, deadline, again) in [
+            (true, false, later, true),
+            (false, false, later, false),
+            (true, true, later, false),
+            (true, false, now, false),
+        ] {
+            assert_eq!(should_respawn(ended, over, now, deadline), again, "{ended} {over}");
+        }
+    }
 
     #[test]
     fn finds_placeholders_and_leaves_other_braces() {
