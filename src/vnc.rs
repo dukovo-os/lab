@@ -3,11 +3,16 @@
 
 //! A VNC client: just enough of RFB (RFC 6143) to see a real machine's
 //! screen and use its keyboard and mouse through Intel AMT's remote
-//! screen (KVM), which AMT serves on the standard VNC port, 5900.
+//! screen (KVM), or a BMC's. AMT before release 16.1 serves it on the
+//! standard VNC port, 5900; from 16.1 on, only through its redirection
+//! service, over TLS (see redirection.rs), as a session of its own that
+//! carries RFB once AMT's sign-in is done.
 //!
-//! - **Signing in** is VNC's: the server's challenge encrypted with DES
-//!   under the password (des.rs). AMT names its protocol version 4.0 and
-//!   speaks 3.8, so any version from 3.8 up is spoken as 3.8.
+//! - **Signing in** on a VNC port is VNC's: the server's challenge
+//!   encrypted with DES under the password (des.rs). Through AMT's
+//!   redirection service, the session is already signed in, and RFB asks
+//!   for none. AMT names its protocol version 4.0 and speaks 3.8, so any
+//!   version from 3.8 up is spoken as 3.8.
 //! - **The screen** comes as raw pixels, in the server's own pixel format
 //!   when it is true colour (every server takes its own), and is read
 //!   into an [`Image`]. A server that changes the screen's size says so
@@ -20,10 +25,11 @@
 //! - **The pointer** is absolute, in the screen's pixels.
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use crate::des;
+use crate::link::{self, Link, Target};
+use crate::redirection::{self, Kind, Session, Sign};
 use crate::screen::Image;
 
 /// AMT's port for a standard VNC client.
@@ -192,9 +198,29 @@ enum Message {
     Other,
 }
 
+/// Where a remote screen is, and how a session signs in.
+#[derive(Clone)]
+pub enum Door {
+    /// A VNC server at `host:port`, signed in to with its password.
+    Vnc { address: String, password: String },
+    /// AMT's redirection service, signed in to with AMT's user and
+    /// password.
+    Amt(Sign),
+}
+
+impl Door {
+    /// Where it is, for messages.
+    pub fn address(&self) -> &str {
+        match self {
+            Door::Vnc { address, .. } => address,
+            Door::Amt(sign) => &sign.address,
+        }
+    }
+}
+
 /// A session with a VNC server.
 pub struct Vnc {
-    stream: TcpStream,
+    stream: Link,
     width: u16,
     height: u16,
     format: PixelFormat,
@@ -203,12 +229,12 @@ pub struct Vnc {
 }
 
 impl Vnc {
-    /// Signs in to the server at `address` with `password`, trying again
-    /// until `deadline` while the port is closed or the server turns the
-    /// session away; a wrong password fails at once.
-    pub fn connect(address: &str, password: &str, deadline: Instant) -> Result<Vnc, String> {
+    /// Opens a session through `door`, trying again until `deadline`
+    /// while the port is closed or the server turns the session away; a
+    /// wrong password fails at once.
+    pub fn connect(door: &Door, deadline: Instant) -> Result<Vnc, String> {
         loop {
-            match Vnc::try_connect(address, password) {
+            match Vnc::try_connect(door) {
                 Ok(vnc) => return Ok(vnc),
                 Err(Failed::Stop(why)) => return Err(why),
                 Err(Failed::Again(why)) if Instant::now() >= deadline => return Err(why),
@@ -217,20 +243,32 @@ impl Vnc {
         }
     }
 
-    fn try_connect(address: &str, password: &str) -> Result<Vnc, Failed> {
+    fn try_connect(door: &Door) -> Result<Vnc, Failed> {
+        let address = door.address();
         let again =
             |err: std::io::Error| Failed::Again(format!("the remote screen at {address}: {err}"));
-        let target = address
-            .to_socket_addrs()
-            .map_err(|err| Failed::Stop(format!("the remote screen's address {address}: {err}")))?
-            .next()
-            .ok_or_else(|| {
-                Failed::Stop(format!("the remote screen's address {address} is no address"))
-            })?;
-        let stream = TcpStream::connect_timeout(&target, CONNECT_TIME).map_err(again)?;
-        stream.set_read_timeout(Some(MESSAGE_TIME)).map_err(again)?;
-        stream.set_write_timeout(Some(MESSAGE_TIME)).map_err(again)?;
-        stream.set_nodelay(true).map_err(again)?;
+        let (stream, password) = match door {
+            Door::Vnc { address, password } => {
+                let target = Target::plain(address);
+                let stream =
+                    target.connect(CONNECT_TIME, MESSAGE_TIME, Duration::ZERO).map_err(|err| {
+                        let why = format!("the remote screen at {address}: {err}");
+                        if link::is_lasting(&err) { Failed::Stop(why) } else { Failed::Again(why) }
+                    })?;
+                (stream, Some(password.as_str()))
+            }
+            Door::Amt(sign) => {
+                let session = Session::open(sign, Kind::Screen).map_err(|failed| match failed {
+                    redirection::Failed::Again(why) => Failed::Again(why),
+                    redirection::Failed::Stop(why) => Failed::Stop(why),
+                })?;
+                let stream = session.link;
+                stream.socket().set_read_timeout(Some(MESSAGE_TIME)).map_err(again)?;
+                stream.socket().set_write_timeout(Some(MESSAGE_TIME)).map_err(again)?;
+                (stream, None)
+            }
+        };
+        stream.socket().set_nodelay(true).map_err(again)?;
         let mut vnc =
             Vnc { stream, width: 0, height: 0, format: PixelFormat::RGB32, name: String::new() };
         vnc.sign_in(password).map_err(|failed| match failed {
@@ -240,8 +278,10 @@ impl Vnc {
         Ok(vnc)
     }
 
-    /// The handshake, sign-in and initialisation (RFC 6143, 7.1 to 7.3).
-    fn sign_in(&mut self, password: &str) -> Result<(), Failed> {
+    /// The handshake, sign-in and initialisation (RFC 6143, 7.1 to 7.3),
+    /// with VNC's `password`, or with none for a session that AMT's
+    /// redirection service has signed in.
+    fn sign_in(&mut self, password: Option<&str>) -> Result<(), Failed> {
         let again = Failed::Again;
         let version = self.read(12).map_err(again)?;
         let minor = parse_version(&version).ok_or_else(|| {
@@ -270,10 +310,10 @@ impl Vnc {
                 )));
             }
             let kinds = self.read(usize::from(count)).map_err(again)?;
-            let kind = [PASSWORD, NO_SIGN_IN]
-                .into_iter()
-                .find(|kind| kinds.contains(kind))
-                .ok_or_else(|| {
+            let known: &[u8] =
+                if password.is_some() { &[PASSWORD, NO_SIGN_IN] } else { &[NO_SIGN_IN] };
+            let kind =
+                known.iter().copied().find(|kind| kinds.contains(kind)).ok_or_else(|| {
                     Failed::Stop(format!(
                         "it offers no sign-in this client knows (security types {kinds:?})"
                     ))
@@ -283,6 +323,13 @@ impl Vnc {
         };
         match kind {
             PASSWORD => {
+                let Some(password) = password else {
+                    return Err(Failed::Stop(
+                        "it asks for a VNC password in a session AMT has signed in, which the \
+                         lab has none for"
+                            .into(),
+                    ));
+                };
                 let challenge: [u8; 16] =
                     self.read(16).map_err(again)?.try_into().unwrap_or_default();
                 self.send(&password_response(password, &challenge)).map_err(again)?;
@@ -497,22 +544,14 @@ impl Vnc {
     /// unasked (a bell, cut text), and is false once it has closed.
     pub fn is_open(&mut self) -> bool {
         loop {
-            if self.stream.set_nonblocking(true).is_err() {
-                return false;
-            }
-            let peeked = self.stream.peek(&mut [0u8; 1]);
-            if self.stream.set_nonblocking(false).is_err() {
-                return false;
-            }
-            match peeked {
-                Ok(0) => return false,
-                Ok(_) => {
+            match self.stream.has_input() {
+                Ok(false) => return true,
+                Ok(true) => {
                     let mut scratch = Canvas::new(self.width, self.height);
                     if self.read_message(&mut scratch).is_err() {
                         return false;
                     }
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => return true,
                 Err(_) => return false,
             }
         }
@@ -674,6 +713,9 @@ pub mod fake {
         pub sessions: u32,
         /// Sessions open now.
         pub live: u32,
+        /// Whether a session signs in with VNC's password, as a VNC port
+        /// does, or with none, as AMT's redirection service's does.
+        pub asks_password: bool,
         password: Password,
         open: Vec<TcpStream>,
     }
@@ -716,6 +758,7 @@ pub mod fake {
                 events: Vec::new(),
                 sessions: 0,
                 live: 0,
+                asks_password: true,
                 password,
                 open: Vec::new(),
             }));
@@ -758,9 +801,9 @@ pub mod fake {
 
     fn serve(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
         let _ = stream.set_nonblocking(false);
-        let (version, password) = {
+        let (version, password, asks_password) = {
             let state = state.lock().unwrap();
-            (state.version, (state.password)())
+            (state.version, (state.password)(), state.asks_password)
         };
         // A closed port: the session ends before it starts.
         let Some(password) = password else { return };
@@ -769,14 +812,20 @@ pub mod fake {
             stream.write_all(version)?;
             let mut reply = [0u8; 12];
             stream.read_exact(&mut reply)?;
-            stream.write_all(&[1, 2])?;
+            stream.write_all(&[1, if asks_password { 2 } else { 1 }])?;
             let mut kind = [0u8; 1];
             stream.read_exact(&mut kind)?;
-            let challenge: [u8; 16] = std::array::from_fn(|n| (n as u8).wrapping_mul(37) ^ 0x5a);
-            stream.write_all(&challenge)?;
-            let mut response = [0u8; 16];
-            stream.read_exact(&mut response)?;
-            if kind[0] != 2 || response != password_response(&password, &challenge) {
+            let signed_in = if asks_password {
+                let challenge: [u8; 16] =
+                    std::array::from_fn(|n| (n as u8).wrapping_mul(37) ^ 0x5a);
+                stream.write_all(&challenge)?;
+                let mut response = [0u8; 16];
+                stream.read_exact(&mut response)?;
+                kind[0] == 2 && response == password_response(&password, &challenge)
+            } else {
+                kind[0] == 1
+            };
+            if !signed_in {
                 let reason = b"Authentication failed";
                 stream.write_all(&1u32.to_be_bytes())?;
                 stream.write_all(&(reason.len() as u32).to_be_bytes())?;
@@ -892,6 +941,10 @@ pub mod fake {
 mod tests {
     use super::fake::{Event, FakeVnc, pattern};
     use super::*;
+    use crate::amt::fake::{PASSWORD, USER};
+    use crate::link::Tls;
+    use crate::link::fake::FakeTls;
+    use crate::redirection::fake::FakeRedirection;
 
     const SECRET: &str = "Lk7!pQ2#";
 
@@ -901,6 +954,39 @@ mod tests {
 
     fn fake() -> FakeVnc {
         FakeVnc::start(Box::new(|| Some(SECRET.into())))
+    }
+
+    fn door(address: &str, password: &str) -> Door {
+        Door::Vnc { address: address.into(), password: password.into() }
+    }
+
+    /// AMT's remote screen as release 16.1 serves it: its redirection
+    /// service behind TLS, carrying RFB from a server that asks for no
+    /// sign-in of its own, or, `asks_password`, one that does.
+    struct Redirected {
+        screen: FakeVnc,
+        service: FakeRedirection,
+        front: FakeTls,
+    }
+
+    impl Redirected {
+        fn start(asks_password: bool) -> Redirected {
+            let screen = FakeVnc::start(Box::new(|| Some(SECRET.into())));
+            screen.state.lock().unwrap().asks_password = asks_password;
+            let service = FakeRedirection::start();
+            service.state.lock().unwrap().screen = Some(screen.address);
+            let front = FakeTls::start(service.address);
+            Redirected { screen, service, front }
+        }
+
+        fn door(&self) -> Door {
+            Door::Amt(Sign {
+                address: self.front.address.to_string(),
+                user: USER.into(),
+                password: PASSWORD.into(),
+                tls: Some(Tls::new(&self.front.pin).unwrap()),
+            })
+        }
     }
 
     #[test]
@@ -930,7 +1016,7 @@ mod tests {
     #[test]
     fn sees_the_screen_and_sends_keys_and_the_pointer() {
         let fake = fake();
-        let mut vnc = Vnc::connect(&fake.address.to_string(), SECRET, soon()).unwrap();
+        let mut vnc = Vnc::connect(&door(&fake.address.to_string(), SECRET), soon()).unwrap();
         assert_eq!(vnc.size(), (40, 30));
         assert_eq!(vnc.name, "Intel(r) AMT KVM");
         let image = vnc.capture(soon()).unwrap();
@@ -967,7 +1053,7 @@ mod tests {
             };
             state.resize = Some((64, 48, pattern(64, 48)));
         }
-        let mut vnc = Vnc::connect(&fake.address.to_string(), SECRET, soon()).unwrap();
+        let mut vnc = Vnc::connect(&door(&fake.address.to_string(), SECRET), soon()).unwrap();
         let image = vnc.capture(soon()).unwrap();
         assert_eq!((image.width, image.height), (64, 48));
         assert_eq!(image.pixels(), pattern(64, 48));
@@ -978,7 +1064,7 @@ mod tests {
     fn a_format_it_cannot_read_is_asked_to_change() {
         let fake = fake();
         fake.state.lock().unwrap().format.true_colour = false;
-        let mut vnc = Vnc::connect(&fake.address.to_string(), SECRET, soon()).unwrap();
+        let mut vnc = Vnc::connect(&door(&fake.address.to_string(), SECRET), soon()).unwrap();
         assert_eq!(vnc.capture(soon()).unwrap().pixels(), pattern(40, 30));
     }
 
@@ -986,7 +1072,7 @@ mod tests {
     fn a_wrong_password_fails_at_once() {
         let fake = fake();
         let started = Instant::now();
-        let Err(err) = Vnc::connect(&fake.address.to_string(), "wrong", soon()) else {
+        let Err(err) = Vnc::connect(&door(&fake.address.to_string(), "wrong"), soon()) else {
             panic!("signed in with the wrong password")
         };
         assert!(err.contains("did not take the password (Authentication failed)"), "{err}");
@@ -1004,18 +1090,18 @@ mod tests {
         };
         let address = fake.address.to_string();
         let late = Instant::now() + Duration::from_millis(600);
-        let Err(err) = Vnc::connect(&address, SECRET, late) else {
+        let Err(err) = Vnc::connect(&door(&address, SECRET), late) else {
             panic!("signed in to a closed port")
         };
         assert!(err.contains("closed the session"), "{err}");
         open.store(true, std::sync::atomic::Ordering::Relaxed);
-        Vnc::connect(&address, SECRET, soon()).unwrap();
+        Vnc::connect(&door(&address, SECRET), soon()).unwrap();
     }
 
     #[test]
     fn notices_a_closed_session() {
         let fake = fake();
-        let mut vnc = Vnc::connect(&fake.address.to_string(), SECRET, soon()).unwrap();
+        let mut vnc = Vnc::connect(&door(&fake.address.to_string(), SECRET), soon()).unwrap();
         assert!(vnc.is_open());
         fake.close_sessions();
         let deadline = soon();
@@ -1023,6 +1109,34 @@ mod tests {
             assert!(Instant::now() < deadline, "the closed session still looks open");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn sees_amt_s_screen_through_its_redirection_service_over_tls() {
+        let amt = Redirected::start(false);
+        let mut vnc = Vnc::connect(&amt.door(), soon()).unwrap();
+        assert_eq!(vnc.size(), (40, 30));
+        assert_eq!(vnc.capture(soon()).unwrap().pixels(), pattern(40, 30));
+        vnc.key(0x41, true).unwrap();
+        assert!(vnc.is_open());
+        assert_eq!(vnc.capture(soon()).unwrap().pixels(), pattern(40, 30));
+        assert_eq!(amt.screen.events(), [Event::Key(0x41, true)]);
+        assert_eq!(amt.service.state.lock().unwrap().screen_sessions, 1);
+        amt.screen.close_sessions();
+        let deadline = soon();
+        while vnc.is_open() {
+            assert!(Instant::now() < deadline, "the closed session still looks open");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_vnc_password_inside_amt_s_session_is_not_guessed() {
+        let amt = Redirected::start(true);
+        let Err(err) = Vnc::connect(&amt.door(), soon()) else {
+            panic!("signed in with no password");
+        };
+        assert!(err.contains("security types [2]"), "{err}");
     }
 
     #[test]

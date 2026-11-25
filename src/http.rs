@@ -9,11 +9,13 @@
 //! netboot.rs), so this needs none of what a public web server does; it
 //! saves a dependency and keeps everything they can reach in one short
 //! file. [`send`] is the other side, for talking to Intel AMT (see
-//! wsman.rs).
+//! wsman.rs), over TLS too (see link.rs).
 
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::{Duration, Instant};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use crate::link::{self, Target};
 
 /// The most a request's line and headers may hold.
 const HEAD_LIMIT: usize = 16 * 1024;
@@ -21,8 +23,6 @@ const HEAD_LIMIT: usize = 16 * 1024;
 const BODY_LIMIT: usize = 64 * 1024;
 /// How long a browser may take to send its request.
 const READ_TIME: Duration = Duration::from_secs(10);
-/// How long [`send`] waits between tries while a server refuses.
-const REFUSED_GAP: Duration = Duration::from_millis(500);
 
 /// A request, read.
 #[derive(Debug, Default)]
@@ -267,13 +267,14 @@ pub fn send(
     time: Duration,
     patience: Duration,
 ) -> Result<Answer, String> {
-    try_send(address, method, path, headers, body, time, patience)
+    try_send(&Target::plain(address), method, path, headers, body, time, patience)
         .map_err(|failure| failure.message)
 }
 
-/// As [`send`], saying whether a failure was the network's.
+/// As [`send`], to `target`, plain or over TLS, saying whether a failure
+/// was the network's.
 pub fn try_send(
-    address: &str,
+    target: &Target,
     method: &str,
     path: &str,
     headers: &[(&str, String)],
@@ -281,25 +282,11 @@ pub fn try_send(
     time: Duration,
     patience: Duration,
 ) -> Result<Answer, Failure> {
-    let to = address
-        .to_socket_addrs()
-        .map_err(|err| Failure::malformed(format!("{address}: {err}")))?
-        .next()
-        .ok_or_else(|| Failure::malformed(format!("{address}: no address")))?;
-    let deadline = Instant::now() + patience;
-    let mut stream = loop {
-        match TcpStream::connect_timeout(&to, time) {
-            Ok(stream) => break stream,
-            Err(err) if err.kind() == ErrorKind::ConnectionRefused && Instant::now() < deadline => {
-                std::thread::sleep(REFUSED_GAP);
-            }
-            Err(err) => return Err(Failure::network(format!("connecting to {address}: {err}"))),
-        }
-    };
-    stream
-        .set_read_timeout(Some(time))
-        .and_then(|()| stream.set_write_timeout(Some(time)))
-        .map_err(Failure::malformed)?;
+    let address = &target.address;
+    let mut stream = target.connect(time, time, patience).map_err(|err| {
+        let message = format!("connecting to {address}: {err}");
+        if link::is_lasting(&err) { Failure::malformed(message) } else { Failure::network(message) }
+    })?;
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()

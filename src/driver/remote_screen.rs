@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! A real machine's screen, keyboard and mouse through its management
-//! controller's VNC server, which amt.rs (Intel AMT's remote screen) and
-//! redfish.rs (a Dell iDRAC's virtual console) share.
+//! controller's remote screen, which amt.rs (Intel AMT's, on port 5900 or
+//! through its redirection service) and redfish.rs (a Dell iDRAC's VNC
+//! server) share.
 //!
-//! The driver gives a [`RemoteScreen`] the address of the VNC server and
-//! a way to turn the server on, which sets a password made for the run and
-//! gives it back. The first look at the screen turns the server on and
-//! opens a session; the session stays open, so a controller that plugs
+//! The driver gives a [`RemoteScreen`] a way to turn the screen on, which
+//! sets a VNC password made for the run where the controller takes one,
+//! and gives back the [`Door`] a session opens through. The first look at
+//! the screen turns it on and opens a session; the session stays open, so a controller that plugs
 //! its keyboard and mouse into the machine when a session opens keeps them
 //! there across boots. A session that fails is closed, and the next
 //! action opens another. Each step of a session goes to the driver's log
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 use super::pixel;
 use super::real::DriverLog;
 use crate::suite::Button;
-use crate::vnc::{self, Vnc};
+use crate::vnc::{self, Door, Vnc};
 use crate::{png, screen};
 
 /// How long the screen may take to open a session: the controller may
@@ -50,23 +51,13 @@ const KEY_GAP: Duration = Duration::from_millis(100);
 /// The left Shift's X keysym.
 const SHIFT: u32 = 0xffe1;
 
-/// What turning the controller's VNC server on gave.
-pub struct Enabled {
-    /// The password the server takes, made for this run.
-    pub password: String,
-    /// The server's address as `host:port`, when turning it on showed it
-    /// is not where the screen was expected.
-    pub address: Option<String>,
-}
-
-/// Turns the controller's VNC server on with a password made for the
-/// run.
-pub type TurnOn = Box<dyn Fn() -> Result<Enabled, String> + Send>;
+/// Turns the controller's remote screen on, with a VNC password made for
+/// the run where it takes one, and says where it is and how a session
+/// signs in.
+pub type TurnOn = Box<dyn Fn() -> Result<Door, String> + Send>;
 
 /// A machine's screen, keyboard and mouse over VNC.
 pub struct RemoteScreen {
-    /// The VNC server's `host:port`.
-    pub address: String,
     /// What is turned on, for the log: "port 5900".
     what: String,
     /// Whether a session's first key is a Shift tap, followed by a wait
@@ -74,8 +65,8 @@ pub struct RemoteScreen {
     prime_first_key: bool,
     notes: DriverLog,
     turn_on: TurnOn,
-    /// The password set for this run, once the server is turned on.
-    password: Option<String>,
+    /// Where the screen is, once it is turned on.
+    door: Option<Door>,
     /// The session and when it opened.
     session: Option<(Vnc, Instant)>,
     /// Whether a key has gone through this session yet.
@@ -94,24 +85,22 @@ fn prime(vnc: &mut Vnc) -> Result<(), String> {
 }
 
 impl RemoteScreen {
-    /// A screen at `address` that `turn_on` turns on the first time it is
-    /// wanted. `what` names the thing turned on in the log, and
-    /// `prime_first_key` says whether a session's first key is a Shift
-    /// tap. Nothing is opened yet.
+    /// A screen that `turn_on` turns on the first time it is wanted.
+    /// `what` names the thing turned on in the log, and `prime_first_key`
+    /// says whether a session's first key is a Shift tap. Nothing is
+    /// opened yet.
     pub fn new(
-        address: String,
         what: &str,
         prime_first_key: bool,
         notes: DriverLog,
         turn_on: TurnOn,
     ) -> RemoteScreen {
         RemoteScreen {
-            address,
             what: what.into(),
             prime_first_key,
             notes,
             turn_on,
-            password: None,
+            door: None,
             session: None,
             primed: false,
             pointer: (0, 0),
@@ -132,25 +121,18 @@ impl RemoteScreen {
             return Ok(());
         }
         self.session = None;
-        let password = match &self.password {
-            Some(password) => password.clone(),
+        let door = match &self.door {
+            Some(door) => door,
             None => {
-                self.notes.note(&format!(
-                    "remote screen: turning on {}, with a password made for this run",
-                    self.what
-                ));
-                let enabled = (self.turn_on)().inspect_err(|err| {
+                self.notes.note(&format!("remote screen: turning on {}", self.what));
+                let door = (self.turn_on)().inspect_err(|err| {
                     self.notes.note(&format!("remote screen: {err}"));
                 })?;
-                if let Some(address) = enabled.address {
-                    self.address = address;
-                }
-                self.password = Some(enabled.password.clone());
-                enabled.password
+                self.door.insert(door)
             }
         };
         let deadline = Instant::now() + OPEN_TIME;
-        match Vnc::connect(&self.address, &password, deadline) {
+        match Vnc::connect(door, deadline) {
             Ok(vnc) => {
                 let (width, height) = vnc.size();
                 self.notes.note(&format!(
