@@ -485,6 +485,7 @@ fn test_json(test: &Test, machines: &[&Machine]) -> Value {
         "about": test.about,
         "time": units::format_duration(test.time),
         "fresh": test.fresh,
+        "small_root": test.small_root,
         "only_by_name": test.only_by_name,
         "boot": match test.boot {
             suite::Boot::Image => "image",
@@ -704,7 +705,7 @@ fn show(arguments: &Arguments) -> Result<u8, Error> {
     ]
     .iter()
     .any(|control| controls.contains(control));
-    let boot = if test.fresh || alone {
+    let boot = if test.fresh || test.small_root || alone {
         "a boot of its own"
     } else {
         "shares a boot with the test before when it can"

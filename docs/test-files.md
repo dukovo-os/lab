@@ -15,6 +15,7 @@ the runner page with no other change.
 about = "The network cable comes out and goes back in, and the network comes back"
 time = "3m"          # the longest the test may take, boot included
 fresh = false        # true: boot afresh for this test alone
+small_root = false   # true: keep the lab image's small root, on a boot of its own
 
 [[step]]
 link = "down"
@@ -35,6 +36,7 @@ expect_not = "NO-CARRIER"
 | `about` | yes | What the test checks, in one line. |
 | `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `192h` (eight days), for a server's week-long soak. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. On a real machine, the time to write its disk before a fresh boot is added. |
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
+| `small_root` | no | `true` keeps the lab image's own root, 512 MiB, for this test: on a real machine the lab grows the root to the end of the disk after each fresh boot, so a test that fills the disk would write the whole disk, and with `small_root` it fills 512 MiB. The lab does not grow the root, and its health check does not hold the small root to the space a grown one has. The test boots afresh and its boot is not shared, as the next test expects a grown root. It changes nothing on QEMU beyond the boot of its own. |
 | `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk, and `"dvd"` the install DVD in the optical drive: see [Installer tests](#installer-tests). |
 | `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
 | `host_needs` | no | Programs the test's `host` steps run on the lab PC, as `["krb5kdc", "kdb5_util"]`. A lab PC without one skips the test and names it: see [The lab PC as a peer](#the-lab-pc-as-a-peer). |
