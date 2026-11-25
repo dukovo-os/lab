@@ -142,6 +142,14 @@ fn crashes_file(test: &Test) -> String {
     format!("{}-crashes.txt", test.id.replace('/', "-"))
 }
 
+/// The reports in what [`COLLECT_CRASHES`] printed, from its first header
+/// line on; none when it printed no header. `elevate -S` writes its
+/// password prompt to the same stream first, with no newline after it, so
+/// the text before the first header is never a report.
+fn crash_reports(printed: &str) -> Option<&str> {
+    printed.find("== /").map(|start| &printed[start..])
+}
+
 /// The command that gives a machine the address `ip` on net1, the private
 /// network, and sets that port up. Both run in one shell, so that when it
 /// is run as root (through `elevate`, which elevates only its first
@@ -1106,14 +1114,17 @@ impl<'a> Worker<'a> {
         // And one that formats a CompactFlash card, given one blank.
         self.driver.want_cf_card(test.cf);
         // A test that keeps the lab image's small root leaves a disk the
-        // next test does not expect, so its boot is its own too.
+        // next test does not expect, so its boot is its own too, as is the
+        // boot of a test that says it leaves the machine as no later test
+        // should find it.
         let own_boot = attacks
             || cards
             || discs
             || floppies
             || test.cf.is_some()
             || !test.hardware.is_empty()
-            || test.small_root;
+            || test.small_root
+            || test.own_boot;
         let installs = matches!(test.boot, Boot::Stick { .. } | Boot::Dvd { .. });
         // A machine that is its own twin boots Linux before the test's boot,
         // so the steps before the bench step (a profile they set) run on
@@ -1587,12 +1598,12 @@ impl<'a> Worker<'a> {
                 return;
             }
         };
-        if text.trim().is_empty() {
+        let Some(reports) = crash_reports(&text) else {
             return;
-        }
+        };
         let folder = self.shared.bundle.logs(&self.folder);
         let path = folder.join(crashes_file(test));
-        match fs::create_dir_all(&folder).and_then(|()| fs::write(&path, text)) {
+        match fs::create_dir_all(&folder).and_then(|()| fs::write(&path, reports)) {
             Ok(()) => {
                 let relative = self.shared.bundle.relative(&path);
                 self.log.push(format!("Crash reports kept in {relative}"));
@@ -3091,6 +3102,14 @@ mod tests {
         // The log is `stress-disk-full.log`, in the same folder.
         assert!(COLLECT_CRASHES.contains("/system/state/reports/crashes/*"));
         assert!(COLLECT_CRASHES.contains("/system/state/crash/*"));
+    }
+
+    #[test]
+    fn elevate_s_prompt_alone_is_no_crash_report() {
+        assert_eq!(crash_reports(""), None);
+        assert_eq!(crash_reports("[elevate] password for lab: "), None);
+        let printed = "[elevate] password for lab: == /system/state/crash/1.txt\nkernel panic\n";
+        assert_eq!(crash_reports(printed), Some("== /system/state/crash/1.txt\nkernel panic\n"));
     }
 
     #[test]

@@ -72,6 +72,13 @@ struct FakeMachine {
     name: String,
 }
 
+/// What Dukovo's `elevate -S` asks for the lab account's password with.
+const ELEVATE_PROMPT: &str = "[elevate] password for lab: ";
+
+/// The crash report the machine named `crashed` holds, as the crash copy
+/// prints it.
+const CRASH_REPORT: &str = "== /system/state/reports/crashes/web-1.txt\nweb ended on SIGSEGV\n";
+
 /// The characters the fake console draws, in the test font.
 const FAKE_CHARS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789().:$#?-/";
 
@@ -388,6 +395,16 @@ impl Driver for FakeMachine {
                 self.on = false;
                 (Some(0), String::new())
             }
+            // The crash copy, as root. As Dukovo's elevate -S, the prompt
+            // comes first on the same stream, with no newline after it; the
+            // machine named `crashed` has a report to copy.
+            cmd if cmd.strip_prefix("elevate -S ") == Some(COLLECT_CRASHES) => match input {
+                Some("sesame\n") if self.name == "crashed" => {
+                    (Some(0), format!("{ELEVATE_PROMPT}{CRASH_REPORT}"))
+                }
+                Some("sesame\n") => (Some(0), ELEVATE_PROMPT.into()),
+                _ => (Some(1), "elevate: a password is needed\n".into()),
+            },
             // A benchmark program: faster than the fake Linux below at
             // fork, slower at pipes.
             "bench" => (
@@ -1681,6 +1698,28 @@ fn a_failed_test_leaves_its_stick_to_the_next_boot() {
 }
 
 #[test]
+fn a_test_with_a_boot_of_its_own_shares_it_with_no_test_after() {
+    let plain = "time = \"1m\"\n[[step]]\nrun = \"true\"\n";
+    let setting = setting_with(&[
+        ("stress/a-fresh.toml", &format!("about = \"fresh\"\nfresh = true\n{plain}")),
+        ("stress/b-shares.toml", &format!("about = \"shares\"\n{plain}")),
+        ("stress/c-alone.toml", &format!("about = \"alone\"\nown_boot = true\n{plain}")),
+        ("stress/d-after.toml", &format!("about = \"after\"\n{plain}")),
+    ]);
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(
+        outcomes(&results, "qemu"),
+        [
+            ("stress/a-fresh".into(), Outcome::Pass, Some(1)),
+            ("stress/b-shares".into(), Outcome::Pass, Some(1)),
+            ("stress/c-alone".into(), Outcome::Pass, Some(2)),
+            ("stress/d-after".into(), Outcome::Pass, Some(3)),
+        ],
+        "a fresh test's boot goes on to the next test; one of its own goes on to none"
+    );
+}
+
+#[test]
 fn a_stick_that_will_not_come_out_ends_the_shared_boot() {
     let setting = setting_with(STICK_TESTS);
     let mut jammed = setting.qemu.clone();
@@ -2263,6 +2302,28 @@ fn growing_the_root_needs_the_lab_password() {
     assert_eq!(done.summary, Summary { passed: 0, failed: 0, skipped: 0, errors: 1 });
     let why = results[0].reason.clone().unwrap();
     assert!(why.contains("growing the root needs the lab's password"), "{why}");
+}
+
+#[test]
+fn a_failed_test_keeps_the_machine_s_crash_reports_without_elevate_s_prompt() {
+    let setting = setting_with(&[(
+        "features/wrong.toml",
+        "about = \"fails\"\ntime = \"1m\"\n[[step]]\nrun = \"uname\"\nexpect = \"Linux\"\n",
+    )]);
+    let crashed = named(&setting, "crashed");
+    let (done, results) = run_with_password(&setting, vec![&crashed, &setting.qemu]);
+    assert_eq!(done.summary, Summary { passed: 0, failed: 2, skipped: 0, errors: 0 });
+    let log_on = |machine: &str| {
+        log_of(&done, results.iter().find(|result| result.machine == machine).unwrap())
+    };
+    let kept = done.bundle.join("logs/crashed/features-wrong-crashes.txt");
+    assert_eq!(fs::read_to_string(kept).unwrap(), CRASH_REPORT);
+    let log = log_on("crashed");
+    assert!(log.contains("Crash reports kept in"), "{log}");
+    // The other machine's copy printed elevate's prompt alone: no reports.
+    assert!(!done.bundle.join("logs/qemu/features-wrong-crashes.txt").exists());
+    let log = log_on("qemu");
+    assert!(!log.contains("Crash reports"), "{log}");
 }
 
 /// A run with the lab password, which a root step gives `elevate`.

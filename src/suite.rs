@@ -155,8 +155,13 @@ pub struct Test {
     pub about: String,
     /// The longest it may take on KVM or real hardware, boot included.
     pub time: Duration,
-    /// Whether it needs a boot of its own instead of sharing one.
+    /// Whether it boots afresh instead of sharing the boot the test before
+    /// it left.
     pub fresh: bool,
+    /// Whether its boot is its own: afresh, and not shared with the test
+    /// after it either, as it leaves the machine as no later test should
+    /// find it.
+    pub own_boot: bool,
     /// Whether the test keeps the lab image's own small root: the lab does
     /// not grow it after the boot, and the boot is the test's alone.
     pub small_root: bool,
@@ -960,6 +965,8 @@ struct TestFile {
     #[serde(default)]
     fresh: bool,
     #[serde(default)]
+    own_boot: bool,
+    #[serde(default)]
     small_root: bool,
     boot: Option<BootFrom>,
     disk: Option<String>,
@@ -1319,6 +1326,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         about: file.about,
         time,
         fresh: file.fresh,
+        own_boot: file.own_boot,
         small_root: file.small_root,
         boot,
         steps,
@@ -2042,6 +2050,18 @@ mod tests {
         let tests = load(dir.path()).unwrap();
         assert!(tests.iter().find(|test| test.id == "stress/full").unwrap().small_root);
         assert!(!tests.iter().find(|test| test.id == "stress/a").unwrap().small_root);
+    }
+
+    #[test]
+    fn a_test_has_a_boot_of_its_own_only_when_it_says_so() {
+        let dir = TempDir::new("suite-own-boot");
+        let tiny = "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n";
+        dir.write("stress/a.toml", tiny);
+        dir.write("stress/alone.toml", &format!("own_boot = true\n{tiny}"));
+        let tests = load(dir.path()).unwrap();
+        let alone = tests.iter().find(|test| test.id == "stress/alone").unwrap();
+        assert!(alone.own_boot && !alone.fresh);
+        assert!(!tests.iter().find(|test| test.id == "stress/a").unwrap().own_boot);
     }
 
     #[test]
