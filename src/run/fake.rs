@@ -1698,6 +1698,28 @@ fn a_failed_test_leaves_its_stick_to_the_next_boot() {
 }
 
 #[test]
+fn a_test_with_a_boot_of_its_own_shares_it_with_no_test_after() {
+    let plain = "time = \"1m\"\n[[step]]\nrun = \"true\"\n";
+    let setting = setting_with(&[
+        ("stress/a-fresh.toml", &format!("about = \"fresh\"\nfresh = true\n{plain}")),
+        ("stress/b-shares.toml", &format!("about = \"shares\"\n{plain}")),
+        ("stress/c-alone.toml", &format!("about = \"alone\"\nown_boot = true\n{plain}")),
+        ("stress/d-after.toml", &format!("about = \"after\"\n{plain}")),
+    ]);
+    let (_, results) = run_on(&setting, vec![&setting.qemu]);
+    assert_eq!(
+        outcomes(&results, "qemu"),
+        [
+            ("stress/a-fresh".into(), Outcome::Pass, Some(1)),
+            ("stress/b-shares".into(), Outcome::Pass, Some(1)),
+            ("stress/c-alone".into(), Outcome::Pass, Some(2)),
+            ("stress/d-after".into(), Outcome::Pass, Some(3)),
+        ],
+        "a fresh test's boot goes on to the next test; one of its own goes on to none"
+    );
+}
+
+#[test]
 fn a_stick_that_will_not_come_out_ends_the_shared_boot() {
     let setting = setting_with(STICK_TESTS);
     let mut jammed = setting.qemu.clone();

@@ -14,7 +14,8 @@ the runner page with no other change.
 ```toml
 about = "The network cable comes out and goes back in, and the network comes back"
 time = "3m"          # the longest the test may take, boot included
-fresh = false        # true: boot afresh for this test alone
+fresh = false        # true: boot afresh for this test
+own_boot = false     # true: boot afresh, and share the boot with no test after
 small_root = false   # true: keep the lab image's small root, on a boot of its own
 
 [[step]]
@@ -36,6 +37,7 @@ expect_not = "NO-CARRIER"
 | `about` | yes | What the test checks, in one line. |
 | `time` | yes | The longest it may take on KVM or real hardware: a whole number and `s`, `m` or `h`, at most `192h` (eight days), for a server's week-long soak. QEMU without KVM multiplies it by the machine's `tcg_slowdown`. On a real machine, the time to write its disk before a fresh boot is added. |
 | `fresh` | no | `true` boots the machine afresh, from a clean disk, for this test. Otherwise a test shares the boot the test before it left, when that test passed. |
+| `own_boot` | no | `true` gives the test a boot of its own: afresh, as `fresh` does, and not shared with the test after it, for a test that leaves the machine as no later test should find it (as one that turns on a catalog, whose installs bind apps to it for good). |
 | `small_root` | no | `true` keeps the lab image's own root, 512 MiB, for this test: on a real machine the lab grows the root to the end of the disk after each fresh boot, so a test that fills the disk would write the whole disk, and with `small_root` it fills 512 MiB. The lab does not grow the root, and its health check does not hold the small root to the space a grown one has. The test boots afresh and its boot is not shared, as the next test expects a grown root. It changes nothing on QEMU beyond the boot of its own. |
 | `boot` | no | `"image"` (the default) boots the image under test. `"stick"` boots the install stick with a blank disk, and `"dvd"` the install DVD in the optical drive: see [Installer tests](#installer-tests). |
 | `disk` | no | With `boot = "stick"` or `"dvd"`, the blank disk's size: `8G` by default, from `1G` to `2048G`. |
@@ -967,8 +969,10 @@ command, as a broken test file does.
 - To hand something from a `lab` step to a root step, put it in the lab
   account's home, `/users/lab`: each account on Dukovo has a `/tmp` of
   its own.
-- Prefer sharing a boot. Use `fresh = true` only when the test changes
-  the machine in a way later tests should not inherit, or checks the boot
-  itself.
+- Prefer sharing a boot. Use `fresh = true` only when the test needs a
+  machine no test before it changed, or checks the boot itself, and
+  `own_boot = true` only when it changes the machine in a way later tests
+  should not inherit: a `fresh` test's boot goes on to the next test when
+  it passes.
 - A test that signs in at the console signs out at its end, so the next
   test finds the sign-in as a fresh boot leaves it.

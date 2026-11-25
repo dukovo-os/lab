@@ -1114,14 +1114,17 @@ impl<'a> Worker<'a> {
         // And one that formats a CompactFlash card, given one blank.
         self.driver.want_cf_card(test.cf);
         // A test that keeps the lab image's small root leaves a disk the
-        // next test does not expect, so its boot is its own too.
+        // next test does not expect, so its boot is its own too, as is the
+        // boot of a test that says it leaves the machine as no later test
+        // should find it.
         let own_boot = attacks
             || cards
             || discs
             || floppies
             || test.cf.is_some()
             || !test.hardware.is_empty()
-            || test.small_root;
+            || test.small_root
+            || test.own_boot;
         let installs = matches!(test.boot, Boot::Stick { .. } | Boot::Dvd { .. });
         // A machine that is its own twin boots Linux before the test's boot,
         // so the steps before the bench step (a profile they set) run on
