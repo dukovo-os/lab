@@ -2139,6 +2139,9 @@ impl<'a> Worker<'a> {
             Token::Amt => self.driver.amt_address().ok_or_else(|| {
                 StepFailure::Error("this machine's driver has no address for its AMT".into())
             }),
+            Token::AmtWeb => self.driver.amt_web().ok_or_else(|| {
+                StepFailure::Error("this machine's driver has no address for its AMT".into())
+            }),
             Token::GuestAgent => self
                 .driver
                 .guest_agent_socket()

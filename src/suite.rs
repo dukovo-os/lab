@@ -3085,6 +3085,19 @@ expect = "1 received"
         );
         let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
         assert!(why.contains("{amt} names something of the lab PC's"), "{why}");
+        // AMT's web server, by its URL, needs AMT the same way.
+        dir.write(
+            "drivers/amt.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nhost = \"curl -k {amt-web}\"\n",
+        );
+        let test = &load(dir.path()).unwrap()[0];
+        assert!(test.controls().contains(&Control::Amt));
+        dir.write(
+            "drivers/amt.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nrun = \"curl {amt-web}\"\n",
+        );
+        let Err(Error::Usage(why)) = load(dir.path()) else { panic!("loaded") };
+        assert!(why.contains("{amt-web} names something of the lab PC's"), "{why}");
     }
 
     #[test]
