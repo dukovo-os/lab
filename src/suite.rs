@@ -157,6 +157,9 @@ pub struct Test {
     pub time: Duration,
     /// Whether it needs a boot of its own instead of sharing one.
     pub fresh: bool,
+    /// Whether the test keeps the lab image's own small root: the lab does
+    /// not grow it after the boot, and the boot is the test's alone.
+    pub small_root: bool,
     /// What the machine boots from when the test boots it.
     pub boot: Boot,
     pub steps: Vec<Step>,
@@ -956,6 +959,8 @@ struct TestFile {
     time: String,
     #[serde(default)]
     fresh: bool,
+    #[serde(default)]
+    small_root: bool,
     boot: Option<BootFrom>,
     disk: Option<String>,
     #[serde(default)]
@@ -1314,6 +1319,7 @@ fn load_file(path: &Path, category: &str) -> Result<Test, Error> {
         about: file.about,
         time,
         fresh: file.fresh,
+        small_root: file.small_root,
         boot,
         steps,
         host_needs: file.host_needs,
@@ -2026,6 +2032,17 @@ pub fn load_presets(dir: &Path, tests: &[Test]) -> Result<Vec<Preset>, Error> {
 mod tests {
     use super::*;
     use crate::testing::TempDir;
+
+    #[test]
+    fn a_test_keeps_the_small_root_only_when_it_says_so() {
+        let dir = TempDir::new("suite-small-root");
+        let tiny = "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n";
+        dir.write("stress/a.toml", tiny);
+        dir.write("stress/full.toml", &format!("small_root = true\n{tiny}"));
+        let tests = load(dir.path()).unwrap();
+        assert!(tests.iter().find(|test| test.id == "stress/full").unwrap().small_root);
+        assert!(!tests.iter().find(|test| test.id == "stress/a").unwrap().small_root);
+    }
 
     #[test]
     fn a_test_that_runs_only_by_name_is_left_out_of_all_and_of_its_category() {

@@ -90,6 +90,19 @@ pub const NO_PASSWORD: &str = "this step runs as root, and the lab has no passwo
 /// `storage grow` does nothing when the root already fills the disk.
 pub const GROW_ROOT: &str = "sh -c 'part=$(sed -n \"s/^disk //p\" /system/live/spark/root); case \"$part\" in *[0-9]p[0-9]*) disk=${part%p*};; *) disk=$(echo \"$part\" | sed \"s/[0-9]*$//\");; esac; storage grow \"$disk\"'";
 
+/// The command, run as root on a machine whose test failed or errored,
+/// that prints each regular file in the folders where Dukovo keeps crash
+/// reports (`/system/state/reports/crashes`, which only root reads) and
+/// kernel crash dumps (`/system/state/crash`), each after a header line
+/// `== <path>`. The lab rewrites a real machine's disk at its next fresh
+/// boot, so what the command prints is kept in the run's bundle. It prints
+/// nothing when the folders hold no file, and always exits 0.
+pub const COLLECT_CRASHES: &str = "sh -c 'for f in /system/state/reports/crashes/* /system/state/crash/*; do [ -f \"$f\" ] && { echo \"== $f\"; cat \"$f\"; }; done; true'";
+
+/// The longest the crash collection may take, so that a machine which
+/// hangs cannot hold the run.
+const CRASHES_TIME: Duration = Duration::from_secs(30);
+
 /// The command, given the lab PC's time in UTC, that sets a real machine's
 /// clock after a fresh boot ([`crate::driver::Driver::sets_clock`]). The
 /// lab network reaches no time server, so the machine's clock is whatever
@@ -122,6 +135,12 @@ pub const EMULATED: &str = "QEMU's emulator, not the machine, made these numbers
 
 /// Why a test that attacks from Linux is skipped when the run has no kit.
 pub const NO_REDTEAM: &str = "this test attacks from Linux, and the run was given no red-team kit: `ob lab redteam-kit` builds one and `ob lab` passes it with --redteam";
+
+/// The name of the file that keeps a test's crash reports, beside its log
+/// (see [`COLLECT_CRASHES`]).
+fn crashes_file(test: &Test) -> String {
+    format!("{}-crashes.txt", test.id.replace('/', "-"))
+}
 
 /// The command that gives a machine the address `ip` on net1, the private
 /// network, and sets that port up. Both run in one shell, so that when it
@@ -1086,8 +1105,15 @@ impl<'a> Worker<'a> {
         self.driver.want_hardware(&test.hardware);
         // And one that formats a CompactFlash card, given one blank.
         self.driver.want_cf_card(test.cf);
-        let own_boot =
-            attacks || cards || discs || floppies || test.cf.is_some() || !test.hardware.is_empty();
+        // A test that keeps the lab image's small root leaves a disk the
+        // next test does not expect, so its boot is its own too.
+        let own_boot = attacks
+            || cards
+            || discs
+            || floppies
+            || test.cf.is_some()
+            || !test.hardware.is_empty()
+            || test.small_root;
         let installs = matches!(test.boot, Boot::Stick { .. } | Boot::Dvd { .. });
         // A machine that is its own twin boots Linux before the test's boot,
         // so the steps before the bench step (a profile they set) run on
@@ -1147,7 +1173,7 @@ impl<'a> Worker<'a> {
             } else if fresh {
                 let (record, outcome) =
                     self.timed(test, "boot afresh and wait until booted", false, |worker| {
-                        worker.boot_fresh(deadline)
+                        worker.boot_fresh(deadline, test.small_root)
                     });
                 steps.push(record);
                 failure = outcome.err();
@@ -1203,6 +1229,7 @@ impl<'a> Worker<'a> {
         };
         if matches!(result, Outcome::Fail | Outcome::Error) {
             self.screenshot_after_failure(test);
+            self.collect_crashes(test);
         }
         // After the installer, the disk no longer holds the image under
         // test, so the next test boots afresh. An attack boot has the
@@ -1379,7 +1406,13 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn boot_fresh(&mut self, deadline: Instant) -> Result<Option<String>, StepFailure> {
+    /// Boots the machine afresh. With `small_root` the root is not grown,
+    /// and the health check does not hold it to the space a grown root has.
+    fn boot_fresh(
+        &mut self,
+        deadline: Instant,
+        small_root: bool,
+    ) -> Result<Option<String>, StepFailure> {
         self.driver.boot_fresh().map_err(StepFailure::Error)?;
         self.boot += 1;
         // A new boot starts with no attacker and no addresses on the
@@ -1388,9 +1421,14 @@ impl<'a> Worker<'a> {
         self.serial = SerialWatch::new(self.driver.serial_log().to_path_buf());
         self.log.push(format!("Boot {}: serial log {}", self.boot, self.relative_serial()));
         let note = self.wait_ready(deadline)?;
-        let grown = self.grow_root(deadline)?;
+        let grown = if small_root {
+            self.log.push("The test keeps the lab image's small root; it is not grown.".into());
+            None
+        } else {
+            self.grow_root(deadline)?
+        };
         self.set_clock(deadline)?;
-        self.check_health(deadline)?;
+        self.check_health(deadline, !small_root && self.driver.grows_root())?;
         // The test that boots sees its whole boot: its serial steps may
         // check what came before the ready line.
         self.serial.rewind();
@@ -1469,8 +1507,9 @@ impl<'a> Worker<'a> {
     /// this test; one that fails [`health::FAILURES_TO_BENCH`] fresh boots
     /// in a row is benched, and its remaining tests are skipped. A machine
     /// with no SSH channel or no lab key has nothing to ask, as with
-    /// [`Worker::grow_root`].
-    fn check_health(&mut self, deadline: Instant) -> Result<(), StepFailure> {
+    /// [`Worker::grow_root`]. `root_grows` is whether the root was grown
+    /// for this boot, which decides if its space is checked.
+    fn check_health(&mut self, deadline: Instant, root_grows: bool) -> Result<(), StepFailure> {
         if !self.driver.checks_health()
             || self.machine.who(Control::Ssh) != Who::Driver
             || !self.has_key
@@ -1480,11 +1519,7 @@ impl<'a> Worker<'a> {
         let until = deadline.min(Instant::now() + HEALTH_TIME);
         let (output, shown) = self.execute(health::COMMAND, false, None, until)?;
         let judgement = match output.status {
-            Some(0) => health::judge(
-                &health::read(&output.text),
-                Utc::now().seconds(),
-                self.driver.grows_root(),
-            ),
+            Some(0) => health::judge(&health::read(&output.text), Utc::now().seconds(), root_grows),
             status => {
                 let status = status.map_or("no answer".to_string(), |status| status.to_string());
                 health::Judgement {
@@ -1522,6 +1557,48 @@ impl<'a> Worker<'a> {
             found.join("; "),
             advice.join(" ")
         )))
+    }
+
+    /// Keeps the crash reports and dumps a machine holds after a test that
+    /// failed or errored, in `<test id with / as ->-crashes.txt` beside the
+    /// test's log, and names the file in the log (see [`COLLECT_CRASHES`]).
+    /// The machine's disk is rewritten at its next fresh boot, so this is
+    /// the last time they can be read. It runs on the same terms as
+    /// [`Worker::grow_root`], and never changes the test's result: what
+    /// goes wrong is noted in the log.
+    fn collect_crashes(&mut self, test: &Test) {
+        if self.machine.who(Control::Ssh) != Who::Driver
+            || !self.has_key
+            || self.shared.password.is_none()
+            || !self.driver.is_on()
+        {
+            return;
+        }
+        let until = Instant::now() + CRASHES_TIME;
+        let text = match self.execute(COLLECT_CRASHES, true, None, until) {
+            Ok((output, _)) if output.status == Some(0) => output.text,
+            Ok((output, _)) => {
+                let status = output.status.map_or("no answer".to_string(), |s| s.to_string());
+                self.log.push(format!("Crash reports not collected (exit status: {status})."));
+                return;
+            }
+            Err(StepFailure::Fail(why) | StepFailure::Error(why) | StepFailure::Skip(why)) => {
+                self.log.push(format!("Crash reports not collected: {why}"));
+                return;
+            }
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let folder = self.shared.bundle.logs(&self.folder);
+        let path = folder.join(crashes_file(test));
+        match fs::create_dir_all(&folder).and_then(|()| fs::write(&path, text)) {
+            Ok(()) => {
+                let relative = self.shared.bundle.relative(&path);
+                self.log.push(format!("Crash reports kept in {relative}"));
+            }
+            Err(err) => self.log.push(format!("Crash reports not kept: {err}")),
+        }
     }
 
     /// Boots the install stick with a blank disk, and waits for nothing:
@@ -2997,6 +3074,20 @@ mod tests {
         // Without or_skip, a check that fails fails the test.
         let plain = Command { or_skip: None, ..azure.clone() };
         assert!(matches!(check(&plain, Some(0), "Dell Inc.\n"), Err(StepFailure::Fail(_))));
+    }
+
+    #[test]
+    fn a_test_s_crash_reports_are_kept_beside_its_log() {
+        let dir = crate::testing::TempDir::new("run-crashes");
+        dir.write(
+            "stress/disk-full.toml",
+            "about = \"x\"\ntime = \"1m\"\n[[step]]\nwait = \"ready\"\n",
+        );
+        let test = &crate::suite::load(dir.path()).unwrap()[0];
+        assert_eq!(crashes_file(test), "stress-disk-full-crashes.txt");
+        // The log is `stress-disk-full.log`, in the same folder.
+        assert!(COLLECT_CRASHES.contains("/system/state/reports/crashes/*"));
+        assert!(COLLECT_CRASHES.contains("/system/state/crash/*"));
     }
 
     #[test]

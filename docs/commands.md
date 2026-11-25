@@ -606,9 +606,17 @@ as dukovo-os/lab-results keeps runs:
 run.json                  what ran: build, image, machines, tests, preset, start and end
 results.json              each test's result on each machine, step by step, with the lab PC's load at each step
 events.jsonl              what happened as it happened: run's JSON lines, every one
-logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.log, and the traces of failed browser steps
+logs/<machine>/           serial-<boot>.log, qemu-<boot>.log, <category>-<test>.log, <category>-<test>-crashes.txt, and the traces of failed browser steps
 screenshots/<machine>/    <category>-<test>-<name>.png, and .txt: the screen's text, with --fonts
 ```
+
+After a test fails or errors on a machine the lab can run root commands
+on over SSH, the lab reads the crash reports in `/system/state/reports/crashes`
+and the kernel crash dumps in `/system/state/crash` before the machine's
+disk is rewritten, and keeps them in `<category>-<test>-crashes.txt`, each
+file after a header line `== <path>`. The test's log names the file. A
+machine with no crash files leaves none, and a machine that cannot be read
+within 30 seconds changes neither the result nor the run: the log says so.
 
 A run a schedule started names it in run.json (`schedule`), and a run
 that resumes another names that (`resumes`). run.json also records the
