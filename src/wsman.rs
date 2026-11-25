@@ -11,18 +11,22 @@
 //! local name whatever their namespace prefix, as AMT's answers are
 //! simple and regular; there is no general XML parser here.
 //!
-//! The lab reaches AMT only on its own network, so it uses plain HTTP;
-//! digest sign-in keeps the password off the wire, and the password is
-//! never written to a log.
+//! AMT before release 16.1 is reached over plain HTTP on the lab's own
+//! network: digest sign-in keeps the password off the wire. From 16.1 on,
+//! AMT answers only over TLS, on port 16993, and the client trusts the key
+//! the machine file pins (see link.rs); the sign-in is the same digest.
+//! The password is never written to a log.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::hash::md5_hex;
 use crate::http;
+use crate::link::{Target, Tls};
 
-/// AMT's port for WS-Management over plain HTTP.
+/// AMT's ports for WS-Management, over plain HTTP and over TLS.
 pub const PORT: u16 = 16992;
+pub const TLS_PORT: u16 = 16993;
 
 /// How long one message may take: AMT is slow, but not this slow.
 const MESSAGE_TIME: Duration = Duration::from_secs(20);
@@ -50,8 +54,7 @@ pub type Selector<'a> = (&'a str, &'a str);
 
 /// A client for one AMT.
 pub struct Client {
-    /// `host:port`.
-    address: String,
+    target: Target,
     user: String,
     password: String,
     /// The last digest challenge, reused until AMT says it is stale.
@@ -71,11 +74,13 @@ struct Challenge {
 }
 
 impl Client {
-    /// A client for AMT at `host` (an address, with or without a port).
-    pub fn new(host: &str, user: &str, password: &str) -> Client {
-        let address = if host.contains(':') { host.to_string() } else { format!("{host}:{PORT}") };
+    /// A client for AMT at `host` (an address, with or without a port),
+    /// over `tls` when it is given.
+    pub fn new(host: &str, user: &str, password: &str, tls: Option<Tls>) -> Client {
+        let port = if tls.is_some() { TLS_PORT } else { PORT };
+        let address = if host.contains(':') { host.to_string() } else { format!("{host}:{port}") };
         Client {
-            address,
+            target: Target { address, tls },
             user: user.to_string(),
             password: password.to_string(),
             challenge: std::sync::Mutex::new(None),
@@ -198,7 +203,7 @@ impl Client {
             else {
                 return Err(format!(
                     "{} answered HTTP 401 without a digest challenge: is it AMT?",
-                    self.address
+                    self.target.address
                 ));
             };
             if let Ok(mut old) = self.challenge.lock() {
@@ -208,7 +213,7 @@ impl Client {
         Err(format!(
             "AMT at {} did not take the user and password (HTTP 401): check the machine \
              file's amt.user and the password in its amt.password_file",
-            self.address
+            self.target.address
         ))
     }
 
@@ -224,7 +229,7 @@ impl Client {
             // network would otherwise wait it out three times over.
             let patience = if tried == 1 { WAKE_TIME } else { Duration::ZERO };
             let failure = match http::try_send(
-                &self.address,
+                &self.target,
                 "POST",
                 "/wsman",
                 headers,
@@ -236,13 +241,13 @@ impl Client {
                 Err(failure) => failure,
             };
             if !failure.network {
-                return Err(format!("AMT at {}: {}", self.address, failure.message));
+                return Err(format!("AMT at {}: {}", self.target.address, failure.message));
             }
             if tried == TRIES {
                 return Err(format!(
                     "AMT at {}: {} (tried {TRIES} times: check that the machine is on the lab \
                      network and that AMT answers there)",
-                    self.address, failure.message
+                    self.target.address, failure.message
                 ));
             }
             tried += 1;

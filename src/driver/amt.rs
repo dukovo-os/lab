@@ -24,13 +24,21 @@
 //!   are reached as they are.
 //! - **The Linux twin** is the machine itself, net booted into the
 //!   Linux kit; the runner boots afresh after it.
-//! - **The screen, keyboard and mouse** are AMT's remote screen (KVM),
-//!   reached as a VNC server on AMT's port 5900 (see vnc.rs and
-//!   remote_screen.rs). The driver turns it on the first time a test
-//!   wants it, with a password made for the run, and keeps one session
-//!   open from then on: AMT plugs its keyboard and mouse into the machine
-//!   when a session opens, so a session that stays open keeps them there
-//!   across boots.
+//! - **The screen, keyboard and mouse** are AMT's remote screen (KVM)
+//!   (see vnc.rs and remote_screen.rs): a VNC server on AMT's port 5900,
+//!   with a password made for the run, or, from AMT release 16.1 on,
+//!   which has no port 5900, a session of AMT's redirection service. The
+//!   driver turns it on the first time a test wants it, and keeps one
+//!   session open from then on: AMT plugs its keyboard and mouse into the
+//!   machine when a session opens, so a session that stays open keeps
+//!   them there across boots.
+//!
+//! AMT from release 16.1 on (a 12th generation Core's, or an older
+//! machine's whose firmware is updated) answers only over TLS: the
+//! machine file's `amt.pin`, the pin of AMT's key, turns TLS on for power,
+//! the console and the screen alike (see link.rs). With no pin, the driver
+//! speaks plain HTTP and redirection sessions, as AMT before 16.1 serves
+//! them.
 //!
 //! Cables, sticks, cards and discs are a person's to handle. What the
 //! driver does goes in the bundle's `logs/<machine>/amt.log`, never with
@@ -42,20 +50,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::real::{
-    self, Check, LabSide, NetBoot, Verdict, WRITE_TIME, found, persons_job, problem, ssh_target,
-    with_console,
+    self, Check, DriverLog, LabSide, NetBoot, Verdict, WRITE_TIME, found, persons_job, problem,
+    ssh_target, with_console,
 };
-use super::remote_screen::{Enabled, RemoteScreen};
+use super::remote_screen::{RemoteScreen, TurnOn};
 use super::{Driver, Setup};
 use crate::amt::{self, Amt, PowerChange};
 use crate::bench::Kit;
+use crate::link::Tls;
 use crate::machines::AmtSettings;
 use crate::netboot::{self, Offer};
+use crate::redirection::{self, Sign};
 use crate::serial::{ConsoleLog, SerialReader};
-use crate::sol::{self, Sign, SolReader};
+use crate::sol::{self, SolReader};
 use crate::ssh;
 use crate::suite::{Button, PowerAction, Stick};
-use crate::vnc;
+use crate::vnc::{self, Door};
+use crate::wsman;
 
 /// How long the machine is given to go off after a hard off.
 const OFF_TIME: Duration = Duration::from_secs(30);
@@ -123,23 +134,26 @@ impl AmtDriver {
     /// reader, turning Serial-over-LAN on if the console is read from it.
     /// Leaves the machine's power as it is.
     pub fn new(settings: AmtSettings, setup: Setup) -> Result<AmtDriver, String> {
-        let console_address = format!("{}:{}", amt_host(&settings), sol::PORT);
-        AmtDriver::start(settings, setup, console_address)
+        let ports = Ports::of(&settings);
+        AmtDriver::start(settings, setup, ports)
     }
 
-    /// As [`AmtDriver::new`], with AMT's Serial-over-LAN at
-    /// `console_address`.
-    fn start(
-        settings: AmtSettings,
-        setup: Setup,
-        console_address: String,
-    ) -> Result<AmtDriver, String> {
+    /// As [`AmtDriver::new`], with AMT's redirection service and its port
+    /// 5900 at `ports`.
+    fn start(settings: AmtSettings, setup: Setup, ports: Ports) -> Result<AmtDriver, String> {
         let password = read_password(&settings.password_file)?;
+        let tls = tls(&settings)?;
         fs::create_dir_all(&setup.logs)
             .and_then(|()| fs::create_dir_all(&setup.work))
             .map_err(|err| format!("making the machine's folders: {err}"))?;
         let mut netboot = NetBoot::start(&lab_side(&settings), &setup.logs.join("amt.log"))?;
-        let amt = Arc::new(Amt::new(&settings.address, &settings.user, &password));
+        let amt = Arc::new(Amt::new(&settings.address, &settings.user, &password, tls.clone()));
+        let sign = Sign {
+            address: ports.redirection,
+            user: settings.user.clone(),
+            password,
+            tls: tls.clone(),
+        };
         // Until the first boot, what the console says goes to a scratch log.
         let before = setup.work.join("serial-before.log");
         let console = match &settings.serial {
@@ -149,17 +163,10 @@ impl AmtDriver {
             }
             None => {
                 amt.turn_on_serial_over_lan().inspect_err(|err| netboot.note(err))?;
-                let sign = Sign { address: console_address, user: settings.user.clone(), password };
-                ConsoleReader::Sol(SolReader::start(sign, &before, netboot.log())?)
+                ConsoleReader::Sol(SolReader::start(sign.clone(), &before, netboot.log())?)
             }
         };
-        let screen = RemoteScreen::new(
-            format!("{}:{}", amt_host(&settings), vnc::PORT),
-            "port 5900",
-            true,
-            netboot.log(),
-            turn_on_screen(&amt),
-        );
+        let screen = remote_screen(&amt, sign, ports.vnc, netboot.log());
         let mut driver = AmtDriver {
             settings,
             setup,
@@ -174,8 +181,9 @@ impl AmtDriver {
             screen,
         };
         driver.note(&format!(
-            "AMT at {}; net-boot server at {}, ports {}",
+            "AMT at {}{}; net-boot server at {}, ports {}",
             driver.settings.address,
+            if driver.settings.pin.is_some() { " over TLS" } else { "" },
             driver.settings.lab_address,
             driver.netboot.ports()
         ));
@@ -366,14 +374,46 @@ impl AmtDriver {
     }
 }
 
-/// Turns AMT's remote screen on with a password made for the run.
-fn turn_on_screen(amt: &Arc<Amt>) -> super::remote_screen::TurnOn {
+/// AMT's remote screen, which is turned on the first time a test wants
+/// it: through its redirection service when `sign` has TLS, as AMT from
+/// release 16.1 on has no port 5900, else on port 5900 at `vnc`, with a
+/// password made for the run.
+fn remote_screen(amt: &Arc<Amt>, sign: Sign, vnc: String, notes: DriverLog) -> RemoteScreen {
     let amt = Arc::clone(amt);
-    Box::new(move || {
+    if sign.tls.is_some() {
+        let door = Door::Amt(sign);
+        let turn_on: TurnOn = Box::new(move || {
+            amt.turn_on_remote_screen(None)?;
+            Ok(door.clone())
+        });
+        return RemoteScreen::new("KVM, through AMT's redirection port", true, notes, turn_on);
+    }
+    let turn_on: TurnOn = Box::new(move || {
         let password = amt::screen_password()?;
-        amt.turn_on_remote_screen(&password)?;
-        Ok(Enabled { password, address: None })
-    })
+        amt.turn_on_remote_screen(Some(&password))?;
+        Ok(Door::Vnc { address: vnc.clone(), password })
+    });
+    RemoteScreen::new("port 5900, with a password made for this run", true, notes, turn_on)
+}
+
+/// Where AMT's redirection service and its port 5900 are: on AMT's host,
+/// on the ports for TLS when the machine file pins AMT's key.
+struct Ports {
+    redirection: String,
+    vnc: String,
+}
+
+impl Ports {
+    fn of(settings: &AmtSettings) -> Ports {
+        let host = amt_host(settings);
+        let port = if settings.pin.is_some() { redirection::TLS_PORT } else { redirection::PORT };
+        Ports { redirection: format!("{host}:{port}"), vnc: format!("{host}:{}", vnc::PORT) }
+    }
+}
+
+/// The TLS AMT is reached with: its key's, when the machine file pins it.
+fn tls(settings: &AmtSettings) -> Result<Option<Tls>, String> {
+    settings.pin.as_deref().map(Tls::new).transpose()
 }
 
 impl AmtDriver {
@@ -393,7 +433,7 @@ impl AmtDriver {
 /// serial port), the lab network, the TFTP folder and network GRUB, the
 /// writer's kit and the lab key.
 pub fn check(settings: &AmtSettings, key: Option<&Path>, screen: bool) -> Vec<Check> {
-    check_with(settings, key, screen, &format!("{}:{}", amt_host(settings), sol::PORT))
+    check_with(settings, key, screen, &Ports::of(settings).redirection)
 }
 
 /// As [`check`], with AMT's Serial-over-LAN at `console_address`.
@@ -415,12 +455,20 @@ fn check_with(
             .map(|_| "AMT's password file is readable by this user alone".into())
             .map_err(|err| problem(err.clone())),
     );
-    if let Ok(password) = &password {
-        let amt = Amt::new(&settings.address, &settings.user, password);
+    let tls = tls(settings);
+    if let Err(err) = &tls {
+        add("amt", Err(problem(err.clone())));
+    }
+    if let (Ok(password), Ok(tls)) = (&password, &tls) {
+        let amt = Amt::new(&settings.address, &settings.user, password, tls.clone());
         match amt.version() {
-            Err(err) => add("amt", Err(problem(err))),
+            Err(err) => {
+                let tls_address = format!("{}:{}", amt_host(settings), wsman::TLS_PORT);
+                add("amt", Err(problem(with_pin(settings, err, &tls_address))));
+            }
             Ok(version) => {
-                add("amt", Ok(format!("AMT {version} at {}", settings.address)));
+                let over = if tls.is_some() { " over TLS" } else { "" };
+                add("amt", Ok(format!("AMT {version} at {}{over}", settings.address)));
                 add(
                     "control mode",
                     match amt.control_mode() {
@@ -452,6 +500,10 @@ fn check_with(
                                  screen session (OptInRequired {}): set User Opt-in to None in MEBx",
                                 found.consent
                             ))),
+                            Ok(_) if tls.is_some() => Ok("KVM is on in MEBx and asks for no \
+                                consent; the driver opens it through AMT's redirection port when \
+                                a test wants the screen"
+                                .into()),
                             Ok(_) => Ok("KVM is on in MEBx and asks for no consent; the driver \
                                          turns on port 5900 when a test wants the screen"
                                 .into()),
@@ -464,6 +516,7 @@ fn check_with(
                         address: console_address.to_string(),
                         user: settings.user.clone(),
                         password: password.clone(),
+                        tls: tls.clone(),
                     };
                     add("serial over lan", check_serial_over_lan(&amt, &sign));
                 }
@@ -495,6 +548,23 @@ fn check_with(
     }
     checks.extend(real::check_lab_side(&lab_side(settings), key));
     checks
+}
+
+/// The message of a failed call to AMT, with the pin of the key AMT
+/// offers over TLS at `tls_address` when the machine file names none and
+/// AMT answers there: AMT from release 16.1 on serves nothing in the
+/// clear.
+fn with_pin(settings: &AmtSettings, err: String, tls_address: &str) -> String {
+    if settings.pin.is_some() {
+        return err;
+    }
+    match crate::redfish::pin_of(tls_address) {
+        Ok(pin) => format!(
+            "{err}; AMT answers over TLS at {tls_address}, with a key whose pin is {pin}: if \
+             this is the machine's AMT, put pin = \"{pin}\" in the machine file's [amt] section"
+        ),
+        Err(_) => err,
+    }
 }
 
 /// Whether the console can be read from AMT's Serial-over-LAN: a session
@@ -724,9 +794,10 @@ impl Driver for AmtDriver {
 mod tests {
     use super::*;
     use crate::amt::fake::{FakeAmt, PASSWORD, USER};
+    use crate::link::fake::FakeTls;
     use crate::netboot::tests::{make_image, pretend_writer};
+    use crate::redirection::fake::FakeRedirection;
     use crate::screen;
-    use crate::sol::fake::FakeSol;
     use crate::stop::Stop;
     use crate::testing::TempDir;
     use crate::vnc::fake::{Event, FakeVnc, pattern};
@@ -744,20 +815,29 @@ mod tests {
         dir: TempDir,
         fake: FakeAmt,
         /// AMT's Serial-over-LAN, when the console is read from it.
-        sol: Option<Arc<FakeSol>>,
+        sol: Option<Arc<FakeRedirection>>,
         /// AMT's remote screen, open once the pretend AMT turns it on.
         screen: FakeVnc,
+        /// The TLS in front of AMT's ports, when the bench has it.
+        fronts: Vec<FakeTls>,
         driver: AmtDriver,
     }
 
     fn bench(label: &str, tamper: bool) -> Bench {
-        bench_with(label, tamper, false)
+        bench_with(label, tamper, false, false)
     }
 
-    fn bench_with(label: &str, tamper: bool, cable: bool) -> Bench {
+    /// As [`bench`], with AMT as release 16.1 serves it: WS-Management and
+    /// the redirection service over TLS alone, with one key, and the
+    /// remote screen through the redirection service.
+    fn bench_tls(label: &str) -> Bench {
+        bench_with(label, false, false, true)
+    }
+
+    fn bench_with(label: &str, tamper: bool, cable: bool, tls: bool) -> Bench {
         let dir = TempDir::new(label);
         let port = dir.write("ttyUSB0", "");
-        let sol = (!cable).then(|| Arc::new(FakeSol::start()));
+        let sol = (!cable).then(|| Arc::new(FakeRedirection::start()));
         dir.write("writer/kernel", "KERNEL");
         dir.write("writer/initrd", "INITRD");
         dir.write(
@@ -809,8 +889,14 @@ mod tests {
                 });
             }));
         }
+        let mut fronts = Vec::new();
+        if tls {
+            let wsman = FakeTls::start(fake.address);
+            let redirection = wsman.beside(sol.as_ref().unwrap().address);
+            fronts = vec![wsman, redirection];
+        }
         let settings = AmtSettings {
-            address: fake.address.to_string(),
+            address: fronts.first().map_or(fake.address, |front| front.address).to_string(),
             user: USER.into(),
             password_file: password,
             mac: MAC.into(),
@@ -824,6 +910,7 @@ mod tests {
             writer: dir.path().join("writer"),
             console: None,
             grow_root: true,
+            pin: fronts.first().map(|front| front.pin.clone()),
         };
         let setup = Setup {
             image: make_image(&dir, 400_000),
@@ -835,20 +922,30 @@ mod tests {
             ob: None,
             stop: Stop::default(),
         };
-        let console_address =
-            sol.as_ref().map_or_else(|| "unused".into(), |sol| sol.address.to_string());
-        let mut driver = AmtDriver::start(settings, setup, console_address).unwrap();
-        // Tests of the wait after a start set their own.
-        driver.start_settle = Duration::ZERO;
-        let screen = {
+        let screen = if tls {
+            // Behind the redirection service, which has signed the session
+            // in: RFB asks for no password of its own.
+            let screen = FakeVnc::start(Box::new(|| Some(String::new())));
+            screen.state.lock().unwrap().asks_password = false;
+            sol.as_ref().unwrap().state.lock().unwrap().screen = Some(screen.address);
+            screen
+        } else {
             let state = Arc::clone(&fake.state);
             FakeVnc::start(Box::new(move || state.lock().unwrap().screen.open_password()))
         };
         let live = Arc::clone(&screen.state);
         fake.state.lock().unwrap().screen_busy =
             Some(Box::new(move || live.lock().unwrap().live > 0));
-        driver.screen.address = screen.address.to_string();
-        Bench { dir, fake, sol, screen, driver }
+        let redirection = match (fronts.get(1), &sol) {
+            (Some(front), _) => front.address.to_string(),
+            (None, Some(sol)) => sol.address.to_string(),
+            (None, None) => "unused".into(),
+        };
+        let ports = Ports { redirection, vnc: screen.address.to_string() };
+        let mut driver = AmtDriver::start(settings, setup, ports).unwrap();
+        // Tests of the wait after a start set their own.
+        driver.start_settle = Duration::ZERO;
+        Bench { dir, fake, sol, screen, fronts, driver }
     }
 
     fn wait_for(path: &Path, text: &str) -> bool {
@@ -944,7 +1041,7 @@ mod tests {
 
     #[test]
     fn a_serial_cable_is_read_when_the_machine_file_names_one() {
-        let mut bench = bench_with("amt-cable", false, true);
+        let mut bench = bench_with("amt-cable", false, true, false);
         bench.driver.boot_fresh().unwrap();
         assert!(wait_for(bench.driver.serial_log(), "Boot complete."));
         let writer_log = bench.dir.path().join("logs/writer-1.log");
@@ -1179,6 +1276,82 @@ mod tests {
         assert!(err.contains("chmod 600"), "{err}");
         fs::set_permissions(&open, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_password(&open).unwrap(), "secret");
+    }
+
+    #[test]
+    fn drives_amt_over_tls_alone() {
+        let mut bench = bench_tls("amt-tls");
+        bench.driver.boot_fresh().unwrap();
+        assert!(wait_for(bench.driver.serial_log(), "Boot complete."));
+        let disk = fs::read(bench.dir.path().join("disk")).unwrap();
+        assert_eq!(disk, fs::read(&bench.driver.setup.image).unwrap());
+        let soon = Instant::now() + Duration::from_secs(5);
+        bench.driver.power(PowerAction::Cut, soon).unwrap();
+        assert!(!bench.driver.is_on());
+        bench.driver.power(PowerAction::On, soon).unwrap();
+        // The screen through the redirection service: no port 5900, and
+        // no VNC password.
+        bench.driver.press_keys(&["a".into()]).unwrap();
+        let dump = bench.dir.path().join("screen.ppm");
+        bench.driver.screen_dump(&dump).unwrap();
+        let image = screen::Image::parse_ppm(&fs::read(&dump).unwrap()).unwrap();
+        assert_eq!(image.pixels(), pattern(40, 30));
+        assert_eq!(bench.screen.events()[2..], [Event::Key(0x61, true), Event::Key(0x61, false)]);
+        let calls = bench.fake.calls();
+        assert!(calls.contains(&"RequestStateChange 2".into()), "{calls:?}");
+        assert!(!calls.iter().any(|call| call.contains("IPS_KVMRedirectionSettingData")));
+        assert!(!bench.fake.state.lock().unwrap().screen.port_5900);
+        let sol = bench.sol.as_ref().unwrap();
+        assert_eq!(sol.state.lock().unwrap().screen_sessions, 1);
+        // A power change closes the screen's session, which AMT holds
+        // against it, and the next look opens another.
+        bench.driver.power(PowerAction::Reset, soon).unwrap();
+        bench.driver.screen_dump(&dump).unwrap();
+        assert_eq!(sol.state.lock().unwrap().screen_sessions, 2);
+        let log = fs::read_to_string(bench.dir.path().join("logs/amt.log")).unwrap();
+        assert!(log.contains("over TLS; net-boot server"), "{log}");
+        assert!(log.contains("turning on KVM, through AMT's redirection port"), "{log}");
+        assert!(!log.contains(PASSWORD));
+    }
+
+    #[test]
+    fn checks_amt_over_tls_and_names_the_pin_a_file_lacks() {
+        let bench = bench_tls("amt-tls-check");
+        let held = match &bench.driver.console {
+            ConsoleReader::Sol(reader) => reader.hold(),
+            ConsoleReader::Cable(_) => panic!("the bench reads Serial-over-LAN"),
+        };
+        let console = &bench.fronts[1];
+        assert!(bench.sol.as_ref().unwrap().wait(|state| state.live == 0));
+        let checks = check_with(&bench.driver.settings, None, true, &console.address.to_string());
+        drop(held);
+        let detail = |name: &str| {
+            let found = checks.iter().find(|check| check.check == name).unwrap();
+            assert_eq!(found.verdict, Verdict::Ok, "{name}: {}", found.detail);
+            found.detail.clone()
+        };
+        assert!(detail("amt").ends_with("over TLS"), "{}", detail("amt"));
+        assert!(
+            detail("remote screen").contains("redirection port"),
+            "{}",
+            detail("remote screen")
+        );
+        assert!(detail("serial over lan").starts_with("a session opens at"));
+        // A file with no pin, for an AMT that answers only over TLS, is
+        // given the pin to check and put in.
+        let mut settings = bench.driver.settings.clone();
+        settings.pin = None;
+        let front = &bench.fronts[0];
+        let said = with_pin(&settings, "refused".into(), &front.address.to_string());
+        assert!(said.starts_with("refused; AMT answers over TLS at"), "{said}");
+        assert!(said.contains(&format!("pin = \"{}\"", front.pin)), "{said}");
+        // A wrong pin is refused, and the pin offered named.
+        settings.pin = Some(format!("sha256//{}=", "A".repeat(43)));
+        let checks = check_with(&settings, None, false, "unused");
+        let amt = checks.iter().find(|check| check.check == "amt").unwrap();
+        assert_eq!(amt.verdict, Verdict::Problem);
+        assert!(amt.detail.contains("not the one the machine file pins"), "{}", amt.detail);
+        assert!(amt.detail.contains(&front.pin), "{}", amt.detail);
     }
 
     #[test]

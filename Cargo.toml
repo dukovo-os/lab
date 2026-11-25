@@ -12,6 +12,10 @@ repository = "https://github.com/dukovo-os/lab"
 publish = false
 
 [dependencies]
+# TLS to Intel AMT from release 16.1 on, which serves nothing in the
+# clear: rustls on ring, as Dukovo's own programs have it (dukovo-os/dukovo
+# ADR 0192).
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Results bundles and `--json` output.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

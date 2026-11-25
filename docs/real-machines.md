@@ -49,7 +49,7 @@ addresses:
 | --- | --- |
 | `10.77.0.1/24` | The lab PC's lab card. No gateway and no DNS server. |
 | `10.77.0.2` | The machine, handed out by dnsmasq by its MAC address. |
-| `10.77.0.10` | AMT, set in MEBx. AMT shares the machine's network port, and serves its remote screen on port 5900. |
+| `10.77.0.10` | AMT, set in MEBx. AMT shares the machine's network port. Before release 16.1 it serves WS-Management on port 16992, Serial-over-LAN and the remote screen's sign-in on 16994, and the remote screen on 5900; from 16.1 on, only 16993 and 16995, over TLS (see [AMT 16.1 and later](#amt-161-and-later-tls-only)). |
 
 ## Setting the machine up
 
@@ -68,6 +68,33 @@ Once, at the machine:
    Serial-over-LAN's listener if it is off.
 4. Note the network card's MAC address and the disk's serial number
    (`lsblk -o NAME,SERIAL` from a Linux live USB) for the machine file.
+
+### AMT 16.1 and later: TLS only
+
+AMT from release 16.1 on (machines with a 12th generation Core or later,
+such as a Dell Precision 3660, and older ones whose management engine
+firmware is updated) serves nothing in the clear: WS-Management is on
+port 16993 and the redirection service on 16995, both over TLS, and port
+5900 is gone. AMT makes its own certificate, which no authority signs,
+so the machine file pins its key: `pin` under `[amt]`, the same form as
+a Redfish machine's (`sha256//` and the base64 of the SHA-256 hash of
+the key). With a pin, the driver speaks TLS to AMT for everything, and
+trusts no other key; without one, it speaks in the clear, as AMT before
+16.1 serves it. [machines/precision.toml](../machines/precision.toml)
+is an example.
+
+`dukovo-lab machines check` on a file with no pin, for an AMT that
+answers only over TLS, prints the pin AMT offers and the line to put in
+the file. Put it in once you have checked that it is the machine's own: the
+lab network is the lab's alone, so the answer comes from a machine on
+it. AMT makes itself a new certificate when its firmware is updated;
+the driver then refuses the new key, and its message names the pin AMT
+offers now.
+
+Over TLS, the remote screen is a session of AMT's redirection service,
+signed in with AMT's own user and password, and carries the screen as
+RFB with no VNC password of its own. KVM Feature Selection and User
+Opt-in are set in MEBx as for any AMT machine.
 
 ## Setting the lab PC up
 
@@ -130,12 +157,13 @@ each missing program and how many tests need it.
 | `peer` | The lab PC is `{peer}` (`10.77.0.1`) and the machine `{machine}` (`10.77.0.2`); the machine's ports are reached as they are. |
 | `amt` | `{amt}` is AMT's own address (`10.77.0.10`), for a test that checks AMT keeps answering while the system runs. |
 | `linux` | The machine is its own Linux twin: before the first test of a run with a bench step, it boots the Linux kit from the network, and that test then boots Dukovo afresh. |
-| `screen` | AMT's remote screen, a VNC server on port 5900: `screen` steps read its text and `screenshot` steps save it as a PNG. A failing test's screenshot comes from it too. |
+| `screen` | AMT's remote screen, a VNC server on port 5900, or, from AMT 16.1 on, a session of its redirection service over TLS: `screen` steps read its text and `screenshot` steps save it as a PNG. A failing test's screenshot comes from it too. |
 | `keys` | The remote screen's keyboard, a US layout: `keys` and `type` steps. |
 | `mouse` | The remote screen's mouse, which points at pixels of the screen as it is now: `point` and `click` steps. |
 
 The first test that uses the screen, keyboard or mouse turns AMT's
-remote screen on, with a password made for the run, and its session
+remote screen on (on port 5900, with a password made for the run), and
+its session
 stays open until the next power change. AMT plugs a keyboard and mouse
 into the machine when a session opens, and turns power changes down
 while one is open, so the driver closes its session before each power
@@ -161,7 +189,8 @@ own, once the stall is solved.
 
 AMT's management engine shows the system a serial port of its own, at
 PCI 00:16.3 on Intel boards, and hands what the system writes there to
-one console on the network at a time, on AMT's port 16994. With no
+one console on the network at a time, on AMT's port 16994 (16995, over
+TLS, from AMT 16.1 on). With no
 console there, AMT drops the text. So the driver turns Serial-over-LAN
 on as it starts, opens a session, signs in with AMT's user and password
 (by HTTP digest: the password never goes over the network), and keeps

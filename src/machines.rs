@@ -314,6 +314,14 @@ pub struct AmtSettings {
     /// The serial number of the disk the image is written to, the only
     /// disk the writer may write (`lsblk -o NAME,SERIAL` shows it).
     pub disk: String,
+    /// AMT's TLS key as curl names it, `sha256//` and the base64 of the
+    /// key's SHA-256 hash. AMT from release 16.1 on serves nothing in the
+    /// clear, and its certificate is its own, so the pin turns TLS on and
+    /// is what shows the lab is talking to its AMT; `machines check`
+    /// prints it when AMT answers only over TLS. With none, the lab speaks
+    /// to AMT in the clear, as AMT before 16.1 serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
     /// The lab PC's serial port that the machine's console is cabled to,
     /// if it is: with none, the console is read from AMT's
     /// Serial-over-LAN.
@@ -996,6 +1004,13 @@ fn check_amt(settings: &AmtSettings) -> Result<(), String> {
     )?;
     if settings.user.is_empty() {
         return Err("amt.user must name AMT's user, admin as a rule".into());
+    }
+    if let Some(pin) = &settings.pin
+        && !crate::redfish::is_pin(pin)
+    {
+        return Err("amt.pin must be sha256// and the base64 of AMT's TLS key's SHA-256 hash: \
+                    `dukovo-lab machines check` prints it"
+            .into());
     }
     if !SERIAL_SPEEDS.contains(&settings.baud) {
         return Err("amt.baud must be 9600, 19200, 38400, 57600 or 115200".into());
@@ -1817,6 +1832,19 @@ mod tests {
     }
 
     #[test]
+    fn an_amt_file_pins_amt_s_tls_key_or_speaks_in_the_clear() {
+        let dir = TempDir::new("machines-amt-pin");
+        let file = "about = \"a box\"\ndriver = \"amt\"\n[amt]\naddress = \"10.77.0.15\"\n\
+                    password_file = \"p\"\nmac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\n";
+        dir.write("box.toml", file);
+        assert_eq!(load(dir.path()).unwrap()[0].amt.as_ref().unwrap().pin, None);
+        let pin = format!("sha256//{}=", "A".repeat(43));
+        dir.write("box.toml", &format!("{file}pin = \"{pin}\"\n"));
+        let machines = load(dir.path()).unwrap();
+        assert_eq!(machines[0].amt.as_ref().unwrap().pin.as_deref(), Some(pin.as_str()));
+    }
+
+    #[test]
     fn bad_amt_settings_say_what_is_wrong() {
         let amt = |extra: &str| {
             format!(
@@ -1833,6 +1861,7 @@ mod tests {
                 "amt.lab_address",
             ),
             (amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nbaud = 1\n"), "amt.baud"),
+            (amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\npin = \"md5//AAAA\"\n"), "amt.pin"),
             (amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nconsole = \"a b\"\n"), "amt.console"),
             (
                 amt("mac = \"aa:bb:cc:00:11:22\"\ndisk = \"D\"\nsmell = 1\n"),

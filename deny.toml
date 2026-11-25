@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 
 # cargo-deny policy, as Dukovo's own: dependencies come from crates.io
-# under licenses compatible with Apache-2.0 OR MIT.
+# under licenses compatible with Apache-2.0 OR MIT. ISC comes with ring,
+# rustls-webpki and untrusted, and BSD-3-Clause with subtle, all of them
+# under rustls, which the AMT driver's TLS uses.
 
 [advisories]
 yanked = "deny"
 
 [licenses]
-allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0"]
 confidence-threshold = 0.9
 
 [bans]

@@ -14,11 +14,17 @@
 //! `CIM_PowerManagementService.RequestPowerStateChange` for power,
 //! `CIM_BootConfigSetting.ChangeBootOrder` with
 //! `CIM_BootService.SetBootConfigRole` for a one-time boot from the
-//! network, and for the remote screen (KVM) on the standard VNC port,
-//! `IPS_KVMRedirectionSettingData`, `AMT_RedirectionService`'s listener and
-//! `CIM_KVMRedirectionSAP.RequestStateChange`; for Serial-over-LAN, which
-//! sol.rs reads, the listener and `AMT_RedirectionService.RequestStateChange`.
+//! network, and for the remote screen (KVM), `AMT_RedirectionService`'s
+//! listener and `CIM_KVMRedirectionSAP.RequestStateChange`, with
+//! `IPS_KVMRedirectionSettingData` for the standard VNC port where AMT
+//! still has it; for Serial-over-LAN, which sol.rs reads, the listener and
+//! `AMT_RedirectionService.RequestStateChange`.
+//!
+//! AMT from release 16.1 on answers only over TLS (see link.rs): the
+//! machine file's `amt.pin` names its key and turns TLS on. Without a pin,
+//! the lab speaks plain HTTP, which AMT before 16.1 serves.
 
+use crate::link::Tls;
 use crate::wsman::{self, Client, Selector};
 
 const CIM: &str = "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2";
@@ -143,9 +149,10 @@ pub struct Amt {
 }
 
 impl Amt {
-    /// AMT at `address` (with a port, or the plain-HTTP one).
-    pub fn new(address: &str, user: &str, password: &str) -> Amt {
-        Amt { client: Client::new(address, user, password) }
+    /// AMT at `address` (with a port, or the one for plain HTTP or for
+    /// `tls`), over `tls` when it is given.
+    pub fn new(address: &str, user: &str, password: &str, tls: Option<Tls>) -> Amt {
+        Amt { client: Client::new(address, user, password, tls) }
     }
 
     /// The machine's power state, as a CIM power state.
@@ -234,11 +241,13 @@ impl Amt {
         Ok(RemoteScreen { in_mebx, consent })
     }
 
-    /// Turns AMT's remote screen on for a standard VNC client on port
-    /// 5900, signing in with `password` (as [`screen_password`] makes):
-    /// the port and its password, the redirection listener every remote
-    /// session needs, and KVM itself. What is on already is left as it is.
-    pub fn turn_on_remote_screen(&self, password: &str) -> Result<(), String> {
+    /// Turns AMT's remote screen on: with `port_5900` as its password (as
+    /// [`screen_password`] makes it), the standard VNC port, then the
+    /// redirection listener every remote session needs, and KVM itself.
+    /// What is on already is left as it is. AMT from release 16.1 on has no
+    /// port 5900, so `port_5900` is `None` there, and a session opens
+    /// through the redirection port alone.
+    pub fn turn_on_remote_screen(&self, port_5900: Option<&str>) -> Result<(), String> {
         let screen = self.remote_screen()?;
         if !screen.in_mebx {
             return Err("KVM is off in MEBx, and only MEBx turns it on: turn on KVM Feature \
@@ -252,16 +261,22 @@ impl Amt {
                 screen.consent
             ));
         }
-        let kvm = format!("{IPS}/IPS_KVMRedirectionSettingData");
-        let mut settings = self.instance(&kvm)?;
-        set(&mut settings, "Is5900PortEnabled", "true");
-        if value(&settings, "OptInPolicy").is_some() {
-            set(&mut settings, "OptInPolicy", "false");
+        if let Some(password) = port_5900 {
+            let kvm = format!("{IPS}/IPS_KVMRedirectionSettingData");
+            let mut settings = self.instance(&kvm)?;
+            set(&mut settings, "Is5900PortEnabled", "true");
+            if value(&settings, "OptInPolicy").is_some() {
+                set(&mut settings, "OptInPolicy", "false");
+            }
+            set(&mut settings, "RFBPassword", password);
+            self.client
+                .put(
+                    &kvm,
+                    &selectors(&settings, &["InstanceID"]),
+                    &wsman::instance(&kvm, &settings),
+                )
+                .map_err(|err| format!("turning on port 5900 for the remote screen: {err}"))?;
         }
-        set(&mut settings, "RFBPassword", password);
-        self.client
-            .put(&kvm, &selectors(&settings, &["InstanceID"]), &wsman::instance(&kvm, &settings))
-            .map_err(|err| format!("turning on port 5900 for the remote screen: {err}"))?;
         self.turn_on_listener()?;
         // KVM itself: 2 is on with a session, 6 on and waiting for one.
         let point = format!("{CIM}/CIM_KVMRedirectionSAP");
@@ -773,7 +788,7 @@ mod tests {
     use super::*;
 
     fn amt(fake: &FakeAmt) -> Amt {
-        Amt::new(&fake.address.to_string(), USER, PASSWORD)
+        Amt::new(&fake.address.to_string(), USER, PASSWORD, None)
     }
 
     #[test]
@@ -830,7 +845,7 @@ mod tests {
         let amt = amt(&fake);
         assert_eq!(amt.remote_screen().unwrap(), RemoteScreen { in_mebx: true, consent: 0 });
         let password = screen_password().unwrap();
-        amt.turn_on_remote_screen(&password).unwrap();
+        amt.turn_on_remote_screen(Some(&password)).unwrap();
         assert_eq!(
             fake.calls(),
             [
@@ -842,9 +857,18 @@ mod tests {
         assert_eq!(fake.state.lock().unwrap().screen.open_password(), Some(password.clone()));
         // Once on, only the password changes.
         let again = screen_password().unwrap();
-        amt.turn_on_remote_screen(&again).unwrap();
+        amt.turn_on_remote_screen(Some(&again)).unwrap();
         assert_eq!(fake.calls().len(), 4);
         assert_eq!(fake.state.lock().unwrap().screen.open_password(), Some(again));
+    }
+
+    #[test]
+    fn the_remote_screen_through_the_redirection_port_leaves_port_5900_shut() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        amt.turn_on_remote_screen(None).unwrap();
+        assert_eq!(fake.calls(), ["Put AMT_RedirectionService", "RequestStateChange 2"]);
+        assert!(!fake.state.lock().unwrap().screen.port_5900);
     }
 
     #[test]
@@ -852,10 +876,10 @@ mod tests {
         let fake = FakeAmt::start();
         let amt = amt(&fake);
         fake.state.lock().unwrap().screen.consent = 1;
-        let err = amt.turn_on_remote_screen("Lk7!pQ2#").unwrap_err();
+        let err = amt.turn_on_remote_screen(Some("Lk7!pQ2#")).unwrap_err();
         assert!(err.contains("User Opt-in to None"), "{err}");
         fake.state.lock().unwrap().screen.in_mebx = false;
-        let err = amt.turn_on_remote_screen("Lk7!pQ2#").unwrap_err();
+        let err = amt.turn_on_remote_screen(Some("Lk7!pQ2#")).unwrap_err();
         assert!(err.contains("KVM Feature Selection"), "{err}");
         assert!(fake.calls().is_empty());
     }
@@ -936,7 +960,7 @@ mod tests {
     #[test]
     fn a_wrong_password_says_so() {
         let fake = FakeAmt::start();
-        let amt = Amt::new(&fake.address.to_string(), USER, "wrong");
+        let amt = Amt::new(&fake.address.to_string(), USER, "wrong", None);
         let err = amt.power_state().unwrap_err();
         assert!(err.contains("did not take the user and password"), "{err}");
     }

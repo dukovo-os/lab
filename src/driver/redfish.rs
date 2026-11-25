@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use super::real::{
     self, Check, LabSide, NetBoot, Verdict, found, persons_job, problem, ssh_target, with_console,
 };
-use super::remote_screen::{Enabled, RemoteScreen, TurnOn};
+use super::remote_screen::{RemoteScreen, TurnOn};
 use super::{Driver, Setup};
 use crate::bench::Kit;
 use crate::ipmi_sol::{self, IpmiSolReader};
@@ -57,6 +57,7 @@ use crate::redfish::{self, Event, Redfish, ResetKind, Vendor};
 use crate::serial::{ConsoleLog, SerialReader};
 use crate::ssh;
 use crate::suite::{Button, PowerAction, Stick};
+use crate::vnc::Door;
 
 /// How long the machine is given to go off after a hard off.
 const OFF_TIME: Duration = Duration::from_secs(30);
@@ -154,8 +155,7 @@ impl RedfishDriver {
         };
         let host = bmc_host(&settings).to_string();
         let screen = RemoteScreen::new(
-            format!("{host}:{}", redfish::DEFAULT_VNC_PORT),
-            "the iDRAC's VNC server",
+            "the iDRAC's VNC server, with a password made for this run",
             false,
             netboot.log(),
             turn_on_screen(&redfish, host),
@@ -392,7 +392,7 @@ fn turn_on_screen(redfish: &Arc<Redfish>, host: String) -> TurnOn {
         }
         let password = redfish::screen_password()?;
         let port = redfish.enable_vnc(&password)?;
-        Ok(Enabled { password, address: Some(format!("{host}:{port}")) })
+        Ok(Door::Vnc { address: format!("{host}:{port}"), password })
     })
 }
 
@@ -957,8 +957,7 @@ mod tests {
             FakeVnc::start(Box::new(move || state.lock().unwrap().open_password()))
         };
         fake.state.lock().unwrap().vnc_port = screen.address.port();
-        let mut bench = Bench { dir, fake, screen, driver };
-        bench.driver.screen.address = bench.screen.address.to_string();
+        let bench = Bench { dir, fake, screen, driver };
         if !cable {
             // The pretend ipmitool follows what the machine writes from
             // here on, as a real session carries only what comes while
