@@ -399,6 +399,25 @@ pub enum Readiness {
     Stopped,
 }
 
+/// Waits until something listens on the lab PC's loopback `port`, until
+/// `deadline`: a forward kept up that is being started again after the
+/// machine restarted listens again once its `ssh` is in.
+pub fn wait_listening(port: u16, deadline: Instant, stop: &Stop) -> Readiness {
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    loop {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+            return Readiness::Ready;
+        }
+        if stop.requested() {
+            return Readiness::Stopped;
+        }
+        if Instant::now() >= deadline {
+            return Readiness::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 impl Job {
     /// Starts `command` on the lab PC, through `root` when given, in
     /// `folder`, its output and errors going to `log`.
@@ -673,6 +692,22 @@ mod tests {
             assert!(scan(wrong).is_err(), "{wrong}");
         }
         assert!(!uses_peer("echo ${x} {target}"));
+    }
+
+    #[test]
+    fn waiting_for_a_port_ends_once_it_listens_or_when_the_time_is_out() {
+        let stop = Stop::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let soon = Instant::now() + Duration::from_secs(5);
+        assert!(matches!(wait_listening(port, soon, &stop), Readiness::Ready));
+
+        // Nothing listens once it is closed: the wait ends at its time.
+        drop(listener);
+        let started = Instant::now();
+        let until = started + Duration::from_millis(500);
+        assert!(matches!(wait_listening(port, until, &stop), Readiness::TimedOut));
+        assert!(started.elapsed() >= Duration::from_millis(500));
     }
 
     #[test]
