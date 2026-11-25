@@ -23,6 +23,10 @@
 //!   under QEMU is a port of the lab PC's forwarded to the guest's;
 //! - `{amt}`: the address of the machine's Intel AMT, on a machine that
 //!   has it, for a host step to reach its web and WS-Management ports;
+//! - `{amt-web}`: the address of AMT's web server, as a URL: `http://` on
+//!   port 16992, or `https://` on port 16993 where the machine file pins
+//!   AMT's TLS key, as AMT from release 16.1 on serves nothing in the
+//!   clear;
 //! - `{guest-agent}`: the lab PC's end of the machine's QEMU guest agent
 //!   channel, a Unix socket, for a test that asks for one;
 //! - `{work}`: a folder of the test's own on the lab PC, which host steps
@@ -82,6 +86,8 @@ pub enum Token {
     Port(String),
     /// `{amt}`: the machine's AMT's address, on the lab network.
     Amt,
+    /// `{amt-web}`: the URL of the machine's AMT's web server.
+    AmtWeb,
     /// `{guest-agent}`: the lab PC's socket for the machine's QEMU guest
     /// agent channel.
     GuestAgent,
@@ -113,6 +119,7 @@ pub fn scan(text: &str) -> Result<Vec<(Range<usize>, Token)>, String> {
             "peer" => Token::Peer,
             "machine" => Token::Machine,
             "amt" => Token::Amt,
+            "amt-web" => Token::AmtWeb,
             "guest-agent" => Token::GuestAgent,
             "work" => Token::Work,
             "here" => Token::Here,
@@ -152,9 +159,11 @@ pub fn uses_peer(text: &str) -> bool {
     scan(text).is_ok_and(|found| !found.is_empty())
 }
 
-/// Whether `text` names the machine's AMT (`{amt}`).
+/// Whether `text` names the machine's AMT (`{amt}` or `{amt-web}`).
 pub fn uses_amt(text: &str) -> bool {
-    scan(text).is_ok_and(|found| found.iter().any(|(_, token)| *token == Token::Amt))
+    scan(text).is_ok_and(|found| {
+        found.iter().any(|(_, token)| matches!(token, Token::Amt | Token::AmtWeb))
+    })
 }
 
 /// `text` with each placeholder replaced by what `value` gives for it.

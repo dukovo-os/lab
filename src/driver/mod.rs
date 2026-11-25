@@ -303,6 +303,12 @@ pub trait Driver: Send {
         None
     }
 
+    /// The URL of the machine's Intel AMT's web server (`{amt-web}`), on a
+    /// machine that has it.
+    fn amt_web(&self) -> Option<String> {
+        None
+    }
+
     /// The lab PC's end of the machine's QEMU guest agent channel
     /// (`{guest-agent}`), a Unix socket, on a boot that has one.
     fn guest_agent_socket(&self) -> Option<PathBuf> {

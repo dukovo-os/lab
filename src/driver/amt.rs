@@ -580,6 +580,16 @@ fn check_serial_over_lan(amt: &Amt, sign: &Sign) -> Result<String, (Verdict, Str
     sol::try_session(sign).map(|()| format!("a session opens at {}", sign.address)).map_err(problem)
 }
 
+/// The URL of AMT's web server: over TLS, on its port for TLS, when the
+/// machine file pins AMT's key.
+fn web_url(settings: &AmtSettings) -> String {
+    let host = amt_host(settings);
+    match settings.pin {
+        Some(_) => format!("https://{host}:{}/", wsman::TLS_PORT),
+        None => format!("http://{host}:{}/", wsman::PORT),
+    }
+}
+
 /// AMT's host, without the port.
 fn amt_host(settings: &AmtSettings) -> &str {
     settings.address.split(':').next().unwrap_or_default()
@@ -739,6 +749,10 @@ impl Driver for AmtDriver {
 
     fn amt_address(&self) -> Option<String> {
         Some(self.settings.address.clone())
+    }
+
+    fn amt_web(&self) -> Option<String> {
+        Some(web_url(&self.settings))
     }
 
     fn reach(&mut self, port: u16, _udp: bool) -> Result<u16, String> {
@@ -1281,6 +1295,8 @@ mod tests {
     #[test]
     fn drives_amt_over_tls_alone() {
         let mut bench = bench_tls("amt-tls");
+        let host = amt_host(&bench.driver.settings).to_string();
+        assert_eq!(bench.driver.amt_web(), Some(format!("https://{host}:16993/")));
         bench.driver.boot_fresh().unwrap();
         assert!(wait_for(bench.driver.serial_log(), "Boot complete."));
         let disk = fs::read(bench.dir.path().join("disk")).unwrap();
