@@ -121,6 +121,12 @@ pub const NO_FONTS: &str = "this step reads the screen, and the run was given no
 /// How long a browser step waits for its forward to listen.
 const FORWARD_WAIT: Duration = Duration::from_secs(15);
 
+/// How long a browser step waits for a forward kept up to listen again
+/// after the machine restarted: its `ssh` may have begun to connect while
+/// the machine was away, which takes up to the connect timeout of 10
+/// seconds to give up, then the pause between starts and the next connect.
+const FORWARD_BACK_WAIT: Duration = Duration::from_secs(30);
+
 /// Why a `browser` step is skipped.
 pub const NO_BROWSERS: &str = "this step drives a browser, and the run was given no browser kit: `ob lab` makes one and passes it with --browsers";
 
@@ -2002,14 +2008,26 @@ impl<'a> Worker<'a> {
         folder: &Path,
         deadline: Instant,
     ) -> Result<Option<u16>, String> {
+        let logs = self.shared.bundle.logs(&self.folder);
+        let log = logs.join(format!("{}-forward-{port}.log", test.id.replace('/', "-")));
         if let Some(&(local, _)) = self.peer.forwards.get(&port) {
-            return Ok(Some(local));
+            // A step that comes right after a restart of the machine may
+            // come before the forward is back, and its page would find
+            // nothing listening.
+            let until = deadline.min(Instant::now() + FORWARD_BACK_WAIT);
+            return match peer::wait_listening(local, until, self.shared.stop) {
+                Readiness::Ready => Ok(Some(local)),
+                Readiness::Stopped => Err(STOPPED_DURING.to_string()),
+                Readiness::TimedOut | Readiness::Exited(_) => Err(format!(
+                    "the ssh forward was not listening again after {}s; {}",
+                    FORWARD_BACK_WAIT.as_secs(),
+                    self.shared.bundle.relative(&log)
+                )),
+            };
         }
         let local = peer::free_port()?;
         let Some(command) = self.driver.loopback_forward(local, port)? else { return Ok(None) };
-        let logs = self.shared.bundle.logs(&self.folder);
         fs::create_dir_all(&logs).map_err(|err| format!("making {}: {err}", logs.display()))?;
-        let log = logs.join(format!("{}-forward-{port}.log", test.id.replace('/', "-")));
         self.peer.jobs.push(Job::start(&command, &[], folder, &log)?);
         let job = self.peer.jobs.last_mut().expect("pushed above");
         let until = deadline.min(Instant::now() + FORWARD_WAIT);

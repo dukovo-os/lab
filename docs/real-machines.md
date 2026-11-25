@@ -261,8 +261,12 @@ A machine that restarts during the test ends the forward's `ssh`, so the
 runner starts it again, on the same local port, whenever it ends while
 the test runs: every two seconds, until the machine's SSH answers or the
 test's time is up. A page that stayed open reconnects once it is back.
-Each start is a line in the forward's own log (`the forward ended (status
-255); starting it again`).
+A `browser` step that comes after the restart waits up to 30 seconds for
+the forward to listen again before it opens its page, since a step
+before it may have found the machine back by its address while the
+forward's `ssh` was still giving up on a connect begun while the machine
+was away. Each start is a line in the forward's own log (`the forward
+ended (status 255); starting it again`).
 
 Only what a browser opens changes. `host`, `run` and `attack` steps, and
 `{machine}` and `{machine-port:N}` in them, keep the machine's address.
