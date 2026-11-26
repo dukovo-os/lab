@@ -109,6 +109,14 @@ impl Class {
     }
 }
 
+/// How many of a finding's runs send their bundles with it: the latest,
+/// whose logs show how it fails now. A finding that failed night after
+/// night while a schedule held its sends would otherwise take all those
+/// runs' bundles in one push, gigabytes that GitHub refuses. The earlier
+/// runs stay on the lab PC, each listed in the finding with its reason,
+/// and `send --run` sends any of them.
+pub const RUNS_SENT: usize = 2;
+
 /// findings/<id>.json.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Finding {
@@ -227,9 +235,21 @@ impl Finding {
             || matches!(self.state, State::FixProposed | State::Approved | State::Fixed)
     }
 
-    /// Whether it has failed in a run lab-results does not have yet.
+    /// The times it failed in its latest [`RUNS_SENT`] runs, whose bundles
+    /// go to lab-results with it.
+    pub fn latest(&self) -> impl Iterator<Item = &Seen> {
+        let mut runs: Vec<(&str, &str)> =
+            self.runs.iter().map(|seen| (seen.at.as_str(), seen.run.as_str())).collect();
+        runs.sort_unstable_by(|a, b| b.cmp(a));
+        runs.dedup_by_key(|(_, run)| *run);
+        runs.truncate(RUNS_SENT);
+        self.runs.iter().filter(move |seen| runs.iter().any(|(_, run)| *run == seen.run))
+    }
+
+    /// Whether it has failed in one of its latest runs that lab-results
+    /// does not have yet.
     pub fn unsent(&self) -> bool {
-        self.runs.iter().any(|seen| !seen.sent)
+        self.latest().any(|seen| !seen.sent)
     }
 
     /// What lab-results should hold once this finding is sent over `theirs`

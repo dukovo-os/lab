@@ -34,7 +34,7 @@ On the runner page: Send this finding, Send (every new finding of the
 run) or Send all new. From a terminal or an agent:
 
 ```sh
-dukovo-lab send f-3a9c51d2e07b          # one finding, and its runs not sent yet
+dukovo-lab send f-3a9c51d2e07b          # one finding, and its latest runs not sent yet
 dukovo-lab send --run 20261107-153012-4f2a   # a run and its findings
 dukovo-lab send --all                   # every finding with something new
 ```
@@ -45,7 +45,12 @@ Each send:
    lab-results' `main` as it is now.
 2. Copies in each run's bundle that lab-results does not have yet, as
    `runs/<date>/<run>/`: `run.json`, `results.json`, `events.jsonl`,
-   `logs/` (each `.log` compressed to `.log.gz`) and `screenshots/`.
+   `logs/` (each `.log` compressed to `.log.gz`) and `screenshots/`. A
+   finding brings the bundles of its latest two runs only: one that
+   failed every night while a schedule held its sends would otherwise
+   take gigabytes in one push, which GitHub refuses. Its earlier runs stay
+   on the lab PC, listed in the finding with their reasons, and
+   `send --run <run>` sends any of them.
 3. Merges each finding with the copy in lab-results, as
    `findings/<id>.json`: every run either side has, and the state
    lab-results moved it to, unless a person on the lab PC has since said

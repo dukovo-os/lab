@@ -63,8 +63,9 @@ pub fn was_sent(bundle: &Path) -> bool {
     bundle.join("sent.json").is_file()
 }
 
-/// Sends `finding_ids`, the runs they failed in that lab-results lacks,
-/// and the runs `run_ids`, through the clone at `clone`.
+/// Sends `finding_ids`, the latest runs they failed in that lab-results
+/// lacks ([`findings::RUNS_SENT`] each), and the runs `run_ids`, through
+/// the clone at `clone`.
 pub fn send(
     store: &Path,
     clone: &Path,
@@ -80,7 +81,7 @@ pub fn send(
         }
     }
     let mut runs: Vec<String> = Vec::new();
-    let unsent = picked.iter().flat_map(|finding| finding.runs.iter().filter(|seen| !seen.sent));
+    let unsent = picked.iter().flat_map(|finding| finding.latest().filter(|seen| !seen.sent));
     for id in run_ids.iter().chain(unsent.map(|seen| &seen.run)) {
         if !runs.contains(id) {
             runs.push(id.clone());
@@ -348,7 +349,7 @@ fn note_sent(bundle: &Path, at: Utc, commit: Option<&str>, sent: &[Finding]) -> 
 mod tests {
     use super::*;
     use crate::bundle::{Bundle, Outcome, ResultRecord, RunRecord, SCHEMA};
-    use crate::findings::State;
+    use crate::findings::{RUNS_SENT, State};
     use crate::testing::TempDir;
 
     /// Runs git in `dir` for a test, which must work.
@@ -475,6 +476,37 @@ mod tests {
         let ours = findings::find(&store, &finding).unwrap();
         assert_eq!(ours.state, State::FixProposed);
         assert_eq!(ours.count, 2);
+    }
+
+    #[test]
+    fn a_finding_sends_the_bundles_of_its_latest_runs_only() {
+        let dir = TempDir::new("send-latest");
+        let store = dir.path().join("store");
+        let (origin, clone) = lab_results(dir.path(), &store);
+        // Four runs of the same failure, held, as a schedule holds them.
+        let ids = ["20261107-050000-0001", "20261107-060000-0002", "20261107-070000-0003"];
+        let finding = ids.map(|id| failed_run(&store, id))[0].clone();
+        let last = "20261107-080000-0004";
+        assert_eq!(failed_run(&store, last), finding);
+
+        let sent = send(&store, &clone, std::slice::from_ref(&finding), &[]).unwrap();
+        let mut runs = sent.runs.clone();
+        runs.sort();
+        assert_eq!(runs, [ids[2], last], "the latest {RUNS_SENT} runs' bundles");
+        let check = dir.path().join("check");
+        run_git(dir.path(), &["clone", "-q", origin.to_str().unwrap(), check.to_str().unwrap()]);
+        assert!(!store::bundle_dir(&check, ids[0]).exists());
+        let theirs = findings::load(&check, &finding).unwrap();
+        assert_eq!(theirs.runs.len(), 4, "the finding lists every run it failed in");
+        let ours = findings::find(&store, &finding).unwrap();
+        assert!(!ours.unsent(), "nothing more goes with it");
+        assert!(!was_sent(&store::bundle_dir(&store, ids[0])));
+        assert_eq!(send(&store, &clone, std::slice::from_ref(&finding), &[]).unwrap().commit, None);
+
+        // An earlier run goes when it is named.
+        let sent = send(&store, &clone, &[], &[ids[0].to_string()]).unwrap();
+        assert_eq!(sent.runs, [ids[0]]);
+        assert!(was_sent(&store::bundle_dir(&store, ids[0])));
     }
 
     #[test]

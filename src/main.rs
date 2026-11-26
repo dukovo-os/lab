@@ -108,8 +108,9 @@ Commands:
                    What failed, each failure with the runs it came back
                    in (default: those still open); or one finding
   send <finding>... | --all | --run <run>
-                   Sends findings, and the runs they failed in, to the
-                   lab-results repository, where they are worked on
+                   Sends findings, and the latest runs they failed
+                   in, to the lab-results repository, where they are
+                   worked on
   schedule         The schedules: when each runs next and how it went last
   schedule save <name> <test or category>... | --all | --preset <name>
                    (--at <HH:MM> [--days <mon,...>] | --each-build)
