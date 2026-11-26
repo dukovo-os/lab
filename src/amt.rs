@@ -464,6 +464,9 @@ pub mod fake {
         /// How many hard offs AMT takes and does nothing with, as it does
         /// with one asked while the machine is starting.
         pub ignored_hard_offs: u32,
+        /// How many Pulls AMT answers with the fault for a list it no
+        /// longer knows, as it does a Pull sent again after it answered.
+        pub stale_pulls: u32,
         /// Nonces handed out, and the highest count used with each.
         nonce: u32,
     }
@@ -523,6 +526,7 @@ pub mod fake {
                 off_after_on: 0,
                 off_reads: 0,
                 ignored_hard_offs: 0,
+                stale_pulls: 0,
                 screen: Screen {
                     in_mebx: true,
                     consent: 0,
@@ -613,6 +617,16 @@ pub mod fake {
         let inner = match method.as_str() {
             "Enumerate" => {
                 format!("<g:EnumerateResponse><g:EnumerationContext>{class_name}</g:EnumerationContext></g:EnumerateResponse>")
+            }
+            "Pull" if state_now.stale_pulls > 0 => {
+                state_now.stale_pulls -= 1;
+                drop(state_now);
+                let fault = "<a:Envelope><a:Body><a:Fault><a:Code><a:Value>a:Sender</a:Value>\
+                    <a:Subcode><a:Value>e:InvalidEnumerationContext</a:Value></a:Subcode></a:Code>\
+                    <a:Reason><a:Text xml:lang=\"en-US\">The supplied enumeration context is invalid.</a:Text>\
+                    </a:Reason></a:Fault></a:Body></a:Envelope>";
+                http::write_response(stream, &Response::new(400, "application/soap+xml", fault));
+                return;
             }
             "Pull" => {
                 let item = match class_name.as_str() {
@@ -945,6 +959,21 @@ mod tests {
         assert!(err.contains("the answer is cut short") && err.contains("tried 3 times"), "{err}");
         assert_eq!(fake.state.lock().unwrap().dropped_connections, 0, "three connections made");
         assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn a_list_amt_no_longer_knows_starts_again() {
+        let fake = FakeAmt::start();
+        let amt = amt(&fake);
+        // Two Pulls refused: the third enumeration gives the list.
+        fake.state.lock().unwrap().stale_pulls = 2;
+        assert_eq!(amt.power_state().unwrap(), 8);
+        assert_eq!(fake.state.lock().unwrap().stale_pulls, 0);
+        // Three in a row are AMT's answer, and the last one says so.
+        fake.state.lock().unwrap().stale_pulls = 3;
+        let err = amt.power_state().unwrap_err();
+        assert_eq!(err, "AMT refused Pull: The supplied enumeration context is invalid.");
+        assert_eq!(fake.state.lock().unwrap().stale_pulls, 0);
     }
 
     #[test]

@@ -408,6 +408,13 @@ and why (a `machine-out` event). See [run](commands.md#run).
   starts is taken and not done: the driver waits until AMT says on, and
   asks a hard off again every 5 seconds while the machine stays on, for
   up to 30.
+- A list of AMT's, such as the power state, comes in two messages: an
+  Enumerate, then a Pull. When the machine's own network driver starts,
+  as Linux's does on the shared Intel port, the link resets and may drop
+  AMT's answer to a Pull; sent again, that Pull names a list AMT already
+  gave and let go of, and AMT says "The supplied enumeration context is
+  invalid". The driver then starts the list again, up to three times in
+  all.
 - AMT that stops answering altogether, no ping and no ARP reply for its
   address, while the lab network is up, has hung: only pulling the
   machine's power cord for 30 seconds brings it back. AMT 11.8 on an
