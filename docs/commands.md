@@ -474,8 +474,9 @@ brings them back. A fixed finding that fails again is new.
 dukovo-lab send <finding>... | --all | --run <run> [--results <dir>]
 ```
 
-Sends findings, and the runs they failed in that lab-results does not
-have yet, to the private dukovo-os/lab-results repository, where a
+Sends findings, and the latest two runs each failed in that
+lab-results does not have yet, to the private dukovo-os/lab-results
+repository, where a
 thread proposes a fix for each. `--all` sends every finding with
 something new (and any already there that a person has since marked not
 a bug); `--run <run>` sends a run and its findings. It uses a clone of
