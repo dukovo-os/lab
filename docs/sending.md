@@ -46,11 +46,13 @@ Each send:
 2. Copies in each run's bundle that lab-results does not have yet, as
    `runs/<date>/<run>/`: `run.json`, `results.json`, `events.jsonl`,
    `logs/` (each `.log` compressed to `.log.gz`) and `screenshots/`. A
-   finding brings the bundles of its latest two runs only: one that
-   failed every night while a schedule held its sends would otherwise
-   take gigabytes in one push, which GitHub refuses. Its earlier runs stay
-   on the lab PC, listed in the finding with their reasons, and
-   `send --run <run>` sends any of them.
+   file over 100 MiB, which GitHub refuses, stays on the lab PC, with
+   `<name>.left-out` in its place saying so: a browser's trace of a long
+   journey can be that large. A finding brings the bundles of its latest
+   two runs only: one that failed every night while a schedule held its
+   sends would otherwise take gigabytes in one push, which GitHub
+   refuses. Its earlier runs stay on the lab PC, listed in the finding
+   with their reasons, and `send --run <run>` sends any of them.
 3. Merges each finding with the copy in lab-results, as
    `findings/<id>.json`: every run either side has, and the state
    lab-results moved it to, unless a person on the lab PC has since said

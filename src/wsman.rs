@@ -42,6 +42,13 @@ const WAKE_TIME: Duration = Duration::from_secs(20);
 const TRIES: u32 = 3;
 const TRY_GAP: Duration =
     if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(2) };
+/// How many times an enumeration starts in all when AMT no longer knows
+/// it at a Pull. A Pull sent again after the network failed it may name
+/// a list AMT already gave and let go of: the machine's own network
+/// driver, starting, resets the link AMT shares and drops the answer.
+const ENUMERATION_TRIES: u32 = 3;
+/// The subcode of the fault AMT answers that Pull with, WS-Enumeration's.
+const STALE_ENUMERATION: &str = "InvalidEnumerationContext";
 
 pub const ADDRESSING: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
 pub const WSMAN: &str = "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd";
@@ -61,6 +68,28 @@ pub struct Client {
     challenge: std::sync::Mutex<Option<Challenge>>,
     /// Message ids, unique within the client.
     next_id: AtomicU32,
+}
+
+/// Why a message got no answer to use: AMT's refusal, or the network's
+/// failure.
+struct Refusal {
+    /// What to say: the action and AMT's words, or what failed.
+    message: String,
+    /// The SOAP fault's subcode, without its namespace prefix, when AMT
+    /// gave one.
+    subcode: Option<String>,
+}
+
+impl From<String> for Refusal {
+    fn from(message: String) -> Refusal {
+        Refusal { message, subcode: None }
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(message: &str) -> Refusal {
+        Refusal::from(message.to_string())
+    }
 }
 
 /// What AMT's `WWW-Authenticate: Digest` header asked for.
@@ -105,21 +134,40 @@ impl Client {
     }
 
     /// Lists every instance of `class`: an Enumerate, then Pulls until AMT
-    /// says the list has ended. Gives each Pull's items, joined.
+    /// says the list has ended. Gives each Pull's items, joined. A list AMT
+    /// no longer knows at a Pull starts again, up to [`ENUMERATION_TRIES`]
+    /// times in all.
     pub fn enumerate(&self, class: &str) -> Result<String, String> {
-        let started = self.call(
+        let mut tried = 1;
+        loop {
+            match self.enumerate_once(class) {
+                Err(refusal)
+                    if refusal.subcode.as_deref() == Some(STALE_ENUMERATION)
+                        && tried < ENUMERATION_TRIES =>
+                {
+                    tried += 1;
+                }
+                result => return result.map_err(|refusal| refusal.message),
+            }
+        }
+    }
+
+    /// One enumeration of `class`, from its Enumerate to its last Pull.
+    fn enumerate_once(&self, class: &str) -> Result<String, Refusal> {
+        let started = self.exchange(
             class,
             &format!("{ENUMERATION}/Enumerate"),
             &[],
             &format!("<Enumerate xmlns=\"{ENUMERATION}\"/>"),
         )?;
-        let mut context = text(&started, "EnumerationContext")
-            .ok_or("AMT started no enumeration: its answer has no EnumerationContext")?;
+        let mut context = text(&started, "EnumerationContext").ok_or_else(|| {
+            Refusal::from("AMT started no enumeration: its answer has no EnumerationContext")
+        })?;
         let mut items = String::new();
         // AMT gives everything in one Pull with these limits; the bound
         // only stops a firmware that never ends the list.
         for _ in 0..16 {
-            let pulled = self.call(
+            let pulled = self.exchange(
                 class,
                 &format!("{ENUMERATION}/Pull"),
                 &[],
@@ -133,13 +181,14 @@ impl Client {
                 items.push_str(found);
             }
             if elements(&pulled, "EndOfSequence").is_empty() {
-                context = text(&pulled, "EnumerationContext")
-                    .ok_or("AMT's Pull neither ended the list nor gave a context to go on")?;
+                context = text(&pulled, "EnumerationContext").ok_or_else(|| {
+                    Refusal::from("AMT's Pull neither ended the list nor gave a context to go on")
+                })?;
             } else {
                 return Ok(items);
             }
         }
-        Err("AMT's list did not end".into())
+        Err(Refusal::from("AMT's list did not end"))
     }
 
     /// Invokes `method` of `class` on the instance `selectors` pick, with
@@ -169,21 +218,34 @@ impl Client {
         selectors: &[Selector<'_>],
         body: &str,
     ) -> Result<String, String> {
+        self.exchange(class, action, selectors, body).map_err(|refusal| refusal.message)
+    }
+
+    /// [`Client::call`], with the fault's subcode kept for the caller.
+    fn exchange(
+        &self,
+        class: &str,
+        action: &str,
+        selectors: &[Selector<'_>],
+        body: &str,
+    ) -> Result<String, Refusal> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let message = envelope(class, action, selectors, body, id);
         let answer = self.post(message.as_bytes())?;
         let text_of = String::from_utf8_lossy(&answer.body).into_owned();
-        if answer.status != 200 {
-            let why = text(&text_of, "Text")
+        let why = if answer.status != 200 {
+            text(&text_of, "Text")
                 .or_else(|| text(&text_of, "Reason"))
-                .unwrap_or_else(|| format!("HTTP status {}", answer.status));
-            return Err(format!("AMT refused {}: {why}", short_action(action)));
-        }
-        if !elements(&text_of, "Fault").is_empty() {
-            let why = text(&text_of, "Text").unwrap_or_else(|| "a SOAP fault".into());
-            return Err(format!("AMT refused {}: {why}", short_action(action)));
-        }
-        Ok(text_of)
+                .unwrap_or_else(|| format!("HTTP status {}", answer.status))
+        } else if !elements(&text_of, "Fault").is_empty() {
+            text(&text_of, "Text").unwrap_or_else(|| "a SOAP fault".into())
+        } else {
+            return Ok(text_of);
+        };
+        Err(Refusal {
+            message: format!("AMT refused {}: {why}", short_action(action)),
+            subcode: fault_subcode(&text_of),
+        })
     }
 
     /// Posts `message` to /wsman, signing in with HTTP digest: with the
@@ -508,6 +570,15 @@ pub fn text(xml: &str, name: &str) -> Option<String> {
     elements(xml, name).first().map(|inside| unescape(inside.trim()))
 }
 
+/// The subcode of the SOAP fault in `answer`, without its namespace
+/// prefix: `InvalidEnumerationContext` for
+/// `<Subcode><Value>wsen:InvalidEnumerationContext</Value></Subcode>`.
+fn fault_subcode(answer: &str) -> Option<String> {
+    let subcode = elements(answer, "Subcode").into_iter().next()?;
+    let value = text(subcode, "Value")?;
+    Some(value.rsplit(':').next().unwrap_or_default().to_string())
+}
+
 /// The texts of every element whose local name is `name`.
 pub fn texts(xml: &str, name: &str) -> Vec<String> {
     elements(xml, name).iter().map(|inside| unescape(inside.trim())).collect()
@@ -516,6 +587,16 @@ pub fn texts(xml: &str, name: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_fault_s_subcode_without_its_prefix() {
+        let fault = "<s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode>\
+            <s:Value>wsen:InvalidEnumerationContext</s:Value></s:Subcode></s:Code>\
+            <s:Reason><s:Text>The supplied enumeration context is invalid.</s:Text></s:Reason></s:Fault>";
+        assert_eq!(fault_subcode(fault).as_deref(), Some("InvalidEnumerationContext"));
+        let plain = "<s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code></s:Fault>";
+        assert_eq!(fault_subcode(plain), None);
+    }
 
     #[test]
     fn signs_in_as_rfc_2617_does() {

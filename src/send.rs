@@ -35,6 +35,11 @@ use crate::store;
 /// Where lab-results is cloned from, for the message that says how.
 const RESULTS_URL: &str = "git@github.com:dukovo-os/lab-results.git";
 
+/// The largest file a bundle sends, 100 MiB: GitHub refuses a push with
+/// a larger one, and the whole send with it. A larger file, a browser's
+/// trace of a long journey most often, stays on the lab PC.
+const LARGEST: u64 = if cfg!(test) { 1024 } else { 100 * 1024 * 1024 };
+
 /// What went.
 #[derive(Debug, Serialize)]
 pub struct Sent {
@@ -287,18 +292,49 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
         } else if kind.is_file() {
             fs::create_dir_all(to)
                 .map_err(|err| Error::Harness(format!("making {}: {err}", to.display())))?;
-            if path.extension().is_some_and(|ext| ext == "log") {
+            let copy = if path.extension().is_some_and(|ext| ext == "log") {
                 let mut zipped = name.clone();
                 zipped.push(".gz");
-                gzip(&path, &to.join(zipped))?;
+                let copy = to.join(zipped);
+                gzip(&path, &copy)?;
+                copy
             } else {
-                fs::copy(&path, to.join(&name)).map_err(|err| {
+                let copy = to.join(&name);
+                fs::copy(&path, &copy).map_err(|err| {
                     Error::Harness(format!("copying {} to lab-results: {err}", path.display()))
                 })?;
-            }
+                copy
+            };
+            leave_out_if_too_large(&copy)?;
         }
     }
     Ok(())
+}
+
+/// Takes `copy` back out of lab-results when it is larger than
+/// [`LARGEST`], and leaves `<name>.left-out` in its place to say so.
+fn leave_out_if_too_large(copy: &Path) -> Result<(), Error> {
+    let failed = |err: std::io::Error| {
+        Error::Harness(format!("leaving {} out of lab-results: {err}", copy.display()))
+    };
+    let size = fs::metadata(copy).map_err(failed)?.len();
+    if size <= LARGEST {
+        return Ok(());
+    }
+    fs::remove_file(copy).map_err(failed)?;
+    let name = copy.file_name().unwrap_or_default().to_string_lossy();
+    let mut note = copy.as_os_str().to_owned();
+    note.push(".left-out");
+    let mib = size.div_ceil(1024 * 1024);
+    let limit = LARGEST.div_ceil(1024 * 1024);
+    fs::write(
+        &note,
+        format!(
+            "{name} stays in the run's bundle on the lab PC: at {mib} MiB it is over the \
+             {limit} MiB a file sent to lab-results may take.\n"
+        ),
+    )
+    .map_err(failed)
 }
 
 fn regular_file(path: &Path) -> bool {
@@ -476,6 +512,30 @@ mod tests {
         let ours = findings::find(&store, &finding).unwrap();
         assert_eq!(ours.state, State::FixProposed);
         assert_eq!(ours.count, 2);
+    }
+
+    #[test]
+    fn a_file_too_large_for_lab_results_stays_on_the_lab_pc() {
+        let dir = TempDir::new("send-large");
+        let store = dir.path().join("store");
+        let (origin, clone) = lab_results(dir.path(), &store);
+        let id = "20261107-080000-0001";
+        let finding = failed_run(&store, id);
+        let logs = store::bundle_dir(&store, id).join("logs/qemu");
+        let large = vec![b'x'; usize::try_from(LARGEST).unwrap() + 1];
+        fs::write(logs.join("journey-chromium-trace-1.zip"), &large).unwrap();
+        fs::write(logs.join("journey-chromium-trace-2.zip"), &large[1..]).unwrap();
+
+        send(&store, &clone, std::slice::from_ref(&finding), &[]).unwrap();
+        let check = dir.path().join("check");
+        run_git(dir.path(), &["clone", "-q", origin.to_str().unwrap(), check.to_str().unwrap()]);
+        let sent = store::bundle_dir(&check, id).join("logs/qemu");
+        assert!(!sent.join("journey-chromium-trace-1.zip").exists());
+        let note = fs::read_to_string(sent.join("journey-chromium-trace-1.zip.left-out")).unwrap();
+        assert!(note.starts_with("journey-chromium-trace-1.zip stays"), "{note}");
+        assert!(sent.join("journey-chromium-trace-2.zip").is_file(), "one at the limit goes");
+        assert!(sent.join("drivers-link-pull.log.gz").is_file());
+        assert!(logs.join("journey-chromium-trace-1.zip").is_file(), "the lab PC keeps it");
     }
 
     #[test]
