@@ -17,7 +17,8 @@
 //! console, then a line that says it is done. `ob lab` builds the kit from
 //! the Linux kernel `ob bench` holds Dukovo to (Dukovo's ADR 0290), so the
 //! lab and CI measure against the same Linux. The twin boots once per run
-//! on each machine; its numbers serve every bench step after.
+//! on each machine; its numbers serve every bench step after, each row the
+//! median of the machine's latest twin boots (see twins.rs).
 //!
 //! Each row the step names passes when Dukovo takes at most `limit` times
 //! Linux's time per operation: 1.00 by default, parity, the bar every row

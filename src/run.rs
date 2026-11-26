@@ -64,6 +64,7 @@ use crate::suite::{
     AttackerKind, Bench, Boot, Browser, Command, Engine, Fit, PASSWORD_TOKEN, PowerAction,
     SAVED_PREFIX, Serve, Step, TARGET_TOKEN, Test, saved_names,
 };
+use crate::twins;
 use crate::units::{describe_duration, format_duration};
 
 /// What a stopped test's result says; a run that is resumed runs again the
@@ -301,6 +302,12 @@ struct Shared<'a> {
     with_person: bool,
     password: Option<&'a str>,
     linux: Option<&'a Kit>,
+    /// The Linux kit's identity, which [`twins`] keeps its boots by; none
+    /// when its files could not be read, and then each run's boot stands
+    /// alone.
+    linux_id: Option<&'a str>,
+    /// The store, which keeps each machine's twin boots from run to run.
+    store: &'a Path,
     redteam: Option<&'a RedteamKit>,
     /// Held while a machine measures performance, so that machines run
     /// side by side never time each other's load.
@@ -396,6 +403,7 @@ pub fn run(
     let stop = Stop::default();
     let finished = AtomicBool::new(false);
     let measuring = Mutex::new(());
+    let linux_id = request.linux.as_ref().and_then(|kit| twins::kit_id(kit).ok());
     let shared = Shared {
         run_id: &id,
         bundle: &bundle,
@@ -405,6 +413,8 @@ pub fn run(
         with_person: request.with_person,
         password: request.password.as_deref(),
         linux: request.linux.as_ref(),
+        linux_id: linux_id.as_deref(),
+        store: &request.store,
         redteam: request.redteam.as_ref(),
         measuring: &measuring,
         fonts: request.fonts.as_deref(),
@@ -994,7 +1004,8 @@ struct Worker<'a> {
     log: Vec<String>,
     screenshots: Vec<String>,
     /// Linux's numbers, from the machine's Linux twin, once measured: once
-    /// a run is enough, as nothing about Linux changes between tests.
+    /// a run is enough, as nothing about Linux changes between tests. Each
+    /// row is the median of the twin's latest boots ([`twins`]).
     linux: Option<BTreeMap<String, f64>>,
     /// Where the screen is saved to read its text, in the work folder.
     screen_file: PathBuf,
@@ -2480,12 +2491,13 @@ impl<'a> Worker<'a> {
         outcome
     }
 
-    /// Boots the machine's Linux twin and gives its rows, keeping its
-    /// console as `linux-boot-N.log` for Dukovo's boot `boot`, the one it
-    /// ran beside or before. The bench step gets here only on a machine
-    /// that sets its boot aside for the twin (QEMU), as a machine that is
-    /// its own twin measures before the test's boot, in
-    /// [`Worker::measure_twin_first`].
+    /// Boots the machine's Linux twin and gives the rows to hold Dukovo
+    /// to, keeping its console as `linux-boot-N.log` for Dukovo's boot
+    /// `boot`, the one it ran beside or before: each row the median of
+    /// this boot and the machine's latest before it ([`twins`]). The bench
+    /// step gets here only on a machine that sets its boot aside for the
+    /// twin (QEMU), as a machine that is its own twin measures before the
+    /// test's boot, in [`Worker::measure_twin_first`].
     fn measure_twin(
         &mut self,
         kit: &Kit,
@@ -2494,7 +2506,30 @@ impl<'a> Worker<'a> {
     ) -> Result<BTreeMap<String, f64>, StepFailure> {
         let log = self.shared.bundle.logs(&self.folder).join(format!("linux-boot-{boot}.log"));
         let text = self.driver.linux_twin(kit, &log, deadline).map_err(StepFailure::Error)?;
-        Ok(bench::parse(&text))
+        let rows = bench::parse(&text);
+        let Some(kit) = self.shared.linux_id else {
+            self.log.push(
+                "Linux's times are this boot's: the kit's files could not be read to know it by."
+                    .into(),
+            );
+            return Ok(rows);
+        };
+        let boot =
+            twins::Boot { run: self.shared.run_id.into(), kit: kit.into(), rows: rows.clone() };
+        match twins::record(self.shared.store, &self.machine.name, boot) {
+            Ok(held) => {
+                self.log.push(format!(
+                    "Linux's times are the median of the twin's latest {} on this machine, of runs {}.",
+                    if held.runs.len() == 1 { "boot".to_string() } else { format!("{} boots", held.runs.len()) },
+                    held.runs.join(", ")
+                ));
+                Ok(held.rows)
+            }
+            Err(why) => {
+                self.log.push(format!("Linux's times are this boot's alone: {why}"));
+                Ok(rows)
+            }
+        }
     }
 
     /// Measures the twin of a machine that is its own twin, before the
