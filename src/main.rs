@@ -54,6 +54,7 @@ mod status;
 mod stop;
 mod store;
 mod suite;
+mod twins;
 mod ui;
 mod units;
 mod vnc;

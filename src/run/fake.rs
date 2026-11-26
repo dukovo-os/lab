@@ -982,6 +982,21 @@ fn bench_steps_hold_dukovo_to_linux_measured_once_a_run() {
         "{first}"
     );
     assert!(!first.contains("Boot 2"), "{first}");
+    // Linux's times are the median of the machine's twin boots, which the
+    // store keeps from run to run.
+    assert!(
+        first.contains(&format!(
+            "Linux's times are the median of the twin's latest boot on this machine, of runs {}.",
+            on_itself.id.as_deref().unwrap()
+        )),
+        "{first}"
+    );
+    let again = request(Some(kit.clone()), vec![&real]);
+    run(&again, &Reporter::silent(), &start_fake).unwrap();
+    let again_bundle = crate::store::bundle_dir(&again.store, again.id.as_deref().unwrap());
+    let second = fs::read_to_string(again_bundle.join("logs/real/performance-broken.log"))
+        .unwrap_or_default();
+    assert!(second.contains("the twin's latest 2 boots on this machine"), "{second}");
     // The finding of a slow row names no number, so it comes back as one.
     assert_eq!(
         crate::findings::signature(&reason),

@@ -328,7 +328,15 @@ rows = ["posix_fork_wait", "posix_fork_exec_wait"]
   `limit` goes from 0.1 to 10, for a row with a known gap that is being
   worked on. A row printed more than once keeps its fastest.
 - The twin boots once a run on each machine, the first time a bench step
-  runs there, and its numbers serve every bench step after. On QEMU the
+  runs there, and its numbers serve every bench step after. Linux's time
+  for a row moves from boot to boot more than Dukovo's does (624 to 664
+  ns for the event queue's wait on an OptiPlex 7040, where Dukovo's
+  stayed within 2%), so the store keeps each machine's twin boots,
+  `twins/<machine>.json`, and each row is held to the median of the
+  machine's latest five boots of the same kit at the same clock, this
+  run's among them. A new kit, known by its kernel's and initramfs's
+  SHA-256, starts afresh. The test's log names the runs whose boots the
+  median is of. On QEMU the
   machine under test is paused while the twin runs, so the two never
   share the host. A real machine is its own twin: when a test with a
   bench step runs there before the twin is measured, the machine boots
